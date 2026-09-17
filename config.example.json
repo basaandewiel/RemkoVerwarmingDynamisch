@@ -1,0 +1,51 @@
+{
+  "location": {
+    "lat": 52.09,
+    "lon": 5.12,
+    "timezone": "Europe/Amsterdam",
+    "name": "Utrecht (voorbeeld) - vul hier je eigen coördinaten in"
+  },
+  "forecast": {
+    "horizon_hours": 72,
+    "cache_ttl_seconds": 600,
+    "user_agent": "remko-wkf70-optimizer/1.0 (contact: jouw@email.nl)"
+  },
+  "heatpump": {
+    "supply_temperature": 35,
+    "cop_curve_w35": [[12, 5.10], [10, 4.92], [7, 4.62], [2, 3.50], [-7, 2.80], [-15, 2.50]],
+    "cop_curve_w45": [[7, 3.60], [-7, 2.60]],
+    "cop_curve_w55": [[7, 2.80], [-7, 1.70]]
+  },
+  "optimization": {
+    "block_hours": 3,
+    "only_future": true,
+    "top_n": 3
+  },
+  "prices": {
+    "source": "entsoe",
+    "days_ahead": 2,
+    "entsoe": {
+      "api_key": "PLAK_HIER_JE_ENTS-OE_API_KEY",
+      "in_domain": "10YNL----------L",
+      "out_domain": "10YNL----------L"
+    },
+    "energyzero": {
+      "api_url": "https://api.energyzero.nl/v1/energyprices",
+      "usage_type": 1,
+      "incl_btw": true
+    },
+    "price_adjustments": {
+      "vat_pct": 0.0,
+      "fixed_tax_per_kwh": 0.0
+    }
+  },
+  "mqtt": {
+    "enabled": true,
+    "host": "localhost",
+    "port": 1883,
+    "username": null,
+    "password": null,
+    "topic_base": "remko/wkf70",
+    "qos": 0
+  }
+}

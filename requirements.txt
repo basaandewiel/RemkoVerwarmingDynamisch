@@ -1,0 +1,5 @@
+# REMKO WKF 70 dynamisch stroomadvies
+# Basisprogramma: alleen Python 3.9+ standaardbibliotheek (geen installs nodig).
+#
+# Alleen nodig voor de (optionele) MQTT-publicatie:
+paho-mqtt>=2.0
