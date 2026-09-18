@@ -36,7 +36,7 @@
     },
     "price_adjustments": {
       "vat_pct": 0.0,
-      "fixed_tax_per_kwh": 0.0
+      "fixed_tax_per_kwh": 0.12
     }
   },
   "mqtt": {
