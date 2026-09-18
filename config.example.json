@@ -14,7 +14,13 @@
     "supply_temperature": 35,
     "cop_curve_w35": [[12, 5.10], [10, 4.92], [7, 4.62], [2, 3.50], [-7, 2.80], [-15, 2.50]],
     "cop_curve_w45": [[7, 3.60], [-7, 2.60]],
-    "cop_curve_w55": [[7, 2.80], [-7, 1.70]]
+    "cop_curve_w55": [[7, 2.80], [-7, 1.70]],
+    "cop_curve_w53": [[12, 3.27], [10, 3.15], [7, 2.96], [2, 2.28], [-7, 1.88], [-15, 1.68]],
+    "dhw": {
+      "enabled": true,
+      "temperature": 53,
+      "curve_key": "cop_curve_w53"
+    }
   },
   "optimization": {
     "block_hours": 3,

@@ -12,7 +12,11 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
    (dat is de prijs per kWh *warmte* — op koude uren is de stroom misschien
    goedkoop, maar de warmtepomp dan juist duurder in gebruik),
 5. het **goedkoopste aaneengesloten blok van 3 uur** (schuivend venster)
-   op basis van die gecorrigeerde prijs.
+   op basis van die gecorrigeerde prijs,
+6. (optioneel) hetzelfde voor **sanitair warm water (SWW)**: het water wordt
+   opgewarmd tot een hogere temperatuur (standaard 53 °C), wat een veel lagere
+   COP geeft — en dus een eigen (soms ander) goedkoopste blok.
+   Dit wordt berekend met een aparte COP-curve, zie `heatpump.dhw` in de config.
 
 Het resultaat kan optioneel via **MQTT** worden gepubliceerd (de MQTT-
 integratie van jouw warmtepomp draait al; dit programma publiceert alleen
@@ -43,7 +47,11 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `forecast.horizon_hours` | Hoe ver de temperatuurvoorspelling wordt opgehaald (uurwaarden). 72 is ruim genoeg; de prijsdata reikt meestal maar ~48 uur. |
 | `forecast.cache_ttl_seconds` | met.no verzoekt te cachen; 600 s (10 min) is netjes. |
 | `forecast.user_agent` | **verplicht door met.no** — vul een herkenbare string in (bijv. met e-mailadres). |
-| `heatpump.supply_temperature` | Aanvoertemperatuur: `35`, `45` of `55`. Kopieer de bijbehorende COP-curve naar `cop_curve` (zie hieronder). |
+| `heatpump.supply_temperature` | Aanvoertemperatuur ruimteverwarming: `35`, `45` of `55`. Kopieer de bijbehorende COP-curve naar `cop_curve` (zie hieronder). |
+| `heatpump.cop_curve_w53` | Geschatte COP-curve voor warm water tot 53 °C (\*). |
+| `heatpump.dhw.enabled` | `true` (default): bereken ook het advies voor sanitair warm water. |
+| `heatpump.dhw.temperature` | Doeltemperatuur warmwaterboiler (default `53`). |
+| `heatpump.dhw.curve_key` | Welke config-curve voor SWW wordt gebruikt (default `cop_curve_w53`). |
 | `optimization.block_hours` | Lengte van het goedkoopste blok (default 3). |
 | `optimization.only_future` | `true`: alleen blokken die nu of later starten. |
 | `optimization.top_n` | Hoeveel beste blokken worden weergegeven. |
@@ -63,20 +71,30 @@ installatiehandleiding** (volgens EN 14511; eerst kolom onder `Heizleistung /
 Kompressorfrequenz / COP` voor het WKF 70 NEO compact — werkpunt
 A7/W35, overgenomen in de NEO brochure):
 
-| Buitenlucht | COP @ 35 °C | COP @ 45 °C | COP @ 55 °C |
-|---|---|---|---|
-| +12 °C | 5,10 | – | – |
-| +10 °C | 4,92 | – | – |
-|  +7 °C | 4,62 | 3,60 | 2,80 |
-|  +2 °C | 3,50 | – | – |
-|  −7 °C | 2,80 | 2,60 | 1,70 |
-| −15 °C | 2,50 | – | – |
+| Buitenlucht | COP @ 35 °C | COP @ 45 °C | COP @ 55 °C | COP @ 53 °C (sww ⚠) |
+|---|---|---|---|---|
+| +12 °C | 5,10 | – | – | 3,27 |
+| +10 °C | 4,92 | – | – | 3,15 |
+|  +7 °C | 4,62 | 3,60 | 2,80 | 2,96 |
+|  +2 °C | 3,50 | – | – | 2,28 |
+|  −7 °C | 2,80 | 2,60 | 1,70 | 1,88 |
+| −15 °C | 2,50 | – | – | 1,68 |
 
 Tussen de meetpunten wordt **lineair geïnterpoleerd**; buiten het bereik
 wordt de dichtstbijzijnde waarde gebruikt. Bij aanvoertemperatuur 35 °C
 (vloerverwarming) is de curve compleet; bij 45/55 °C zijn er slechts twee
 meetpunten bekend — kies dan bewust welke aanvoertemperatuur je werkelijk
 gebruikt.
+
+> ⚠ De kolom **53 °C** is een *schatting*: REMKO geeft geen meting voor
+> precies 53 °C. De waarden zijn afgeleid door lineair te interpoleren tussen
+> de gemeten **45 °C- en 55 °C-curven** (factor 0,8 = (53−45)/(55−45)) en die
+> verhouding over het buitentemperatuurbereik te leggen:
+> 12 °C → 5,10·0,641 = 3,27; 10 °C → 4,92·0,641 = 3,15; 7 °C → 2,96;
+> 2 °C → 3,50·0,652 = 2,28; −7 °C → 1,88; −15 °C → 2,50·0,671 = 1,68.
+> Heeft jouw installatie echte SWW-metingen (bijv. uit de
+> warmwatermodus van de WKF), vervang dan de waarden in
+> `heatpump.cop_curve_w53` — het programma rekent met elke curve.
 
 > Tip: vervang de waarden in `config.json` gerust door de tabel uit *jouw*
 > handleiding als die afwijkt; het programma werkt met elke COP-curve.
@@ -109,15 +127,20 @@ python3 main.py --no-mqtt
 
 ## Output & MQTT-topics
 
-Tekstuitvoer toont per uurprijsslot: prijs, verwachte buitentemperatuur,
+Tekstuitvoer toont per prijsslot: prijs, verwachte buitentemperatuur,
 COP en de gecorrigeerde prijs, plus het beste blok van 3 uur (en top-N).
+Is `heatpump.dhw.enabled` aan, dan komt daar een aparte sectie
+**Sanitair warm water (SWW)** achteraan: een eigen per-slot tabel en het
+beste 3-uursblok voor het opwarmen tot 53 °C (op basis van de SWW-COP).
 
 Met MQTT ingeschakeld wordt gepubliceerd (paylod = JSON):
 
 | Topic | Inhoud |
 |---|---|
-| `<topic_base>/advice` | Het beste blok: `start`, `end`, gemiddelde gecorrigeerde prijs e.d. |
+| `<topic_base>/advice` | Het beste blok voor ruimteverwarming: `start`, `end`, gemiddelde gecorrigeerde prijs e.d. |
 | `<topic_base>/prices` | Alle (toekomstige) slots met prijs, temp, COP en gecorrigeerde prijs — je eigen sturing kan hierop filters toepassen. |
+| `<topic_base>/dhw/advice` | Idem als `advice`, maar voor sanitair warm water tot 53 °C. |
+| `<topic_base>/dhw/prices` | Idem als `prices`, maar met de SWW-COP en -gecorrigeerde prijzen. |
 | `<topic_base>/status` | Statusberichtje (run geslaagd / foutmelding). |
 
 ## Prijsgranulariteit & ENTSO-E

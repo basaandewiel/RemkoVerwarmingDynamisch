@@ -7,6 +7,7 @@ Stroomlijn:
   3. dynamische kWh-prijzen via EnergyZero/EasyEnergy (publiek, geen key)
   4. gecorrigeerde prijs per slot = kWh-prijs / COP(buitentemp.)
   5. goedkoopste aaneengesloten blok van N uur (standaard 3)
+  6. (optioneel) idem voor sanitair warm water tot 53 °C (eigen COP-curve)
 
 Gebruik:  python3 main.py [--json] [--no-mqtt] [opties]
 Zie README.md.
@@ -57,6 +58,35 @@ def fmt_slot(dt: datetime) -> str:
     return f"{DUTCH_DAYS[dt.weekday()][:3]} {dt:%d-%m %H:%M}"
 
 
+def _append_best_block(
+    lines: List[str], best: dict, blocks: List[dict], title: str
+) -> None:
+    if not best:
+        lines.append("")
+        lines.append("Geen volledig 3-uursblok gevonden binnen de (toekomstige) data.")
+        return
+    lines.append("")
+    lines.append(title)
+    lines.append("-" * 64)
+    lines.append(f"  Start : {fmt_dt(best['start'])}")
+    lines.append(f"  Einde : {fmt_dt(best['end'])}")
+    lines.append(f"  Stroomprijs gem.    : {nl(best['mean_price'], 3)} €/kWh")
+    lines.append(f"  Buitentemperatuur gem.: {nl(best['mean_temp'], 1)} °C")
+    lines.append(f"  COP gem.            : {nl(best['mean_cop'], 2)}")
+    lines.append(
+        f"  Gecorr. prijs gem.   : {nl(best['mean_corrected'], 4)} €/kWh warmte "
+        f"(= stroomprijs / COP)"
+    )
+    if len(blocks) > 1:
+        lines.append("")
+        lines.append("Volgende beste blokken:")
+        for i, b in enumerate(blocks[1:], start=2):
+            lines.append(
+                f"  {i}. {fmt_dt(b['start'])} – {fmt_dt(b['end'])}  "
+                f"→ {nl(b['mean_corrected'], 4)} €/kWh warmte"
+            )
+
+
 def build_advice(cfg: dict, args, now: datetime) -> dict:
     """Haal data op en bereken het advies. Geeft een dict resultaat."""
     loc = cfg["location"]
@@ -70,6 +100,7 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         35: hp["cop_curve_w35"],
         45: hp["cop_curve_w45"],
         55: hp["cop_curve_w55"],
+        53: hp.get("cop_curve_w53"),
     }
     supply = args.supply_temperature or int(hp["supply_temperature"])
     if supply not in curves:
@@ -80,6 +111,21 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         model = cop_mod.CopModel(supply_temperature=supply, curve=curves[supply])
     except KeyError:
         model = cop_mod.CopModel(supply_temperature=supply)
+
+    # 1b) SWW-model: sanitair warm water met eigen aanvoertemperatuur (bv. 53 °C)
+    dhw_cfg = hp.get("dhw") or {}
+    dhw_enabled = bool(dhw_cfg.get("enabled", False))
+    dhw_model = None
+    if dhw_enabled:
+        dhw_temp = int(dhw_cfg.get("temperature", 53))
+        dhw_key = dhw_cfg.get("curve_key", f"cop_curve_w{dhw_temp}")
+        dhw_curve = curves.get(dhw_temp) or hp.get(dhw_key)
+        if dhw_curve is None:
+            raise ValueError(
+                f"geen COP-curve gevonden voor SWW-temperatuur {dhw_temp} °C "
+                f"(voeg '{dhw_key}' toe aan heatpump in de config)"
+            )
+        dhw_model = cop_mod.CopModel(supply_temperature=dhw_temp, curve=dhw_curve)
 
     # 2) temperatuurvoorspelling (met.no)
     forecast = metno.fetch_hourly_forecast(
@@ -145,6 +191,26 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         now=now,
     )
 
+    # 5b) SWW: zelfde prijzen en temperaturen, maar een andere COP-curve.
+    #     Het goedkoopste blok kan daardoor anders uitvallen dan voor ruimtes.
+    dhw_rows = (
+        build_corrected_rows(pr["slots"], temps_by_hour, dhw_model)
+        if dhw_model
+        else []
+    )
+    dhw_blocks = (
+        find_cheapest_blocks(
+            dhw_rows,
+            granularity_min=pr["granularity_min"],
+            block_hours=int(args.block_hours or opt["block_hours"]),
+            only_future=bool(opt["only_future"]),
+            top_n=int(opt["top_n"]),
+            now=now,
+        )
+        if dhw_rows
+        else []
+    )
+
     return {
         "generated_at": now,
         "location": {
@@ -167,6 +233,19 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         "rows": rows,
         "blocks": blocks,
         "best": blocks[0] if blocks else None,
+        "dhw": {
+            "enabled": dhw_enabled,
+            "temperature_c": dhw_model.supply_temperature if dhw_model else None,
+            "cop_source": (
+                dhw_model.source
+                + " (geschat: interpolatie tussen W45- en W55-metwaarden)"
+                if dhw_model
+                else None
+            ),
+            "rows": dhw_rows,
+            "blocks": dhw_blocks,
+            "best": dhw_blocks[0] if dhw_blocks else None,
+        },
     }
 
 
@@ -183,6 +262,9 @@ def render_human(result: dict) -> str:
         f"Locatie : {loc['name']} ({loc['lat']}, {loc['lon']}) [{loc['timezone']}]"
     )
     lines.append(f"COP     : {hp['cop_source']}")
+    dhw = result.get("dhw")
+    if dhw and dhw.get("enabled"):
+        lines.append(f"SWW     : sanitair warm water tot {dhw['temperature_c']} °C — {dhw['cop_source']}")
     lines.append(
         f"Prijzen : {pr['source']} — granulariteit {pr['granularity_min']} min"
     )
@@ -200,31 +282,32 @@ def render_human(result: dict) -> str:
             f"{nl(r['temp'], 1):>7}  | {nl(r['cop'], 2):>4} |  {nl(r['corrected'], 3):>9}"
         )
 
-    if best:
-        lines.append("")
-        lines.append("BESTE BLOK VAN 3 UUR (op gecorrigeerde prijs):")
-        lines.append("-" * 64)
-        lines.append(f"  Start : {fmt_dt(best['start'])}")
-        lines.append(f"  Einde : {fmt_dt(best['end'])}")
-        lines.append(f"  Stroomprijs gem.    : {nl(best['mean_price'], 3)} €/kWh")
-        lines.append(f"  Buitentemperatuur gem.: {nl(best['mean_temp'], 1)} °C")
-        lines.append(f"  COP gem.            : {nl(best['mean_cop'], 2)}")
-        lines.append(
-            f"  Gecorr. prijs gem.   : {nl(best['mean_corrected'], 4)} €/kWh warmte "
-            f"(= stroomprijs / COP)"
-        )
+    _append_best_block(
+        lines,
+        best,
+        result["blocks"],
+        "BESTE BLOK VAN 3 UUR (ruimteverwarming, op gecorrigeerde prijs):",
+    )
 
-        if len(result["blocks"]) > 1:
-            lines.append("")
-            lines.append("Volgende beste blokken:")
-            for i, b in enumerate(result["blocks"][1:], start=2):
-                lines.append(
-                    f"  {i}. {fmt_dt(b['start'])} – {fmt_dt(b['end'])}  "
-                    f"→ {nl(b['mean_corrected'], 4)} €/kWh warmte"
-                )
-    else:
+    if dhw and dhw.get("rows"):
         lines.append("")
-        lines.append("Geen volledig 3-uursblok gevonden binnen de (toekomstige) data.")
+        lines.append("SANITAIR WARM WATER (SWW) — opwarmen tot 53 °C")
+        lines.append("-" * 64)
+        lines.append(f"COP     : {dhw['cop_source']}")
+        lines.append("Per slot (prijs, verwachte buitentemp., COP, gecorrigeerde prijs):")
+        lines.append("  Tijd                 | prijs €/kWh |  temp °C |  COP | €/kWh warmte")
+        lines.append("-" * 72)
+        for r in dhw["rows"]:
+            lines.append(
+                f"  {fmt_slot(r['dt_local'])}   |  {nl(r['price'], 3):>9}  | "
+                f"{nl(r['temp'], 1):>7}  | {nl(r['cop'], 2):>4} |  {nl(r['corrected'], 3):>9}"
+            )
+        _append_best_block(
+            lines,
+            dhw["best"],
+            dhw["blocks"],
+            "BESTE BLOK VAN 3 UUR VOOR SWW (op gecorrigeerde prijs):",
+        )
     return "\n".join(lines)
 
 
@@ -269,6 +352,42 @@ def mqtt_payloads(result: dict, cfg: dict) -> dict:
     }
 
 
+def mqtt_payloads_dhw(result: dict) -> dict:
+    """Extra MQTT-payloads voor sanitair warm water (topics dhw/advice, dhw/prices)."""
+    dhw = result.get("dhw")
+    if not dhw or not dhw.get("enabled") or not dhw.get("rows"):
+        return {}
+    now_local = result["generated_at"]
+    dhw_best = dhw["best"]
+    return {
+        "dhw/advice": (
+            {
+                "recommended": True,
+                "start": dhw_best["start"].isoformat(),
+                "end": dhw_best["end"].isoformat(),
+                "mean_price_eur_per_kwh": dhw_best["mean_price"],
+                "mean_outside_temp_c": dhw_best["mean_temp"],
+                "mean_cop": dhw_best["mean_cop"],
+                "mean_corrected_eur_per_kwh_heat": dhw_best["mean_corrected"],
+                "block_hours": dhw_best["block_hours"],
+            }
+            if dhw_best
+            else {"recommended": False}
+        ),
+        "dhw/prices": [
+            {
+                "time": r["dt_local"].isoformat(),
+                "price_eur_per_kwh": r["price"],
+                "temp_c": r["temp"],
+                "cop": r["cop"],
+                "corrected_eur_per_kwh_heat": r["corrected"],
+            }
+            for r in dhw["rows"]
+            if r["dt_local"] >= now_local
+        ],
+    }
+
+
 def to_serializable(result: dict) -> dict:
     out = dict(result)
     out["generated_at"] = result["generated_at"].isoformat()
@@ -298,6 +417,37 @@ def to_serializable(result: dict) -> dict:
         for b in result["blocks"]
     ]
     out["best"] = out["blocks"][0] if out["blocks"] else None
+
+    dhw = result.get("dhw")
+    if dhw:
+        out["dhw"] = {
+            "enabled": dhw["enabled"],
+            "temperature_c": dhw["temperature_c"],
+            "cop_source": dhw["cop_source"],
+            "rows": [
+                {
+                    "time": r["dt_local"].isoformat(),
+                    "price_eur_per_kwh": r["price"],
+                    "temp_c": r["temp"],
+                    "cop": r["cop"],
+                    "corrected_eur_per_kwh_heat": r["corrected"],
+                }
+                for r in dhw["rows"]
+            ],
+            "blocks": [
+                {
+                    "start": b["start"].isoformat(),
+                    "end": b["end"].isoformat(),
+                    "block_hours": b["block_hours"],
+                    "mean_price_eur_per_kwh": b["mean_price"],
+                    "mean_temp_c": b["mean_temp"],
+                    "mean_cop": b["mean_cop"],
+                    "mean_corrected_eur_per_kwh_heat": b["mean_corrected"],
+                }
+                for b in dhw["blocks"]
+            ],
+        }
+        out["dhw"]["best"] = out["dhw"]["blocks"][0] if out["dhw"]["blocks"] else None
     return out
 
 
@@ -330,6 +480,7 @@ def main(argv: List[str] | None = None) -> int:
         mqtt_ok = False
         if not args.no_mqtt and cfg.get("mqtt", {}).get("enabled"):
             payloads = mqtt_payloads(result, cfg)
+            payloads.update(mqtt_payloads_dhw(result))
             mqtt_ok = mqtt_out.publish(cfg["mqtt"], payloads)
 
         if args.json:

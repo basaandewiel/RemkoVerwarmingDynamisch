@@ -3,14 +3,21 @@
 Waarden volgens EN 14511 uit de officiële REMKO technische data /
 installatiehandleiding (WKF 70 NEO compact):
 
-    Buitenlucht | COP @ W35  | COP @ W45 | COP @ W55
-    ------------+------------+-----------+----------
-    +12 °C      | 5,10       |    –      |    –
-    +10 °C      | 4,92       |    –      |    –
-     +7 °C      | 4,62       | 3,60      | 2,80
-     +2 °C      | 3,50       |    –      |    –
-     −7 °C      | 2,80       | 2,60      | 1,70
-    −15 °C      | 2,50       |    –      |    –
+    Buitenlucht | COP @ W35  | COP @ W45 | COP @ W55 | COP @ W53 (sww, geschat)
+    ------------+------------+-----------+-----------+--------------------------
+    +12 °C      | 5,10       |    –      |    –      | 3,27
+    +10 °C      | 4,92       |    –      |    –      | 3,15
+     +7 °C      | 4,62       | 3,60      | 2,80      | 2,96
+     +2 °C      | 3,50       |    –      |    –      | 2,28
+     −7 °C      | 2,80       | 2,60      | 1,70      | 1,88
+    −15 °C      | 2,50       |    –      |    –      | 1,68
+
+De W53-curve (sanitair warm water, opwarmen tot 53 °C) is een *schatting*:
+lineaire interpolatie in de aanvoertemperatuur tussen de gemeten W45- en
+W55-waarden (factor 0,8 = (53-45)/(55-45)), met de ratio-vorm van de W35-
+curve over het buitentemperatuurbereik. Meetpunten: 12 °C → 5,10·0,641 = 3,27;
+10 °C → 4,92·0,641 = 3,15; 7 °C → 2,96; 2 °C → 3,50·0,652 = 2,28;
+−7 °C → 1,88; −15 °C → 2,50·0,671 = 1,68.
 
 Tussen de meetpunten wordt lineair geïnterpoleerd; buiten het meetbereik
 wordt op de dichtstbijzijnde waarde geklemd.
@@ -33,6 +40,15 @@ DEFAULT_CURVES: dict[int, Sequence[CurvePoint]] = {
     ],
     45: [(7.0, 3.60), (-7.0, 2.60)],
     55: [(7.0, 2.80), (-7.0, 1.70)],
+    # Schatting voor sanitair warm water (53 °C), zie docstring.
+    53: [
+        (12.0, 3.27),
+        (10.0, 3.15),
+        (7.0, 2.96),
+        (2.0, 2.28),
+        (-7.0, 1.88),
+        (-15.0, 1.68),
+    ],
 }
 
 
