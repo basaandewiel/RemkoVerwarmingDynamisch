@@ -7,11 +7,17 @@ Twee manieren:
      hooguit interval-minuten ná de blokstart uit.
      */5 * * * * cd ~/github/remkoverwarming && /usr/bin/python3 dhw_boost.py >> boost.log 2>&1
 
-  B) --watch (aanbevolen): het script blijft draaien, slaapt tot vlak voor
-     de blokstart en verstuurt dan vrijwel exact op tijd. Bij elke wake
-     herberekent het het advies, want het beste blok kan verschuiven zodra
-     nieuwe day-ahead-prijzen binnenkomen. Te starten via systemd
-     (bijlage in README) of nohup.
+  B) --watch (aanbevolen): het script blijft draaien en wordt alleen wakker
+     als er iets kan veranderen of gebeuren:
+       * de blokstart zelf             -> dan wordt het commando verstuurd;
+       * de dagelijkse prijs-update    -> rond 13:30 verschijnen de
+         dag-ahead-prijzen van de volgende dag, de enige keer dat het beste
+         blok kan veranderen (--price-refresh-time, default 13:30);
+       * (alleen zolang er nog géén blok bekend is, bijv. vertraagde
+         prijzen) elke --retry-interval (default 30 min).
+     Herberekenen om de paar minuten is bewust niet nodig: het DHW-water
+     wordt dagelijks bijverwarmd en het 3-uursblok is tussen deze momenten
+     stabiel. Te starten via systemd (bijlage in README) of nohup.
 
 Werking (beide modi):
   1. berekent hetzelfde advies als main.py (zelfde config),
@@ -164,8 +170,11 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
         )
 
 
-WATCH_START_MARGIN_SECONDS = 60.0  # wek ~1 min vóór de blokstart op
+WATCH_START_MARGIN_SECONDS = 2.0   # wek ~2s NÁ de blokstart (gegarandeerd ≥ start)
 RETRY_SECONDS = 30.0               # tussen pogingen als de broker niet bereikbaar is
+MIN_SLEEP = 5.0                    # ondergrens slaap (voorkomt busy-loop)
+PRICE_REFRESH_DEFAULT = "13:30"    # dagelijks moment waarop dag-ahead-prijzen binnenkomen
+RETRY_INTERVAL_DEFAULT = 1800.0    # fallback (30 min) zolang er nog geen blok bekend is
 
 
 def _log(*parts) -> None:
@@ -173,17 +182,30 @@ def _log(*parts) -> None:
     print(f"[{ts}] " + " ".join(str(p) for p in parts), flush=True)
 
 
-def compute_sleep(out: dict, now: datetime, interval: float) -> float:
-    """Aantal seconden slapen tot de volgende nuttige wake-up."""
-    if out.get("status") == "wait" and out.get("block"):
+def next_price_refresh(now: datetime, tz: ZoneInfo, hhmm: str) -> datetime:
+    """Eerstvolgende dagelijkse dag-ahead-publicatie (default vandaag 13:30)."""
+    hh, mm = (int(x) for x in hhmm.split(":"))
+    candidate = datetime(now.year, now.month, now.day, hh, mm, tzinfo=tz)
+    if now >= candidate:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) -> datetime:
+    """Het eerstvolgende moment dat iets nuttigs kan veranderen:
+    - blok is bekend: min(blokstart + 2s, eerstvolgende prijs-update ~13:30);
+    - al verstuurd tijdens een blok: min(blokeinde, prijs-update);
+    - anders (nog geen blok/vertraagde prijzen): over RETRY_INTERVAL.
+    """
+    status = out.get("status")
+    refresh = next_price_refresh(now, tz, refresh_hhmm)
+    if status == "wait" and out.get("block"):
         start = datetime.fromisoformat(out["block"]["start"])
-        delta = (start - now).total_seconds() - WATCH_START_MARGIN_SECONDS
-        if delta > 0:
-            return max(10.0, min(delta, interval))
-        return 10.0  # blokstart is héél dichtbij: vaak wakker worden
-    if out.get("status") == "already_sent":
-        return min(interval, 30.0)
-    return float(interval)
+        return min(start + timedelta(seconds=WATCH_START_MARGIN_SECONDS), refresh)
+    if status == "already_sent" and out.get("block"):
+        end = datetime.fromisoformat(out["block"]["end"])
+        return min(end, refresh)
+    return now + timedelta(seconds=RETRY_INTERVAL_DEFAULT)
 
 
 def send_with_retry(out: dict, mqtt_cfg: dict, tz, dry_run: bool) -> bool:
@@ -212,9 +234,22 @@ def send_with_retry(out: dict, mqtt_cfg: dict, tz, dry_run: bool) -> bool:
         time.sleep(RETRY_SECONDS)
 
 
-def watch(cfg: dict, tz, interval: float, dry_run: bool) -> int:
-    """Blijf draaien: slaap tot (vlak voor) de blokstart, verstuur dan precies."""
-    _log("SWW-boost watchdog gestart — herberekent elke max", f"{interval:.0f}s")
+def watch(
+    cfg: dict,
+    tz: ZoneInfo,
+    refresh_hhmm: str,
+    retry_interval: float,
+    dry_run: bool,
+) -> int:
+    """Blijf draaien: slaap tot het relevante moment en verstuur dan precies.
+
+    Samen met de status uit `decide` is elke wake een van drie dingen:
+    - blokstart bereikt  -> verstuur (-commando);
+    - dagelijkse prijs-update ~13:30 -> herbereken het advies;
+    - (alleen als er nog geen blok is) elke `retry_interval` seconden.
+    """
+    _log("SWW-boost watchdog gestart — herberekent alleen bij blokstart of",
+         f"dagelijkse prijs-update {refresh_hhmm} (fallback elke {retry_interval/60:.0f} min)")
     while True:
         try:
             now = datetime.now(tz)
@@ -240,7 +275,12 @@ def watch(cfg: dict, tz, interval: float, dry_run: bool) -> int:
                     else f"status: {status}"
                 )
                 _log(extra)
-            time.sleep(compute_sleep(out, now, interval))
+
+            wake = next_wake_time(out, now, tz, refresh_hhmm)
+            delay = max(MIN_SLEEP, (wake - now).total_seconds())
+            _log("slaapt tot", wake.strftime("%a %d-%m %H:%M:%S"),
+                 f"(+{delay/3600:.1f}u)" if delay >= 3600 else f"(+{delay/60:.0f}min)")
+            time.sleep(delay)
         except KeyboardInterrupt:
             _log("gestopt")
             return 130
@@ -297,13 +337,18 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument(
         "--watch",
         action="store_true",
-        help="blijf draaien en verstuur vrijwel exact bij de blokstart",
+        help="blijf draaien en verstuur bij de blokstart",
     )
     ap.add_argument(
-        "--watch-interval",
+        "--price-refresh-time",
+        default=PRICE_REFRESH_DEFAULT,
+        help=f"dagelijks moment om het advies te herberekenen (default {PRICE_REFRESH_DEFAULT})",
+    )
+    ap.add_argument(
+        "--retry-interval",
         type=float,
-        default=300.0,
-        help="max seconden tussen herberekeningen (default 300)",
+        default=RETRY_INTERVAL_DEFAULT,
+        help="seconden tussen herberekeningen zolang er nog geen blok bekend is (default 1800)",
     )
     args = ap.parse_args(argv)
 
@@ -315,7 +360,7 @@ def main(argv: List[str] | None = None) -> int:
             now = now.replace(tzinfo=tz)
 
         if args.watch and not args.now:
-            return watch(cfg, tz, args.watch_interval, args.dry_run)
+            return watch(cfg, tz, args.price_refresh_time, args.retry_interval, args.dry_run)
 
         out = decide(cfg, now)
         execute(out, cfg.get("mqtt") or {}, dry_run=args.dry_run, force=args.force)

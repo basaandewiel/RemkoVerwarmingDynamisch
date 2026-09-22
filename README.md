@@ -146,9 +146,19 @@ De *stop* wordt bewust niet verstuurd: de warmtepomp stopt zelf zodra de
 boiler op temperatuur is (setpoint 53 °C).
 
 **Aanbevolen: `--watch`** — een continu draaiend proces dat vrijwel exact op
-de blokstart verstuurt. Het slaapt tot ~1 minuut voor de blokstart en
-herberekent bij elke wake opnieuw het advies (het beste blok kan verschuiven
-zodra nieuwe day-ahead-prijzen binnenkomen). Starten via systemd:
+de blokstart verstuurt. Het wordt alleen wakker als er iets kan veranderen
+of gebeuren:
+
+- de **blokstart zelf** → dan wordt het start-commando verstuurd;
+- de **dagelijkse prijs-update** rond 13:30 (`--price-refresh-time`,
+  default `13:30`) → het moment waarop de day-ahead-prijzen van de volgende
+  dag binnenkomen, de enige keer dat het beste blok kan veranderen;
+- alleen zolang er **nog geen blok bekend** is (bijv. vertraagde
+  prijspublicatie) elke `--retry-interval` (default 30 min).
+
+Herberekenen om de paar minuten is bewust niet nodig: het DHW-water wordt
+elke dag bijverwarmd en het 3-uursblok is tussen deze momenten stabiel.
+Starten via systemd:
 
 ```ini
 # /etc/systemd/system/remko-sww-boost.service
