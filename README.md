@@ -145,22 +145,58 @@ De waarde van register 1082 wordt **afgeleid** uit
 De *stop* wordt bewust niet verstuurd: de warmtepomp stopt zelf zodra de
 boiler op temperatuur is (setpoint 53 °C).
 
-Draai `dhw_boost.py` net zo vaak als je wilt (het is een one-shot-check die
-niets doet als het niet de tijd is). Gebruik bijv. een cron-regel per 5 min:
+**Aanbevolen: `--watch`** — een continu draaiend proces dat vrijwel exact op
+de blokstart verstuurt. Het slaapt tot ~1 minuut voor de blokstart en
+herberekent bij elke wake opnieuw het advies (het beste blok kan verschuiven
+zodra nieuwe day-ahead-prijzen binnenkomen). Starten via systemd:
+
+```ini
+# /etc/systemd/system/remko-sww-boost.service
+[Unit]
+Description=REMKO WKF SWW-boost (verstuur commando bij start goedkoopste blok)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/remkoverwarming
+ExecStart=/usr/bin/python3 dhw_boost.py --watch
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now remko-sww-boost
+journalctl -u remko-sww-boost -f
+```
+
+Het proces blijft draaien en stuurt per blok precies één start-commando; de
+statusfile in `~/.cache/remko-wkf70/dhw_boost_state.json` voorkomt dubbele
+berichten. Is de broker even bezet, dan probeert het om de 30 s opnieuw
+zolang het trigger-venster loopt.
+
+**Alternatief: via cron** — een one-shot-check die niets doet als het niet
+de tijd is, maar het commando gaat dan hooguit een cron-interval ná de
+blokstart uit:
 
 ```cron
 */5 * * * * cd /home/pi/remkoverwarming && /usr/bin/python3 dhw_boost.py >> boost.log 2>&1
 ```
 
-Wat het script doet per run:
+Wat het script per run doet:
 
 - berekent hetzelfde advies als `main.py` (zelfde config),
 - is "nu" binnen de eerste `mqtt.dhw_boost.trigger_minutes` (default 45) van
   het beste SWW-blok, dan publiceert het het start-commando **eenmalig**;
 - een statusfile in `~/.cache/remko-wkf70/dhw_boost_state.json` onthoudt per
   blok-start dat er al verstuurd is (geen dubbele berichten tijdens hetzelfde
-  blok). Een 5-minuten-cron stuurt het commando dus binnen 5 minuten na de
-  blokstart (testen: `python3 dhw_boost.py --now "2026-09-23T11:45:00+02:00" --dry-run`).
+  blok). Testen zonder te versturen:
+  `python3 dhw_boost.py --now "2026-09-23T11:45:00+02:00" --dry-run`,
+  of `--watch --now ... --dry-run` voor één watch-cyclus.
 
 ## Output & MQTT-topics
 

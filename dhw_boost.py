@@ -2,10 +2,18 @@
 """SWW-boost: publiceer het start-commando op het moment dat het goedkoopste
 3-uursblok voor sanitair warm water (SWW) begint.
 
-Gebruik (via cron, bijv. elke 5 minuten):
-    */5 * * * * cd ~/github/remkoverwarming && /usr/bin/python3 dhw_boost.py >> boost.log 2>&1
+Twee manieren:
+  A) one-shot via cron (elke 5-10 min): werkt prima, maar het commando gaat
+     hooguit interval-minuten ná de blokstart uit.
+     */5 * * * * cd ~/github/remkoverwarming && /usr/bin/python3 dhw_boost.py >> boost.log 2>&1
 
-Werking (one-shot per run, bedoeld om elke run opnieuw aan te roepen):
+  B) --watch (aanbevolen): het script blijft draaien, slaapt tot vlak voor
+     de blokstart en verstuurt dan vrijwel exact op tijd. Bij elke wake
+     herberekent het het advies, want het beste blok kan verschuiven zodra
+     nieuwe day-ahead-prijzen binnenkomen. Te starten via systemd
+     (bijlage in README) of nohup.
+
+Werking (beide modi):
   1. berekent hetzelfde advies als main.py (zelfde config),
   2. als 'nu' binnen de eerste `trigger_minutes` van het beste SWW-blok valt,
      wordt het start-commando gepubliceerd op mqtt.control_topic (default
@@ -26,6 +34,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import List
 from zoneinfo import ZoneInfo
@@ -155,6 +164,91 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
         )
 
 
+WATCH_START_MARGIN_SECONDS = 60.0  # wek ~1 min vóór de blokstart op
+RETRY_SECONDS = 30.0               # tussen pogingen als de broker niet bereikbaar is
+
+
+def _log(*parts) -> None:
+    ts = datetime.now().strftime("%d-%m %H:%M:%S")
+    print(f"[{ts}] " + " ".join(str(p) for p in parts), flush=True)
+
+
+def compute_sleep(out: dict, now: datetime, interval: float) -> float:
+    """Aantal seconden slapen tot de volgende nuttige wake-up."""
+    if out.get("status") == "wait" and out.get("block"):
+        start = datetime.fromisoformat(out["block"]["start"])
+        delta = (start - now).total_seconds() - WATCH_START_MARGIN_SECONDS
+        if delta > 0:
+            return max(10.0, min(delta, interval))
+        return 10.0  # blokstart is héél dichtbij: vaak wakker worden
+    if out.get("status") == "already_sent":
+        return min(interval, 30.0)
+    return float(interval)
+
+
+def send_with_retry(out: dict, mqtt_cfg: dict, tz, dry_run: bool) -> bool:
+    """Publiceer, met retry zolang we nog binnen het trigger-venster zitten."""
+    if dry_run:
+        return True
+    window_end = (
+        datetime.fromisoformat(out["block"]["end"]) if out.get("block") else None
+    )
+    while True:
+        ok = mqtt_out.publish_command(mqtt_cfg, out["topic"], out["payload"])
+        if ok:
+            save_state(
+                {
+                    "last_sent_start": out["block"]["start"],
+                    "sent_at": out["now"],
+                }
+            )
+            _log("VERSTUURD →", out["topic"], json.dumps(out["payload"], ensure_ascii=False))
+            return True
+        _log("FOUT: publish mislukt, probeer opnieuw over", f"{RETRY_SECONDS:g}s")
+        now = datetime.now(tz)
+        if window_end and now >= window_end:
+            _log("FOUT: kon niet versturen binnen het trigger-venster")
+            return False
+        time.sleep(RETRY_SECONDS)
+
+
+def watch(cfg: dict, tz, interval: float, dry_run: bool) -> int:
+    """Blijf draaien: slaap tot (vlak voor) de blokstart, verstuur dan precies."""
+    _log("SWW-boost watchdog gestart — herberekent elke max", f"{interval:.0f}s")
+    while True:
+        try:
+            now = datetime.now(tz)
+            out = decide(cfg, now)
+            status = out["status"]
+
+            if status == "send":
+                _log("blokstart bereikt — verstuur het boost-commando")
+                if not send_with_retry(out, cfg.get("mqtt") or {}, tz, dry_run):
+                    return 1
+                continue  # statusfile voorkomt dubbele berichten; op naar het volgende blok
+
+            if status in ("no_dhw", "disabled"):
+                _log("status:", status, "— niets te doen, stop")
+                return 0
+
+            if status == "already_sent":
+                _log("status: al verstuurd voor dit blok")
+            else:
+                extra = (
+                    f"blokstart over {out['wait_minutes']:g} min"
+                    if status == "wait"
+                    else f"status: {status}"
+                )
+                _log(extra)
+            time.sleep(compute_sleep(out, now, interval))
+        except KeyboardInterrupt:
+            _log("gestopt")
+            return 130
+        except Exception as exc:  # noqa: BLE001 — de daemon moet blijven draaien
+            _log("FOUT (ga verder):", exc)
+            time.sleep(60)
+
+
 def render_human(out: dict) -> List[str]:
     lines: List[str] = []
     lines.append("SWW-boost — dynamisch stroomadvies")
@@ -200,6 +294,17 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="niets publiceren, alleen tonen")
     ap.add_argument("--force", action="store_true", help="ondanks statusfile opnieuw versturen")
     ap.add_argument("--json", action="store_true", help="JSON-output op stdout")
+    ap.add_argument(
+        "--watch",
+        action="store_true",
+        help="blijf draaien en verstuur vrijwel exact bij de blokstart",
+    )
+    ap.add_argument(
+        "--watch-interval",
+        type=float,
+        default=300.0,
+        help="max seconden tussen herberekeningen (default 300)",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -208,6 +313,9 @@ def main(argv: List[str] | None = None) -> int:
         now = datetime.fromisoformat(args.now) if args.now else datetime.now(tz)
         if now.tzinfo is None:
             now = now.replace(tzinfo=tz)
+
+        if args.watch and not args.now:
+            return watch(cfg, tz, args.watch_interval, args.dry_run)
 
         out = decide(cfg, now)
         execute(out, cfg.get("mqtt") or {}, dry_run=args.dry_run, force=args.force)
