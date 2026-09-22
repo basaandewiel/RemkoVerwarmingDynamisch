@@ -2,4 +2,4 @@
 # Basisprogramma: alleen Python 3.9+ standaardbibliotheek (geen installs nodig).
 #
 # Alleen nodig voor de (optionele) MQTT-publicatie:
-paho-mqtt>=2.0
+paho-mqtt>=1.6

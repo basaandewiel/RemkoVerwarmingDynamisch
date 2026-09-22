@@ -1,8 +1,13 @@
 # Bevat je persoonlijke ENTSO-E API-key — niet committen.
 config.json
 
+# Python
 __pycache__/
 *.pyc
 *.log
 *.pem
 *.key
+
+# Optionele virtuele omgeving (als je zelf eentje aanmaakt)
+.venv/
+venv/

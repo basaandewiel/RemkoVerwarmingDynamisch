@@ -52,6 +52,14 @@
     "username": null,
     "password": null,
     "topic_base": "remko/wkf70",
-    "qos": 0
+    "qos": 0,
+    "control_topic": "remko/wkf70/set",
+    "dhw_boost": {
+      "enabled": true,
+      "trigger_minutes": 45,
+      "payload": {
+        "values": {"1082": "0190"}
+      }
+    }
   }
 }

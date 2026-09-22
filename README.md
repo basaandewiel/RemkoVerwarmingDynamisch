@@ -63,6 +63,10 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `prices.price_adjustments.vat_pct` | Btw-percentage op de groothandelsprijs (bv. `21`). Constante factor, verandert de blokkeuze niet. |
 | `prices.price_adjustments.fixed_tax_per_kwh` | Vaste belasting per kWh (bv. energiebelasting €/kWh). **Verandert de blokkeuze wel** (want `(prijs + belasting)/COP`). Standaard 0,12 €/kWh in de config. |
 | `mqtt.*` | MQTT-publicatie (broker, topics). Zet `enabled` op `false` om uit te schakelen. |
+| `mqtt.control_topic` | Topic waarop het **SWW-boost-commando** wordt gepubliceerd (default `<topic_base>/set`). |
+| `mqtt.dhw_boost.enabled` | Master-schakelaar voor het boost-commando. |
+| `mqtt.dhw_boost.trigger_minutes` | Venster aan het begin van het SWW-blok (default 45) waarbinnen het commando verstuurd wordt. |
+| `mqtt.dhw_boost.payload` | Het exacte JSON-bericht dat bij de start van het SWW-blok gaat, default `{"values": {"1082": "0190"}}`. |
 
 ## COP-curve van de REMKO WKF 70 (NEO) compact
 
@@ -124,6 +128,34 @@ python3 main.py --no-mqtt
 # elke 10 minuten een nieuw advies (evt. alleen overdag)
 */10 * * * * cd /home/pi/remkoverwarming && /usr/bin/python3 main.py >> run.log 2>&1
 ```
+
+## SWW-boost-commando via MQTT (`dhw_boost.py`)
+
+Als `heatpump.dhw.enabled` aan staat, kan het programma op het moment dat
+het **goedkoopste 3-uursblok voor sanitair warm water begint** een
+start-commando naar de warmtepomp sturen. Voor de REMKO-WKF-integratie is
+dat standaard `{"values": {"1082": "0190"}}` op `<topic_base>/set`
+(config: `mqtt.control_topic`, aanpasbaar via `mqtt.dhw_boost.payload`).
+
+De *stop* wordt bewust niet verstuurd: de warmtepomp stopt zelf zodra de
+boiler op temperatuur is (setpoint 53 °C).
+
+Draai `dhw_boost.py` net zo vaak als je wilt (het is een one-shot-check die
+niets doet als het niet de tijd is). Gebruik bijv. een cron-regel per 5 min:
+
+```cron
+*/5 * * * * cd /home/pi/remkoverwarming && /usr/bin/python3 dhw_boost.py >> boost.log 2>&1
+```
+
+Wat het script doet per run:
+
+- berekent hetzelfde advies als `main.py` (zelfde config),
+- is "nu" binnen de eerste `mqtt.dhw_boost.trigger_minutes` (default 45) van
+  het beste SWW-blok, dan publiceert het het start-commando **eenmalig**;
+- een statusfile in `~/.cache/remko-wkf70/dhw_boost_state.json` onthoudt per
+  blok-start dat er al verstuurd is (geen dubbele berichten tijdens hetzelfde
+  blok). Een 5-minuten-cron stuurt het commando dus binnen 5 minuten na de
+  blokstart (testen: `python3 dhw_boost.py --now "2026-09-23T11:45:00+02:00" --dry-run`).
 
 ## Output & MQTT-topics
 
