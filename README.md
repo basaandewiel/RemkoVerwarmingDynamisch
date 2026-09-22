@@ -66,7 +66,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.control_topic` | Topic waarop het **SWW-boost-commando** wordt gepubliceerd (default `<topic_base>/set`). |
 | `mqtt.dhw_boost.enabled` | Master-schakelaar voor het boost-commando. |
 | `mqtt.dhw_boost.trigger_minutes` | Venster aan het begin van het SWW-blok (default 45) waarbinnen het commando verstuurd wordt. |
-| `mqtt.dhw_boost.payload` | Het exacte JSON-bericht dat bij de start van het SWW-blok gaat, default `{"values": {"1082": "0190"}}`. |
+| `mqtt.dhw_boost.payload` | Wordt **afgeleid** uit `heatpump.dhw.temperature`: temperatuur × 10 als hex (53 °C → 530 → `"0212"`). Niet handmatig instellen. |
 
 ## COP-curve van de REMKO WKF 70 (NEO) compact
 
@@ -133,9 +133,14 @@ python3 main.py --no-mqtt
 
 Als `heatpump.dhw.enabled` aan staat, kan het programma op het moment dat
 het **goedkoopste 3-uursblok voor sanitair warm water begint** een
-start-commando naar de warmtepomp sturen. Voor de REMKO-WKF-integratie is
-dat standaard `{"values": {"1082": "0190"}}` op `<topic_base>/set`
-(config: `mqtt.control_topic`, aanpasbaar via `mqtt.dhw_boost.payload`).
+start-commando naar de warmtepomp sturen: `{"values": {"1082": "<hex>"}}`
+op `mqtt.control_topic` (default `<topic_base>/set`).
+
+De waarde van register 1082 wordt **afgeleid** uit
+`heatpump.dhw.temperature` uit config.json: de gewenste temperatuur
+(°C × 10), uitgedrukt als hexadecimaal getal. Met 53 °C is dat
+53 × 10 = 530 decimal = `0x212`, dus de payload wordt
+`{"values": {"1082": "0212"}}`.
 
 De *stop* wordt bewust niet verstuurd: de warmtepomp stopt zelf zodra de
 boiler op temperatuur is (setpoint 53 °C).

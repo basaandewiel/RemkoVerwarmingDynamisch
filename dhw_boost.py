@@ -8,9 +8,10 @@ Gebruik (via cron, bijv. elke 5 minuten):
 Werking (one-shot per run, bedoeld om elke run opnieuw aan te roepen):
   1. berekent hetzelfde advies als main.py (zelfde config),
   2. als 'nu' binnen de eerste `trigger_minutes` van het beste SWW-blok valt,
-     wordt het start-commando (config: mqtt.dhw_boost.payload, default
-     {"values": {"1082": "0190"}}) gepubliceerd op mqtt.control_topic
-     (default <topic_base>/set),
+     wordt het start-commando gepubliceerd op mqtt.control_topic (default
+     <topic_base>/set). De waarde van register 1082 is afgeleid uit
+     heatpump.dhw.temperature uit config.json: temperatuur &times; 10 als
+     hexadecimaal getal (53 &deg;C &rarr; 530 decimal &rarr; "0212").
   3. een statusfile in ~/.cache/remko-wkf70 onthoudt per blok-start of er al
      verstuurd is, zodat er geen dubbele berichten tijdens hetzelfde blok
      uitgaan.
@@ -32,7 +33,18 @@ from zoneinfo import ZoneInfo
 import main as app
 import mqtt_out
 
-DEFAULT_PAYLOAD = {"values": {"1082": "0190"}}
+DEFAULT_DHW_TEMP = 53.0
+
+
+def build_boost_payload(dhw_temperature: float) -> dict:
+    """1082-waarde = gewenste SWW-temperatuur ('C x 10) in hexadecimaal.
+
+    Voorbeeld: 53 graden -> 530 decimal -> 0x212 -> "0212" (4 cijfers,
+    zelfde formaat als het oorspronkelijke "0190" = 0x190 = 40 graden).
+    """
+    value_dec = int(round(dhw_temperature * 10.0))
+    value_hex = format(value_dec, "04x")
+    return {"values": {"1082": value_hex}}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -71,7 +83,9 @@ def decide(cfg: dict, now: datetime) -> dict:
     boost_cfg = mqtt_cfg.get("dhw_boost") or {}
     base = mqtt_cfg.get("topic_base", "remko/wkf70").rstrip("/")
     topic = (mqtt_cfg.get("control_topic") or f"{base}/set").strip()
-    payload = boost_cfg.get("payload") or DEFAULT_PAYLOAD
+    dhw_cfg = (cfg.get("heatpump") or {}).get("dhw") or {}
+    dhw_temp = dhw_cfg.get("temperature", DEFAULT_DHW_TEMP)
+    payload = build_boost_payload(float(dhw_temp))
     window_min = int(boost_cfg.get("trigger_minutes", 45))
 
     out: dict = {
