@@ -176,7 +176,33 @@ of gebeuren:
 
 Herberekenen om de paar minuten is bewust niet nodig: het DHW-water wordt
 elke dag bijverwarmd en het 3-uursblok is tussen deze momenten stabiel.
-Starten via systemd:
+
+### Op een Raspberry Pi (systemd) — aanbevolen
+
+De map `deploy/` bevat een systemd-unit en een installatiescript dat de
+gebruikersnaam en map zelf invult en een venv opzet (nodig op Raspberry Pi
+OS Bookworm: `pip install` zonder venv wordt geblokkeerd door PEP 668).
+
+```bash
+# op de Pi: clone of kopieer de repo naar /home/pi/remkoverwarming, daarna:
+bash deploy/install.sh
+
+# vul hierna je eigen config aan (API-key, coördinaten, mqtt-host):
+nano config.json
+sudo systemctl restart remko-sww-boost
+
+# controle:
+systemctl status remko-sww-boost
+journalctl -u remko-sww-boost -f
+```
+
+Het script maakt `config.json` (uit `config.example.json`) aan als die
+ontbreekt, installeert dependencies in `venv/`, en start de service met
+`Restart=on-failure`. Je eigen `config.json` met API-key zet je gemakkelijk
+over vanaf een andere machine: `scp config.json pi@<ip>:~/remkoverwarming/`.
+
+Handmatig (zonder installatiescript) kan ook, bijv. als de service onder
+jouw eigen user moet draaien:
 
 ```ini
 # /etc/systemd/system/remko-sww-boost.service
@@ -187,8 +213,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=pi
 WorkingDirectory=/home/pi/remkoverwarming
-ExecStart=/usr/bin/python3 dhw_boost.py --watch
+ExecStart=/home/pi/remkoverwarming/venv/bin/python3 dhw_boost.py --watch
+Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=60
 
