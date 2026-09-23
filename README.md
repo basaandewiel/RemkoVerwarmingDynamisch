@@ -66,7 +66,8 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.control_topic` | Topic waarop het **SWW-boost-commando** wordt gepubliceerd (default `<topic_base>/set`). |
 | `mqtt.dhw_boost.enabled` | Master-schakelaar voor het boost-commando. |
 | `mqtt.dhw_boost.trigger_minutes` | Venster aan het begin van het SWW-blok (default 45) waarbinnen het commando verstuurd wordt. |
-| `mqtt.dhw_boost.payload` | Wordt **afgeleid** uit `heatpump.dhw.temperature`: temperatuur × 10 als hex (53 °C → 530 → `"0212"`). Niet handmatig instellen. |
+| `mqtt.dhw_boost.default_temperature` | Temperatuur (°C) **waar de boiler na het goedkoopste blok weer naar teruggezet** wordt (reset-commando aan het blokeinde), default 40 °C. |
+| `mqtt.dhw_boost.payload` | Wordt **afgeleid**: boost = `heatpump.dhw.temperature` × 10 als hex, reset = `mqtt.dhw_boost.default_temperature` × 10 als hex (53 °C → `"0212"`, 40 °C → `"0190"`). Niet handmatig instellen. |
 
 ## COP-curve van de REMKO WKF 70 (NEO) compact
 
@@ -142,14 +143,23 @@ De waarde van register 1082 wordt **afgeleid** uit
 53 × 10 = 530 decimal = `0x212`, dus de payload wordt
 `{"values": {"1082": "0212"}}`.
 
-De *stop* wordt bewust niet verstuurd: de warmtepomp stopt zelf zodra de
-boiler op temperatuur is (setpoint 53 °C).
+**Aan het einde van het blok** wordt de temperatuur teruggezet naar de
+default uit `mqtt.dhw_boost.default_temperature` (default 40 °C):
+40 × 10 = 400 decimal = `0x190` → `{"values": {"1082": "0190"}}`. Zo
+verwarmt de boiler niet de rest van de dag door op duur stroom. Dit
+reset-commando gaat alleen uit ná een verstuurd boost-commando voor
+hetzelfde blok; de *stop na het opwarmen* doet de warmtepomp zelf (setpoint).
+
+Er gaat maximaal **één boost per lokale dag** uit (het water wordt één keer
+per dag bijverwarmd). Is de eerste boost van de dag gemist, dan mag de
+eerstvolgende alsnog gaan.
 
 **Aanbevolen: `--watch`** — een continu draaiend proces dat vrijwel exact op
 de blokstart verstuurt. Het wordt alleen wakker als er iets kan veranderen
 of gebeuren:
 
-- de **blokstart zelf** → dan wordt het start-commando verstuurd;
+- de **blokstart zelf** → dan wordt het start-commando verstuurd, en het
+  **blokeinde** → de reset terug naar de default-temperatuur;
 - de **dagelijkse prijs-update** rond 13:30 (`--price-refresh-time`,
   default `13:30`) → het moment waarop de day-ahead-prijzen van de volgende
   dag binnenkomen, de enige keer dat het beste blok kan veranderen;

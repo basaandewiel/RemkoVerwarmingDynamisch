@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SWW-boost: publiceer het start-commando op het moment dat het goedkoopste
-3-uursblok voor sanitair warm water (SWW) begint.
+3-uursblok voor sanitair warm water (SWW) begint, en zet aan het einde van
+dat blok de gewenste boilertemperatuur terug naar de default (40 °C).
 
 Twee manieren:
   A) one-shot via cron (elke 5-10 min): werkt prima, maar het commando gaat
@@ -26,12 +27,21 @@ Werking (beide modi):
      <topic_base>/set). De waarde van register 1082 is afgeleid uit
      heatpump.dhw.temperature uit config.json: temperatuur &times; 10 als
      hexadecimaal getal (53 &deg;C &rarr; 530 decimal &rarr; "0212").
-  3. een statusfile in ~/.cache/remko-wkf70 onthoudt per blok-start of er al
-     verstuurd is, zodat er geen dubbele berichten tijdens hetzelfde blok
-     uitgaan.
+  3. aan het EINDE van het blok wordt de gewenste temperatuur teruggezet
+     naar de default (mqtt.dhw_boost.default_temperature, default 40 &deg;C
+     &rarr; 400 decimal &rarr; "0190"), zodat de boiler niet de rest van de
+     dag door blijft verwarmen op duur stroom. Dit reset-commando gaat dan
+     dus ook uit als het inschakel-commando is verstuurd.
+  4. een statusfile in ~/.cache/remko-wkf70 onthoudt per blok-start welke
+     commando's (boost én reset) er al verstuurd zijn, zodat er geen dubbele
+     berichten tijdens hetzelfde blok uitgaan.
+  5. er gaat maximaal één boost per lokale dag uit (het water wordt één keer
+     per dag bijverwarmd). Is de eerste boost van de dag gemist, dan mag de
+     eerstvolgende alsnog gaan.
 
-Het *stop*-commando wordt bewust niet verstuurd: de warmtepomp stopt zelf
-wanneer de boiler op temperatuur is (setpoint 53 °C).
+Het reset-commando wordt alleen gestuurd ná een verstuurd boost-commando
+voor datzelfde blok; is het blok gemist, dan blijft de standaardwaarde
+gewoon staan.
 """
 
 from __future__ import annotations
@@ -49,6 +59,7 @@ import main as app
 import mqtt_out
 
 DEFAULT_DHW_TEMP = 53.0
+DEFAULT_RESET_TEMP = 40.0
 
 
 def build_boost_payload(dhw_temperature: float) -> dict:
@@ -100,19 +111,34 @@ def decide(cfg: dict, now: datetime) -> dict:
     topic = (mqtt_cfg.get("control_topic") or f"{base}/set").strip()
     dhw_cfg = (cfg.get("heatpump") or {}).get("dhw") or {}
     dhw_temp = dhw_cfg.get("temperature", DEFAULT_DHW_TEMP)
-    payload = build_boost_payload(float(dhw_temp))
+    boost_payload = build_boost_payload(float(dhw_temp))
+    reset_temp = boost_cfg.get("default_temperature", DEFAULT_RESET_TEMP)
+    reset_payload = build_boost_payload(float(reset_temp))
     window_min = int(boost_cfg.get("trigger_minutes", 45))
 
     out: dict = {
         "now": now.isoformat(),
         "enabled": bool(mqtt_cfg.get("enabled")) and bool(boost_cfg.get("enabled", True)),
         "topic": topic,
-        "payload": payload,
+        "payload": boost_payload,
+        "reset_payload": reset_payload,
     }
 
     if not out["enabled"]:
         out["status"] = "disabled"
         return out
+
+    # 1) Openstaande reset? Een boost is verstuurd voor een blok dat inmiddels
+    #    voorbij is, en de reset daarnaar is nog niet gedaan -> reset sturen.
+    state = load_state()
+    sent_start = state.get("last_sent_start")
+    sent_end = state.get("last_sent_end")
+    if sent_start and sent_end and state.get("last_reset_start") != sent_start:
+        if now >= datetime.fromisoformat(sent_end):
+            out["status"] = "reset"
+            out["payload"] = reset_payload  # dit bericht moet nu de reset zijn
+            out["block"] = {"start": sent_start, "end": sent_end}
+            return out
 
     dhw = app.build_advice(cfg, _Args(), now).get("dhw") or {}
     if not dhw.get("enabled") or not dhw.get("rows"):
@@ -130,8 +156,9 @@ def decide(cfg: dict, now: datetime) -> dict:
         "mean_cop": best["mean_cop"],
         "mean_corrected_eur_per_kwh_heat": best["mean_corrected"],
     }
-
     start, end = best["start"], best["end"]
+    start_iso = start.isoformat()
+
     window_end = min(end, start + timedelta(minutes=window_min))
     if now < start:
         out["status"] = "wait"
@@ -146,14 +173,32 @@ def decide(cfg: dict, now: datetime) -> dict:
         return out
 
     # nu valt binnen het trigger-venster aan het begin van het blok
-    already = load_state().get("last_sent_start") == start.isoformat()
-    out["status"] = "already_sent" if already else "send"
+    if state.get("last_sent_start") == start_iso:
+        out["status"] = "already_sent"
+    elif _boosted_same_day(state, start):
+        out["status"] = "already_boosted_today"
+    else:
+        out["status"] = "send"
     return out
+
+
+def _boosted_same_day(state: dict, start: datetime) -> bool:
+    """Is er in dezelfde (lokale) dag al een boost verstuurd?
+
+    Bedoeling: het DHW-water wordt één keer per dag bijverwarmd. Als de
+    ochtend-boost is gemist, blokkeert dit niets (dan is er geen boost
+    verstuurd vandaag en mag de eerste alsnog gaan).
+    """
+    last = state.get("last_sent_start")
+    if not last:
+        return False
+    last_dt = datetime.fromisoformat(last)
+    return (start.year, start.month, start.day) == (last_dt.year, last_dt.month, last_dt.day)
 
 
 def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
     """Voer de beslissing uit: publiceer evt. en schrijf de statusfile."""
-    if out["status"] not in ("send", "already_sent"):
+    if out["status"] not in ("send", "already_sent", "reset"):
         return
     if out["status"] == "already_sent" and not force:
         return
@@ -162,12 +207,15 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
     ok = mqtt_out.publish_command(mqtt_cfg, out["topic"], out["payload"])
     out["mqtt_published"] = ok
     if ok:
-        save_state(
-            {
-                "last_sent_start": out["block"]["start"],
-                "sent_at": out["now"],
-            }
-        )
+        state = load_state()
+        if out["status"] == "reset":
+            state["last_reset_start"] = out["block"]["start"]
+            state["reset_at"] = out["now"]
+        else:
+            state["last_sent_start"] = out["block"]["start"]
+            state["last_sent_end"] = out["block"]["end"]
+            state["sent_at"] = out["now"]
+        save_state(state)
 
 
 WATCH_START_MARGIN_SECONDS = 2.0   # wek ~2s NÁ de blokstart (gegarandeerd ≥ start)
@@ -193,8 +241,8 @@ def next_price_refresh(now: datetime, tz: ZoneInfo, hhmm: str) -> datetime:
 
 def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) -> datetime:
     """Het eerstvolgende moment dat iets nuttigs kan veranderen:
-    - blok is bekend: min(blokstart + 2s, eerstvolgende prijs-update ~13:30);
-    - al verstuurd tijdens een blok: min(blokeinde, prijs-update);
+    - blok komt eraan: min(blokstart + 2s, eerstvolgende prijs-update ~13:30);
+    - boost is al verstuurd: het blok EINDE (dan volgt de reset naar default);
     - anders (nog geen blok/vertraagde prijzen): over RETRY_INTERVAL.
     """
     status = out.get("status")
@@ -204,11 +252,23 @@ def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) ->
         return min(start + timedelta(seconds=WATCH_START_MARGIN_SECONDS), refresh)
     if status == "already_sent" and out.get("block"):
         end = datetime.fromisoformat(out["block"]["end"])
-        return min(end, refresh)
+        return end
+    if status == "already_boosted_today":
+        # vandaag al geboost: wakker worden net na middernacht voor morgen
+        midnight = datetime(now.year, now.month, now.day, 0, 0, 2, tzinfo=tz)
+        return midnight + timedelta(days=1)
     return now + timedelta(seconds=RETRY_INTERVAL_DEFAULT)
 
 
-def send_with_retry(out: dict, mqtt_cfg: dict, tz, dry_run: bool) -> bool:
+def send_with_retry(
+    out: dict,
+    mqtt_cfg: dict,
+    tz,
+    dry_run: bool,
+    state_key: str = "last_sent_start",
+    at_key: str = "sent_at",
+    label: str = "boost-commando",
+) -> bool:
     """Publiceer, met retry zolang we nog binnen het trigger-venster zitten."""
     if dry_run:
         return True
@@ -218,13 +278,14 @@ def send_with_retry(out: dict, mqtt_cfg: dict, tz, dry_run: bool) -> bool:
     while True:
         ok = mqtt_out.publish_command(mqtt_cfg, out["topic"], out["payload"])
         if ok:
-            save_state(
-                {
-                    "last_sent_start": out["block"]["start"],
-                    "sent_at": out["now"],
-                }
-            )
-            _log("VERSTUURD →", out["topic"], json.dumps(out["payload"], ensure_ascii=False))
+            state = load_state()
+            state[state_key] = out["block"]["start"]
+            state[at_key] = out["now"]
+            if state_key == "last_sent_start":
+                state["last_sent_end"] = out["block"]["end"]
+            save_state(state)
+            _log("VERSTUURD →", out["topic"],
+                 json.dumps(out["payload"], ensure_ascii=False), f"({label})")
             return True
         _log("FOUT: publish mislukt, probeer opnieuw over", f"{RETRY_SECONDS:g}s")
         now = datetime.now(tz)
@@ -261,6 +322,20 @@ def watch(
                 if not send_with_retry(out, cfg.get("mqtt") or {}, tz, dry_run):
                     return 1
                 continue  # statusfile voorkomt dubbele berichten; op naar het volgende blok
+
+            if status == "reset":
+                _log("blokeinde bereikt — zet gewenste temperatuur terug naar default")
+                if not send_with_retry(
+                    out,
+                    cfg.get("mqtt") or {},
+                    tz,
+                    dry_run,
+                    state_key="last_reset_start",
+                    at_key="reset_at",
+                    label="reset naar default",
+                ):
+                    return 1
+                continue
 
             if status in ("no_dhw", "disabled"):
                 _log("status:", status, "— niets te doen, stop")
@@ -310,6 +385,12 @@ def render_human(out: dict) -> List[str]:
         )
     elif status == "already_sent":
         lines.append("Status  : al verstuurd voor dit blok (geen dubbele berichten)")
+    elif status == "already_boosted_today":
+        lines.append("Status  : vandaag al geboost — geen tweede boost (wacht op morgen)")
+    elif status == "reset":
+        lines.append(
+            f"Status  : TERUGGEZET → {out['topic']} {json.dumps(out['payload'], ensure_ascii=False)} (blok voorbij)"
+        )
     elif status == "wait":
         lines.append(
             f"Status  : wachten (blok begint over {out['wait_minutes']:g} min)"

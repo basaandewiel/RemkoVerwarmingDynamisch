@@ -56,7 +56,8 @@
     "control_topic": "remko/wkf70/set",
     "dhw_boost": {
       "enabled": true,
-      "trigger_minutes": 45
+      "trigger_minutes": 45,
+      "default_temperature": 40
     }
   }
 }
