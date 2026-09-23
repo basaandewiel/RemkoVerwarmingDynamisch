@@ -24,9 +24,12 @@ Werking (beide modi):
   1. berekent hetzelfde advies als main.py (zelfde config),
   2. als 'nu' binnen de eerste `trigger_minutes` van het beste SWW-blok valt,
      wordt het start-commando gepubliceerd op mqtt.control_topic (default
-     <topic_base>/set). De waarde van register 1082 is afgeleid uit
-     heatpump.dhw.temperature uit config.json: temperatuur &times; 10 als
-     hexadecimaal getal (53 &deg;C &rarr; 530 decimal &rarr; "0212").
+     topic_base zélf, bv. V04P26/SMTID/CLIENT2HOST — de gateway luistert
+     daar, niet op een "/set"-subtopic). De waarde van register 1082 is
+     afgeleid uit heatpump.dhw.temperature uit config.json: temperatuur
+     &times; 10 als hexadecimaal getal (53 &deg;C &rarr; 530 decimal &rarr;
+     "0212"), in het formaat dat de gateway accepteert:
+     {"FORCE_RESPONSE": true, "values": {"1082": "0212"}}.
   3. aan het EINDE van het blok wordt de gewenste temperatuur teruggezet
      naar de default (mqtt.dhw_boost.default_temperature, default 40 &deg;C
      &rarr; 400 decimal &rarr; "0190"), zodat de boiler niet de rest van de
@@ -67,10 +70,14 @@ def build_boost_payload(dhw_temperature: float) -> dict:
 
     Voorbeeld: 53 graden -> 530 decimal -> 0x212 -> "0212" (4 cijfers,
     zelfde formaat als het oorspronkelijke "0190" = 0x190 = 40 graden).
+
+    FORCE_RESPONSE wordt door de REMKO-gateway geaccepteerd (net als in haar
+    eigen query-berichten) en dwingt een directe status-reactie af, zodat de
+    publicatie bevestigd wordt op HOST2CLIENT.
     """
     value_dec = int(round(dhw_temperature * 10.0))
     value_hex = format(value_dec, "04x")
-    return {"values": {"1082": value_hex}}
+    return {"FORCE_RESPONSE": True, "values": {"1082": value_hex}}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -108,7 +115,9 @@ def decide(cfg: dict, now: datetime) -> dict:
     mqtt_cfg = cfg.get("mqtt") or {}
     boost_cfg = mqtt_cfg.get("dhw_boost") or {}
     base = mqtt_cfg.get("topic_base", "remko/wkf70").rstrip("/")
-    topic = (mqtt_cfg.get("control_topic") or f"{base}/set").strip()
+    # De REMKO-gateway luistert op CLIENT2HOST zélf (géén "/set"-subtopic):
+    # topic = mqtt.control_topic, tenzij niet gezet -> topic_base.
+    topic = (mqtt_cfg.get("control_topic") or base).strip()
     dhw_cfg = (cfg.get("heatpump") or {}).get("dhw") or {}
     dhw_temp = dhw_cfg.get("temperature", DEFAULT_DHW_TEMP)
     boost_payload = build_boost_payload(float(dhw_temp))

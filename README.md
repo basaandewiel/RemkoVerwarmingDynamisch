@@ -63,13 +63,13 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `prices.price_adjustments.vat_pct` | Btw-percentage op de groothandelsprijs (bv. `21`). Constante factor, verandert de blokkeuze niet. |
 | `prices.price_adjustments.fixed_tax_per_kwh` | Vaste belasting per kWh (bv. energiebelasting €/kWh). **Verandert de blokkeuze wel** (want `(prijs + belasting)/COP`). Standaard 0,12 €/kWh in de config. |
 | `mqtt.*` | MQTT-publicatie (broker, topics). Zet `enabled` op `false` om uit te schakelen. |
-| `mqtt.control_topic` | Topic waarop het **SWW-boost-commando** wordt gepubliceerd (default `<topic_base>/set`). |
+| `mqtt.control_topic` | Topic waarop het **SWW-boost-commando** wordt gepubliceerd. **Default = `topic_base` zelf** — de REMKO-gateway luistert op `V04P26/SMTID/CLIENT2HOST`, dus **niet** op een `/set`-subtopic. |
 | `mqtt.dhw_boost.enabled` | Master-schakelaar voor het boost-commando. |
 | `mqtt.dhw_boost.trigger_minutes` | Venster aan het begin van het SWW-blok (default 45) waarbinnen het commando verstuurd wordt. |
 | `mqtt.dhw_boost.default_temperature` | Temperatuur (°C) **waar de boiler na het goedkoopste blok weer naar teruggezet** wordt (reset-commando aan het blokeinde), default 40 °C. |
 | `mqtt.dhw_boost.qos` | QoS-niveau voor de boost/reset-commando's (default `1`). Met QoS 1 moet de broker de ontvangst bevestigen (PUBACK) **voordat** `VERSTUURD` wordt getoond; bij QoS 0 is er geen garantie. |
 | `mqtt.dhw_boost.retain` | Retain-flag op het commando (default `false`). Zet op `true` als je het laatste commando in MQTT Explorer zichtbaar wilt houden (elke nieuwe boost/reset overschrijft dan de vorige). |
-| `mqtt.dhw_boost.payload` | Wordt **afgeleid**: boost = `heatpump.dhw.temperature` × 10 als hex, reset = `mqtt.dhw_boost.default_temperature` × 10 als hex (53 °C → `"0212"`, 40 °C → `"0190"`). Niet handmatig instellen. |
+| `mqtt.dhw_boost.payload` | Wordt **afgeleid**: boost-setting = `heatpump.dhw.temperature` × 10 als hex, reset = `mqtt.dhw_boost.default_temperature` × 10 als hex (53 °C → `"0212"`, 40 °C → `"0190"`), in het formaat dat de gateway accepteert incl. `FORCE_RESPONSE`. Niet handmatig instellen. |
 
 ## COP-curve van de REMKO WKF 70 (NEO) compact
 
@@ -136,18 +136,24 @@ python3 main.py --no-mqtt
 
 Als `heatpump.dhw.enabled` aan staat, kan het programma op het moment dat
 het **goedkoopste 3-uursblok voor sanitair warm water begint** een
-start-commando naar de warmtepomp sturen: `{"values": {"1082": "<hex>"}}`
-op `mqtt.control_topic` (default `<topic_base>/set`).
+start-commando naar de warmtepomp sturen op `mqtt.control_topic`
+(**default = `topic_base` zelf**, bv. `V04P26/SMTID/CLIENT2HOST` — de
+gateway luistert daar, niet op een `/set`-subtopic):
+
+```json
+{"FORCE_RESPONSE": true, "values": {"1082": "0212"}}
+```
 
 De waarde van register 1082 wordt **afgeleid** uit
 `heatpump.dhw.temperature` uit config.json: de gewenste temperatuur
 (°C × 10), uitgedrukt als hexadecimaal getal. Met 53 °C is dat
-53 × 10 = 530 decimal = `0x212`, dus de payload wordt
-`{"values": {"1082": "0212"}}`.
+53 × 10 = 530 decimal = `0x212`, dus register 1082 wordt `"0212"`.
+`FORCE_RESPONSE` is het veld dat de gateway ook in haar eigen query's
+gebruikt en dwingt een directe status-bevestiging af.
 
 **Aan het einde van het blok** wordt de temperatuur teruggezet naar de
 default uit `mqtt.dhw_boost.default_temperature` (default 40 °C):
-40 × 10 = 400 decimal = `0x190` → `{"values": {"1082": "0190"}}`. Zo
+40 × 10 = 400 decimal = `0x190` → register 1082 wordt `"0190"`. Zo
 verwarmt de boiler niet de rest van de dag door op duur stroom. Dit
 reset-commando gaat alleen uit ná een verstuurd boost-commando voor
 hetzelfde blok; de *stop na het opwarmen* doet de warmtepomp zelf (setpoint).
@@ -205,8 +211,9 @@ zolang het trigger-venster loopt.
 > **QoS 1** verzonden en het script wacht op de broker-bevestiging (PUBACK):
 > zolang de regel `VERSTUURD` niet verschijnt (of juist `FOUT` toont), heeft
 > de broker het bericht niet ontvangen of niet bevestigd. Controleer dan:
-> 1. MQTT Explorer met een **wildcard-subscription** `V04P26/SMTID/CLIENT2HOST/#`
->    (het commando staat op `.../set`);
+> 1. MQTT Explorer met een **wildcard-subscription** `V04P26/SMTID/#`
+>    (het commando staat op `V04P26/SMTID/CLIENT2HOST`, de status met
+>    register 1082 staat op `V04P26/SMTID/HOST2CLIENT`);
 > 2. of Explorer op **dezelfde broker/poort** is aangesloten als
 >    `mqtt.host`/`mqtt.port`;
 > 3. of je ná het versturen subscribe't — bij `retain: false` is een bericht

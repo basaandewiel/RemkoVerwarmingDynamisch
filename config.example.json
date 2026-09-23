@@ -53,7 +53,7 @@
     "password": null,
     "topic_base": "remko/wkf70",
     "qos": 0,
-    "control_topic": "remko/wkf70/set",
+    "control_topic": "remko/wkf70",
     "dhw_boost": {
       "enabled": true,
       "trigger_minutes": 45,
