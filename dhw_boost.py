@@ -150,7 +150,15 @@ def decide(cfg: dict, now: datetime) -> dict:
         if now >= datetime.fromisoformat(sent_end):
             out["status"] = "reset"
             out["payload"] = reset_payload  # dit bericht moet nu de reset zijn
-            out["block"] = {"start": sent_start, "end": sent_end}
+            # COP-gegevens van het oorspronkelijke boost-blok komen uit de
+            # statusfile (slaat bij de boost op); anders ontbreken ze en toont
+            # render_human ze niet.
+            out["block"] = {
+                "start": sent_start,
+                "end": sent_end,
+                "mean_cop": state.get("sent_mean_cop"),
+                "mean_corrected_eur_per_kwh_heat": state.get("sent_mean_corrected"),
+            }
             return out
 
     dhw = app.build_advice(cfg, _Args(), now).get("dhw") or {}
@@ -216,6 +224,8 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
     if out["status"] == "already_sent" and not force:
         return
     if dry_run:
+        out["mqtt_published"] = False
+        out["mqtt_detail"] = "dry-run: niet gepubliceerd"
         return
     ok, detail = mqtt_out.publish_command(
         mqtt_cfg,
@@ -237,6 +247,9 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
             state["last_sent_start"] = out["block"]["start"]
             state["last_sent_end"] = out["block"]["end"]
             state["sent_at"] = out["now"]
+            if out["block"].get("mean_cop") is not None:
+                state["sent_mean_cop"] = out["block"]["mean_cop"]
+                state["sent_mean_corrected"] = out["block"]["mean_corrected_eur_per_kwh_heat"]
         save_state(state)
 
 
@@ -313,6 +326,9 @@ def send_with_retry(
             state[at_key] = out["now"]
             if state_key == "last_sent_start":
                 state["last_sent_end"] = out["block"]["end"]
+                if out["block"].get("mean_cop") is not None:
+                    state["sent_mean_cop"] = out["block"]["mean_cop"]
+                    state["sent_mean_corrected"] = out["block"]["mean_corrected_eur_per_kwh_heat"]
             save_state(state)
             _log("VERSTUURD →", out["topic"],
                  json.dumps(out["payload"], ensure_ascii=False),
@@ -403,16 +419,23 @@ def render_human(out: dict) -> List[str]:
     lines.append(f"Nu      : {app.fmt_dt(datetime.fromisoformat(out['now']))}")
     if "block" in out:
         b = out["block"]
-        lines.append(
-            f"Beste SWW-blok : {app.fmt_dt(datetime.fromisoformat(b['start']))} – "
-            f"{app.fmt_dt(datetime.fromisoformat(b['end']))} "
-            f"(COP {app.nl(b['mean_cop'], 2)}, "
-            f"{app.nl(b['mean_corrected_eur_per_kwh_heat'], 4)} €/kWh warmte)"
-        )
+        start_txt = app.fmt_dt(datetime.fromisoformat(b["start"]))
+        end_txt = app.fmt_dt(datetime.fromisoformat(b["end"]))
+        if b.get("mean_cop") is not None and b.get("mean_corrected_eur_per_kwh_heat") is not None:
+            lines.append(
+                f"Beste SWW-blok : {start_txt} – {end_txt} "
+                f"(COP {app.nl(b['mean_cop'], 2)}, "
+                f"{app.nl(b['mean_corrected_eur_per_kwh_heat'], 4)} €/kWh warmte)"
+            )
+        else:
+            lines.append(f"Beste SWW-blok : {start_txt} – {end_txt}")
 
     status = out["status"]
+    dry = out.get("mqtt_detail", "").startswith("dry-run")
     if status == "send":
-        if out.get("mqtt_published"):
+        if dry:
+            lines.append("Status  : dry-run — niets gepubliceerd")
+        elif out.get("mqtt_published"):
             lines.append(
                 f"Status  : VERSTUURD → {out['topic']} {json.dumps(out['payload'], ensure_ascii=False)}"
             )
@@ -425,7 +448,9 @@ def render_human(out: dict) -> List[str]:
     elif status == "already_boosted_today":
         lines.append("Status  : vandaag al geboost — geen tweede boost (wacht op morgen)")
     elif status == "reset":
-        if out.get("mqtt_published"):
+        if dry:
+            lines.append("Status  : dry-run — reset niet gepubliceerd")
+        elif out.get("mqtt_published"):
             lines.append(
                 f"Status  : TERUGGEZET → {out['topic']} {json.dumps(out['payload'], ensure_ascii=False)} (blok voorbij)"
             )
