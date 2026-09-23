@@ -67,6 +67,8 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.dhw_boost.enabled` | Master-schakelaar voor het boost-commando. |
 | `mqtt.dhw_boost.trigger_minutes` | Venster aan het begin van het SWW-blok (default 45) waarbinnen het commando verstuurd wordt. |
 | `mqtt.dhw_boost.default_temperature` | Temperatuur (°C) **waar de boiler na het goedkoopste blok weer naar teruggezet** wordt (reset-commando aan het blokeinde), default 40 °C. |
+| `mqtt.dhw_boost.qos` | QoS-niveau voor de boost/reset-commando's (default `1`). Met QoS 1 moet de broker de ontvangst bevestigen (PUBACK) **voordat** `VERSTUURD` wordt getoond; bij QoS 0 is er geen garantie. |
+| `mqtt.dhw_boost.retain` | Retain-flag op het commando (default `false`). Zet op `true` als je het laatste commando in MQTT Explorer zichtbaar wilt houden (elke nieuwe boost/reset overschrijft dan de vorige). |
 | `mqtt.dhw_boost.payload` | Wordt **afgeleid**: boost = `heatpump.dhw.temperature` × 10 als hex, reset = `mqtt.dhw_boost.default_temperature` × 10 als hex (53 °C → `"0212"`, 40 °C → `"0190"`). Niet handmatig instellen. |
 
 ## COP-curve van de REMKO WKF 70 (NEO) compact
@@ -198,6 +200,20 @@ Het proces blijft draaien en stuurt per blok precies één start-commando; de
 statusfile in `~/.cache/remko-wkf70/dhw_boost_state.json` voorkomt dubbele
 berichten. Is de broker even bezet, dan probeert het om de 30 s opnieuw
 zolang het trigger-venster loopt.
+
+> **Zie je het bericht niet in MQTT Explorer?** Boost/reset worden met
+> **QoS 1** verzonden en het script wacht op de broker-bevestiging (PUBACK):
+> zolang de regel `VERSTUURD` niet verschijnt (of juist `FOUT` toont), heeft
+> de broker het bericht niet ontvangen of niet bevestigd. Controleer dan:
+> 1. MQTT Explorer met een **wildcard-subscription** `V04P26/SMTID/CLIENT2HOST/#`
+>    (het commando staat op `.../set`);
+> 2. of Explorer op **dezelfde broker/poort** is aangesloten als
+>    `mqtt.host`/`mqtt.port`;
+> 3. of je ná het versturen subscribe't — bij `retain: false` is een bericht
+>    alleen zichtbaar terwijl er live gesubscribe wordt (of zet
+>    `mqtt.dhw_boost.retain` op `true` om het laatste commando vast te houden).
+>    Snel testen vanaf de CLI:
+>    `mosquitto_sub -h 192.168.1.1 -t 'V04P26/SMTID/CLIENT2HOST/#' -v`
 
 **Alternatief: via cron** — een one-shot-check die niets doet als het niet
 de tijd is, maar het commando gaat dan hooguit een cron-interval ná de

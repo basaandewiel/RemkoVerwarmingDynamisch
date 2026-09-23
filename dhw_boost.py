@@ -122,6 +122,10 @@ def decide(cfg: dict, now: datetime) -> dict:
         "topic": topic,
         "payload": boost_payload,
         "reset_payload": reset_payload,
+        # Boost/reset worden met QoS 1 verstuurd: de broker moet de ontvangst
+        # bevestigen (PUBACK) voordat "VERSTUURD" getoond wordt.
+        "qos": int(boost_cfg.get("qos", 1)),
+        "retain": bool(boost_cfg.get("retain", False)),
     }
 
     if not out["enabled"]:
@@ -204,8 +208,17 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
         return
     if dry_run:
         return
-    ok = mqtt_out.publish_command(mqtt_cfg, out["topic"], out["payload"])
+    ok, detail = mqtt_out.publish_command(
+        mqtt_cfg,
+        out["topic"],
+        out["payload"],
+        qos=out.get("qos"),
+        retain=out.get("retain"),
+    )
     out["mqtt_published"] = ok
+    out["mqtt_detail"] = detail
+    if not ok:
+        print(f"FOUT: MQTT-publicatie mislukt: {detail}", file=sys.stderr)
     if ok:
         state = load_state()
         if out["status"] == "reset":
@@ -276,7 +289,15 @@ def send_with_retry(
         datetime.fromisoformat(out["block"]["end"]) if out.get("block") else None
     )
     while True:
-        ok = mqtt_out.publish_command(mqtt_cfg, out["topic"], out["payload"])
+        ok, detail = mqtt_out.publish_command(
+            mqtt_cfg,
+            out["topic"],
+            out["payload"],
+            qos=out.get("qos"),
+            retain=out.get("retain"),
+        )
+        out["mqtt_published"] = ok
+        out["mqtt_detail"] = detail
         if ok:
             state = load_state()
             state[state_key] = out["block"]["start"]
@@ -285,9 +306,11 @@ def send_with_retry(
                 state["last_sent_end"] = out["block"]["end"]
             save_state(state)
             _log("VERSTUURD →", out["topic"],
-                 json.dumps(out["payload"], ensure_ascii=False), f"({label})")
+                 json.dumps(out["payload"], ensure_ascii=False),
+                 f"({label}, {detail})")
             return True
-        _log("FOUT: publish mislukt, probeer opnieuw over", f"{RETRY_SECONDS:g}s")
+        _log("FOUT: publish mislukt —", detail,
+             "— probeer opnieuw over", f"{RETRY_SECONDS:g}s")
         now = datetime.now(tz)
         if window_end and now >= window_end:
             _log("FOUT: kon niet versturen binnen het trigger-venster")
@@ -380,17 +403,27 @@ def render_human(out: dict) -> List[str]:
 
     status = out["status"]
     if status == "send":
-        lines.append(
-            f"Status  : VERSTUURD → {out['topic']} {json.dumps(out['payload'], ensure_ascii=False)}"
-        )
+        if out.get("mqtt_published"):
+            lines.append(
+                f"Status  : VERSTUURD → {out['topic']} {json.dumps(out['payload'], ensure_ascii=False)}"
+            )
+        else:
+            lines.append(
+                f"Status  : FOUT — niet gepubliceerd ({out.get('mqtt_detail', 'onbekend')})"
+            )
     elif status == "already_sent":
         lines.append("Status  : al verstuurd voor dit blok (geen dubbele berichten)")
     elif status == "already_boosted_today":
         lines.append("Status  : vandaag al geboost — geen tweede boost (wacht op morgen)")
     elif status == "reset":
-        lines.append(
-            f"Status  : TERUGGEZET → {out['topic']} {json.dumps(out['payload'], ensure_ascii=False)} (blok voorbij)"
-        )
+        if out.get("mqtt_published"):
+            lines.append(
+                f"Status  : TERUGGEZET → {out['topic']} {json.dumps(out['payload'], ensure_ascii=False)} (blok voorbij)"
+            )
+        else:
+            lines.append(
+                f"Status  : FOUT — niet gepubliceerd ({out.get('mqtt_detail', 'onbekend')})"
+            )
     elif status == "wait":
         lines.append(
             f"Status  : wachten (blok begint over {out['wait_minutes']:g} min)"

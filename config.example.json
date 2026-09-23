@@ -57,7 +57,9 @@
     "dhw_boost": {
       "enabled": true,
       "trigger_minutes": 45,
-      "default_temperature": 40
+      "default_temperature": 40,
+      "qos": 1,
+      "retain": false
     }
   }
 }
