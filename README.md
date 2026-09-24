@@ -202,6 +202,12 @@ ontbreekt, installeert dependencies in `venv/`, en start de service met
 `Restart=on-failure`. Je eigen `config.json` met API-key zet je gemakkelijk
 over vanaf een andere machine: `scp config.json pi@<ip>:~/remkoverwarming/`.
 
+**Handmatige runs op de Pi** moeten via de venv-Python (de systeem-Python
+heeft paho-mqtt niet, en Bookworm blokkeert `pip install --user` / PEP 668):
+`~/remkoverwarming/venv/bin/python3 main.py` (of eerst
+`source ~/remkoverwarming/venv/bin/activate`). Anders toont `main.py`
+`MQTT: niet beschikbaar (paho-mqtt ontbreekt of uitgeschakeld)`.
+
 Handmatig (zonder installatiescript) kan ook, bijv. als de service onder
 jouw eigen user moet draaien:
 
