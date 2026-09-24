@@ -150,6 +150,7 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             days_ahead=days_ahead,
             in_domain=ec.get("in_domain", "10YNL----------L"),
             out_domain=ec.get("out_domain", "10YNL----------L"),
+            cache_ttl_seconds=int(ec.get("cache_ttl_seconds", entsoe.DEFAULT_CACHE_TTL)),
         )
     elif source == "energyzero":
         ez = prices_cfg["energyzero"]

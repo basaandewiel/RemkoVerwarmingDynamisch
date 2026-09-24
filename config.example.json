@@ -33,7 +33,8 @@
     "entsoe": {
       "api_key": "PLAK_HIER_JE_ENTS-OE_API_KEY",
       "in_domain": "10YNL----------L",
-      "out_domain": "10YNL----------L"
+      "out_domain": "10YNL----------L",
+      "cache_ttl_seconds": 3600
     },
     "energyzero": {
       "api_url": "https://api.energyzero.nl/v1/energyprices",

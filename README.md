@@ -59,6 +59,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `prices.days_ahead` | Hoeveel dagen vooruit plannen (day-ahead prijzen zijn meestal ~48 u bekend). |
 | `prices.entsoe.api_key` | **Jouw persoonlijke ENTSO-E API-key** (gratis account op https://transparency.entsoe.eu → My Account → API). |
 | `prices.entsoe.in_domain` / `out_domain` | Biedingszone; NL = `10YNL----------L`. |
+| `prices.entsoe.cache_ttl_seconds` | Houdt de opgehaalde day-ahead prijzen per dag op schijf (default 3600 s). Prijzen veranderen hooguit 1×/dag, dus een watcher hoeft niet bij elke wake de API te bevragen — scheelt aanzienlijk op een trage/overbelaste DNS-server. |
 | `prices.energyzero.*` | Alleen gebruikt als `source` = `energyzero` (gratis, zonder key, maar uurprijzen). |
 | `prices.price_adjustments.vat_pct` | Btw-percentage op de groothandelsprijs (bv. `21`). Constante factor, verandert de blokkeuze niet. |
 | `prices.price_adjustments.fixed_tax_per_kwh` | Vaste belasting per kWh (bv. energiebelasting €/kWh). **Verandert de blokkeuze wel** (want `(prijs + belasting)/COP`). Standaard 0,12 €/kWh in de config. |
@@ -234,6 +235,16 @@ Het proces blijft draaien en stuurt per blok precies één start-commando; de
 statusfile in `~/.cache/remko-wkf70/dhw_boost_state.json` voorkomt dubbele
 berichten. Is de broker even bezet, dan probeert het om de 30 s opnieuw
 zolang het trigger-venster loopt.
+
+De watcher wordt **~2 minuten vóór** de blokstart wakker (de data-ophaal kan
+op een trage DNS-server tientallen seconden duren) en wacht daarna in kleine
+stapjes tot de start. **Zie je telkens `blokstart over ~15 min` en schuift
+die tijd nooit af?** Dan was de wake op `start + 2 s` te laat: tegen de tijd
+dat de herberekening klaar was, sloot `only_future` het net gestarte blok uit
+en koos het script het volgende. Los het op door de nieuwste versie te
+draaien (fix: wake-ahead + wachten in stapjes) **en** `prices.entsoe.cache_ttl_seconds`
+in de config (of `rm -f ~/.cache/remko-wkf70/entsoe_*.json` om een oude
+test-cache te wissen).
 
 > **Zie je het bericht niet in MQTT Explorer?** Boost/reset worden met
 > **QoS 1** verzonden en het script wacht op de broker-bevestiging (PUBACK):

@@ -23,7 +23,10 @@ Returns (zelfde contract als energyzero.fetch_prices):
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import time as _time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -34,6 +37,39 @@ from zoneinfo import ZoneInfo
 
 API_URL = "https://web-api.tp.entsoe.eu/api"
 DEFAULT_DOMAIN = "10YNL----------L"  # Nederland
+DEFAULT_CACHE_TTL = 3600  # dag-ahead prijzen veranderen hooguit 1×/dag
+
+
+def _default_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "remko-wkf70")
+
+
+def _day_cache_path(cache_dir: str, day: date, in_domain: str) -> str:
+    safe_domain = in_domain.replace("/", "_")
+    return os.path.join(cache_dir, f"entsoe_{day:%Y%m%d}_{safe_domain}.json")
+
+
+def _load_day_cache(path: str, ttl_seconds: int) -> Optional[List[Tuple[datetime, float]]]:
+    """Lees een eerder opgehaalde dag uit de cache (None als verlopen/ongeldig)."""
+    try:
+        if not os.path.exists(path):
+            return None
+        if _time.time() - os.path.getmtime(path) >= ttl_seconds:
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return [(datetime.fromisoformat(iso), float(price)) for iso, price in raw]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _save_day_cache(path: str, slots: List[Tuple[datetime, float]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump([(dt.isoformat(), price) for dt, price in slots], fh)
+    except OSError:
+        pass  # cache is een optimalisatie; een volle schijf mag niet crashen
 
 _ACK_TAG = "Acknowledgement_MarketDocument"
 
@@ -69,8 +105,21 @@ def _request_day(
     in_domain: str,
     out_domain: str,
     expected_start_utc: datetime,
+    cache_dir: Optional[str] = None,
+    cache_ttl_seconds: int = DEFAULT_CACHE_TTL,
 ) -> List[Tuple[datetime, float]]:
-    """Haal de day-ahead prijzen van één kalenderdag op (dt_utc, EUR/kWh)."""
+    """Haal de day-ahead prijzen van één kalenderdag op (dt_utc, EUR/kWh).
+
+    Met `cache_dir` wordt de opgehaalde dag tussen cachet (dag-ahead prijzen
+    veranderen hooguit één keer per dag). Zo blijft elke wake van de watcher
+    vrijwel instant, ook op een trage/overbelaste DNS-server.
+    """
+    cache_path = _day_cache_path(cache_dir, day, in_domain) if cache_dir else None
+    if cache_path:
+        cached = _load_day_cache(cache_path, cache_ttl_seconds)
+        if cached is not None:
+            return cached
+
     start_str = f"{day:%Y%m%d}0000"
     end_str = f"{day:%Y%m%d}2359"
     params = {
@@ -127,6 +176,10 @@ def _request_day(
             price_eur_kwh = float(amount) * conversion
             slot_utc = start + timedelta(minutes=(int(position) - 1) * slot_min)
             result.append((slot_utc, price_eur_kwh))
+    if cache_path and result:
+        # alleen niet-lege dagen cachen (een "nog niet gepubliceerde" dag
+        # mag na de TTL gewoon opnieuw worden gevraagd)
+        _save_day_cache(cache_path, result)
     return result
 
 
@@ -145,10 +198,18 @@ def fetch_prices(
     days_ahead: int = 2,
     in_domain: str = DEFAULT_DOMAIN,
     out_domain: str = DEFAULT_DOMAIN,
+    cache_dir: Optional[str] = None,
+    cache_ttl_seconds: int = DEFAULT_CACHE_TTL,
 ) -> Dict:
-    """Haal day-ahead prijzen op voor vandaag .. vandaag+days_ahead-1."""
+    """Haal day-ahead prijzen op voor vandaag .. vandaag+days_ahead-1.
+
+    Antwoorden worden per dag ge-cachet op schijf (standaard 1 uur) zodat een
+    continu draaiende watcher niet bij elke wake de API opnieuw hoeft te
+    bevragen.
+    """
     local_tz = ZoneInfo(tz)
     now_local = datetime.now(local_tz).date()
+    cache_dir = cache_dir or _default_cache_dir()
     slots: List[Tuple[datetime, float]] = []
     for offset in range(days_ahead):
         day = now_local + timedelta(days=offset)
@@ -156,7 +217,15 @@ def fetch_prices(
             day, time.min, tzinfo=local_tz
         ).astimezone(timezone.utc)
         try:
-            day_slots = _request_day(api_key, day, in_domain, out_domain, expected_start_utc)
+            day_slots = _request_day(
+                api_key,
+                day,
+                in_domain,
+                out_domain,
+                expected_start_utc,
+                cache_dir=cache_dir,
+                cache_ttl_seconds=cache_ttl_seconds,
+            )
         except ET.ParseError as exc:
             raise RuntimeError(f"ENTSO-E gaf ongeldige XML terug voor dag {day}") from exc
         slots.extend(day_slots)

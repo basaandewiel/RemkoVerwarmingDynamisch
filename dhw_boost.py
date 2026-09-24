@@ -254,6 +254,10 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
 
 
 WATCH_START_MARGIN_SECONDS = 2.0   # wek ~2s NÁ de blokstart (gegarandeerd ≥ start)
+LEAD_SECONDS = 120.0               # wek deze tijd VÓÓR de blokstart: dan kan de
+                                   # (eventueel trage) herberekening in alle rust
+                                   # klaar zijn, waarna in kleine stapjes tot de
+                                   # start wordt gewacht (zie await_block_start)
 RETRY_SECONDS = 30.0               # tussen pogingen als de broker niet bereikbaar is
 MIN_SLEEP = 5.0                    # ondergrens slaap (voorkomt busy-loop)
 PRICE_REFRESH_DEFAULT = "13:30"    # dagelijks moment waarop dag-ahead-prijzen binnenkomen
@@ -276,7 +280,7 @@ def next_price_refresh(now: datetime, tz: ZoneInfo, hhmm: str) -> datetime:
 
 def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) -> datetime:
     """Het eerstvolgende moment dat iets nuttigs kan veranderen:
-    - blok komt eraan: min(blokstart + 2s, eerstvolgende prijs-update ~13:30);
+    - blok komt eraan: min(blokstart - LEAD, eerstvolgende prijs-update ~13:30);
     - boost is al verstuurd: het blok EINDE (dan volgt de reset naar default);
     - anders (nog geen blok/vertraagde prijzen): over RETRY_INTERVAL.
     """
@@ -284,7 +288,11 @@ def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) ->
     refresh = next_price_refresh(now, tz, refresh_hhmm)
     if status == "wait" and out.get("block"):
         start = datetime.fromisoformat(out["block"]["start"])
-        return min(start + timedelta(seconds=WATCH_START_MARGIN_SECONDS), refresh)
+        # Vóór de start wakker worden (LEAD): een herberekening ná de start
+        # zou het blok door `only_future` verliezen en naar het volgende blok
+        # glijden (de oude 'start + 2s'-marge was te krap voor de trage
+        # data-ophaal op de Pi).
+        return min(start - timedelta(seconds=LEAD_SECONDS), refresh)
     if status == "already_sent" and out.get("block"):
         end = datetime.fromisoformat(out["block"]["end"])
         return end
@@ -293,6 +301,23 @@ def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) ->
         midnight = datetime(now.year, now.month, now.day, 0, 0, 2, tzinfo=tz)
         return midnight + timedelta(days=1)
     return now + timedelta(seconds=RETRY_INTERVAL_DEFAULT)
+
+
+def await_block_start(out: dict, mqtt_cfg: dict, tz: ZoneInfo, dry_run: bool) -> bool:
+    """Wacht in kleine stapjes tot de blokstart en verstuur dan.
+
+    Bewust géén herberekening tussendoor: zodra de start gepasseerd is, sluit
+    `only_future` in find_cheapest_blocks het blok uit en zou de watcher op
+    het *volgende* blok springen — en zo eindeloos doorschuiven. Dag-ahead
+    prijzen zijn stabiel, dus het uitgekozen blok is nog geldig.
+    """
+    start = datetime.fromisoformat(out["block"]["start"])
+    while True:
+        rest = (start - datetime.now(tz)).total_seconds()
+        if rest <= 0:
+            _log("blokstart bereikt — verstuur het boost-commando")
+            return send_with_retry(out, mqtt_cfg, tz, dry_run)
+        time.sleep(min(30.0, max(0.5, rest)))
 
 
 def send_with_retry(
@@ -398,6 +423,19 @@ def watch(
                     else f"status: {status}"
                 )
                 _log(extra)
+
+            # Blok komt binnen LEAD-nadering: niet meer alleen slapen, maar in
+            # kleine stapjes naar de start wachten en dan versturen zonder het
+            # blok opnieuw te berekenen (anders glijdt het steeds door).
+            if status == "wait" and out.get("block"):
+                start = datetime.fromisoformat(out["block"]["start"])
+                rest = (start - now).total_seconds()
+                if rest <= LEAD_SECONDS:
+                    rest_s = max(0.0, rest)
+                    _log(f"blokstart over {rest_s/60:.1f} min — wacht in kleine stapjes")
+                    if not await_block_start(out, cfg.get("mqtt") or {}, tz, dry_run):
+                        return 1
+                    continue
 
             wake = next_wake_time(out, now, tz, refresh_hhmm)
             delay = max(MIN_SLEEP, (wake - now).total_seconds())
