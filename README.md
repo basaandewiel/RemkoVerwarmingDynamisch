@@ -239,8 +239,13 @@ journalctl -u remko-sww-boost -f
 
 Het proces blijft draaien en stuurt per blok precies één start-commando; de
 statusfile in `~/.cache/remko-wkf70/dhw_boost_state.json` voorkomt dubbele
-berichten. Is de broker even bezet, dan probeert het om de 30 s opnieuw
-zolang het trigger-venster loopt.
+berichten. Na een verstuurde boost wordt de watcher precies op het
+**blokeinde** wakker om de temperatuur terug te zetten naar de default
+(`mqtt.dhw_boost.default_temperature`). Is de broker even bezet, dan probeert
+het om de 30 s opnieuw: voor het boost-commando zolang het trigger-venster
+loopt, voor de reset gewoon net zolang tot de broker de ontvangst bevestigt
+(een boiler die op dure stroom op de boost-temperatuur blijft hangen wil je
+niet).
 
 De watcher wordt **~2 minuten vóór** de blokstart wakker (de data-ophaal kan
 op een trage DNS-server tientallen seconden duren) en wacht daarna in kleine

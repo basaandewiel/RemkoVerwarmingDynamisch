@@ -11,6 +11,9 @@ Twee manieren:
   B) --watch (aanbevolen): het script blijft draaien en wordt alleen wakker
      als er iets kan veranderen of gebeuren:
        * de blokstart zelf             -> dan wordt het commando verstuurd;
+       * het einde van een geboost blok      -> de reset terug naar de
+         default-temperatuur (zodra een boost verstuurd is, staat het
+         blokeinde altijd als wake gepland);
        * de dagelijkse prijs-update    -> rond 13:30 verschijnen de
          dag-ahead-prijzen van de volgende dag, de enige keer dat het beste
          blok kan veranderen (--price-refresh-time, default 13:30);
@@ -147,7 +150,8 @@ def decide(cfg: dict, now: datetime) -> dict:
     sent_start = state.get("last_sent_start")
     sent_end = state.get("last_sent_end")
     if sent_start and sent_end and state.get("last_reset_start") != sent_start:
-        if now >= datetime.fromisoformat(sent_end):
+        end_dt = datetime.fromisoformat(sent_end)
+        if now >= end_dt:
             out["status"] = "reset"
             out["payload"] = reset_payload  # dit bericht moet nu de reset zijn
             # COP-gegevens van het oorspronkelijke boost-blok komen uit de
@@ -160,6 +164,12 @@ def decide(cfg: dict, now: datetime) -> dict:
                 "mean_corrected_eur_per_kwh_heat": state.get("sent_mean_corrected"),
             }
             return out
+        # Reset staat nog open maar het blok loopt nog: het blokeinde is dan
+        # het eerstvolgende moment dat er iets te doen valt. Zonder deze
+        # markering zou de watcher doorslapen naar het *volgende* blok (het
+        # lopende blok voldoet door `only_future` niet meer als kandidaat) en
+        # de reset te laat of helemaal niet versturen.
+        out["pending_reset_at"] = sent_end
 
     dhw = app.build_advice(cfg, _Args(), now).get("dhw") or {}
     if not dhw.get("enabled") or not dhw.get("rows"):
@@ -280,12 +290,18 @@ def next_price_refresh(now: datetime, tz: ZoneInfo, hhmm: str) -> datetime:
 
 def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) -> datetime:
     """Het eerstvolgende moment dat iets nuttigs kan veranderen:
+    - een openstaande reset: precies het einde van dat blok (hoogste prioriteit:
+      zonder deze wake slaapt de watcher er met het 'volgende blok' voorbij);
     - blok komt eraan: min(blokstart - LEAD, eerstvolgende prijs-update ~13:30);
     - boost is al verstuurd: het blok EINDE (dan volgt de reset naar default);
     - anders (nog geen blok/vertraagde prijzen): over RETRY_INTERVAL.
     """
     status = out.get("status")
     refresh = next_price_refresh(now, tz, refresh_hhmm)
+    if out.get("pending_reset_at"):
+        # Er is een boost verstuurd waarvan de reset nog niet gedaan is: het
+        # einde van dát blok is het moment dat telt, vóór elk ander blok.
+        return datetime.fromisoformat(out["pending_reset_at"])
     if status == "wait" and out.get("block"):
         start = datetime.fromisoformat(out["block"]["start"])
         # Vóór de start wakker worden (LEAD): een herberekening ná de start
@@ -303,20 +319,41 @@ def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) ->
     return now + timedelta(seconds=RETRY_INTERVAL_DEFAULT)
 
 
-def await_block_start(out: dict, mqtt_cfg: dict, tz: ZoneInfo, dry_run: bool) -> bool:
+def await_block_start(out: dict, cfg: dict, tz: ZoneInfo, dry_run: bool) -> bool:
     """Wacht in kleine stapjes tot de blokstart en verstuur dan.
 
     Bewust géén herberekening tussendoor: zodra de start gepasseerd is, sluit
     `only_future` in find_cheapest_blocks het blok uit en zou de watcher op
     het *volgende* blok springen — en zo eindeloos doorschuiven. Dag-ahead
     prijzen zijn stabiel, dus het uitgekozen blok is nog geldig.
+
+    Op het moment van verzenden wordt de status wél nogmaals bepaald: er kan
+    in de tussentijd al een boost zijn verstuurd, de daglimiet zijn bereikt
+    of een reset klaarstaan. Alleen bij 'send' gaat het boost-commando echt
+    uit; staat er juist een reset open, dan gaat díe.
     """
     start = datetime.fromisoformat(out["block"]["start"])
     while True:
         rest = (start - datetime.now(tz)).total_seconds()
         if rest <= 0:
-            _log("blokstart bereikt — verstuur het boost-commando")
-            return send_with_retry(out, mqtt_cfg, tz, dry_run)
+            fresh = decide(cfg, datetime.now(tz))
+            if fresh["status"] == "send":
+                _log("blokstart bereikt — verstuur het boost-commando")
+                return send_with_retry(fresh, cfg.get("mqtt") or {}, tz, dry_run)
+            if fresh["status"] == "reset":
+                _log("blokstart bereikt — reset staat klaar, stuur de reset")
+                return send_with_retry(
+                    fresh,
+                    cfg.get("mqtt") or {},
+                    tz,
+                    dry_run,
+                    state_key="last_reset_start",
+                    at_key="reset_at",
+                    label="reset naar default",
+                )
+            _log("blokstart bereikt, niets te versturen (status:",
+                 fresh["status"], ")")
+            return True
         time.sleep(min(30.0, max(0.5, rest)))
 
 
@@ -329,12 +366,19 @@ def send_with_retry(
     at_key: str = "sent_at",
     label: str = "boost-commando",
 ) -> bool:
-    """Publiceer, met retry zolang we nog binnen het trigger-venster zitten."""
+    """Publiceer, met retry zolang dat nodig is.
+
+    Alleen het boost-commando heeft een uiterste verstuurtijdstip (het einde
+    van het trigger-venster = blokeinde). Een reset terug naar de default
+    moet juist áltijd blijven proberen (elke RETRY_SECONDS) tot de broker de
+    ontvangst bevestigt: de boiler mag niet op de dure boost-temperatuur
+    blijven hangen omdat de broker één keer even onbereikbaar was.
+    """
     if dry_run:
         return True
-    window_end = (
-        datetime.fromisoformat(out["block"]["end"]) if out.get("block") else None
-    )
+    deadline = None
+    if state_key == "last_sent_start" and out.get("block"):
+        deadline = datetime.fromisoformat(out["block"]["end"])
     while True:
         ok, detail = mqtt_out.publish_command(
             mqtt_cfg,
@@ -362,7 +406,7 @@ def send_with_retry(
         _log("FOUT: publish mislukt —", detail,
              "— probeer opnieuw over", f"{RETRY_SECONDS:g}s")
         now = datetime.now(tz)
-        if window_end and now >= window_end:
+        if deadline and now >= deadline:
             _log("FOUT: kon niet versturen binnen het trigger-venster")
             return False
         time.sleep(RETRY_SECONDS)
@@ -377,8 +421,9 @@ def watch(
 ) -> int:
     """Blijf draaien: slaap tot het relevante moment en verstuur dan precies.
 
-    Samen met de status uit `decide` is elke wake een van drie dingen:
-    - blokstart bereikt  -> verstuur (-commando);
+    Samen met de status uit `decide` is elke wake een van vier dingen:
+    - blokstart bereikt  -> verstuur het boost-commando;
+    - blokeinde bereikt (reset staat open) -> zet terug naar de default;
     - dagelijkse prijs-update ~13:30 -> herbereken het advies;
     - (alleen als er nog geen blok is) elke `retry_interval` seconden.
     """
@@ -433,7 +478,7 @@ def watch(
                 if rest <= LEAD_SECONDS:
                     rest_s = max(0.0, rest)
                     _log(f"blokstart over {rest_s/60:.1f} min — wacht in kleine stapjes")
-                    if not await_block_start(out, cfg.get("mqtt") or {}, tz, dry_run):
+                    if not await_block_start(out, cfg, tz, dry_run):
                         return 1
                     continue
 
