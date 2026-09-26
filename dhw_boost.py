@@ -392,7 +392,10 @@ def send_with_retry(
         if ok:
             state = load_state()
             state[state_key] = out["block"]["start"]
-            state[at_key] = out["now"]
+            # Werkelijke publicatiemoment, niet het (mogelijk minuten oudere)
+            # beslissingstijdstip uit `out["now"]` (de watcher wekt LEAD
+            # seconden vóór de start en publiceert pas ná de start).
+            state[at_key] = datetime.now(tz).isoformat()
             if state_key == "last_sent_start":
                 state["last_sent_end"] = out["block"]["end"]
                 if out["block"].get("mean_cop") is not None:
