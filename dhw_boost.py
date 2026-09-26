@@ -188,7 +188,6 @@ def decide(cfg: dict, now: datetime) -> dict:
         "mean_corrected_eur_per_kwh_heat": best["mean_corrected"],
     }
     start, end = best["start"], best["end"]
-    start_iso = start.isoformat()
 
     window_end = min(end, start + timedelta(minutes=window_min))
     if now < start:
@@ -204,12 +203,7 @@ def decide(cfg: dict, now: datetime) -> dict:
         return out
 
     # nu valt binnen het trigger-venster aan het begin van het blok
-    if state.get("last_sent_start") == start_iso:
-        out["status"] = "already_sent"
-    elif _boosted_same_day(state, start):
-        out["status"] = "already_boosted_today"
-    else:
-        out["status"] = "send"
+    out["status"] = _boost_pending_actions(state, start)
     return out
 
 
@@ -225,6 +219,22 @@ def _boosted_same_day(state: dict, start: datetime) -> bool:
         return False
     last_dt = datetime.fromisoformat(last)
     return (start.year, start.month, start.day) == (last_dt.year, last_dt.month, last_dt.day)
+
+
+def _boost_pending_actions(state: dict, start: datetime) -> str:
+    """Nogmaals de beslisregels tegenover de statusfile, nú voordat er een
+    boost voor een gepland blok verstuurd wordt.
+
+    Geeft 'send' | 'already_sent' | 'already_boosted_today'. Dit gebeurt
+    nadrukkelijk ZONDER het advies opnieuw te berekenen: een herberekening
+    zou het (inmiddels gestarte) blok door `only_future` verliezen en de
+    boost eindeloos doorschuiven.
+    """
+    if state.get("last_sent_start") == start.isoformat():
+        return "already_sent"
+    if _boosted_same_day(state, start):
+        return "already_boosted_today"
+    return "send"
 
 
 def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
@@ -322,38 +332,54 @@ def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) ->
 def await_block_start(out: dict, cfg: dict, tz: ZoneInfo, dry_run: bool) -> bool:
     """Wacht in kleine stapjes tot de blokstart en verstuur dan.
 
-    Bewust géén herberekening tussendoor: zodra de start gepasseerd is, sluit
-    `only_future` in find_cheapest_blocks het blok uit en zou de watcher op
-    het *volgende* blok springen — en zo eindeloos doorschuiven. Dag-ahead
-    prijzen zijn stabiel, dus het uitgekozen blok is nog geldig.
+    Bewust géén herberekening op het vuurmoment: zodra de start gepasseerd
+    is, sluit `only_future` het net gestarte blok uit en zou een verse
+    `decide()` dat blok verliezen en naar het volgende doorschuiven (zie
+    26-09: 'blokstart bereikt, niets te versturen (status: wait)' na élke
+    start). Dag-ahead-prijzen zijn stabiel, dus het geplande blok is geldig.
 
-    Op het moment van verzenden wordt de status wél nogmaals bepaald: er kan
-    in de tussentijd al een boost zijn verstuurd, de daglimiet zijn bereikt
-    of een reset klaarstaan. Alleen bij 'send' gaat het boost-commando echt
-    uit; staat er juist een reset open, dan gaat díe.
+    Wel wordt vlak vóór het versturen tegen de statusfile gecontroleerd:
+    is het blok al verstuurd, de daglimiet bereikt, of staat er een reset
+    van een eerder blok klaar — dan gaat die respectievelijk niét of éérst.
     """
     start = datetime.fromisoformat(out["block"]["start"])
     while True:
         rest = (start - datetime.now(tz)).total_seconds()
         if rest <= 0:
-            fresh = decide(cfg, datetime.now(tz))
-            if fresh["status"] == "send":
-                _log("blokstart bereikt — verstuur het boost-commando")
-                return send_with_retry(fresh, cfg.get("mqtt") or {}, tz, dry_run)
-            if fresh["status"] == "reset":
-                _log("blokstart bereikt — reset staat klaar, stuur de reset")
-                return send_with_retry(
-                    fresh,
-                    cfg.get("mqtt") or {},
-                    tz,
-                    dry_run,
-                    state_key="last_reset_start",
-                    at_key="reset_at",
-                    label="reset naar default",
-                )
-            _log("blokstart bereikt, niets te versturen (status:",
-                 fresh["status"], ")")
-            return True
+            now = datetime.now(tz)
+            state = load_state()
+            # 1) reset van een eerder blok nog open? Die eerst (defensief: bij
+            #    normaal verloop is de wake daarop al eerder uitgeraakt).
+            sent_start = state.get("last_sent_start")
+            sent_end = state.get("last_sent_end")
+            if (
+                sent_start
+                and sent_end
+                and state.get("last_reset_start") != sent_start
+                and now >= datetime.fromisoformat(sent_end)
+            ):
+                fresh = decide(cfg, now)
+                if fresh["status"] == "reset":
+                    _log("blokstart bereikt — reset van het vorige blok staat "
+                         "klaar, stuur de reset")
+                    return send_with_retry(
+                        fresh,
+                        cfg.get("mqtt") or {},
+                        tz,
+                        dry_run,
+                        state_key="last_reset_start",
+                        at_key="reset_at",
+                        label="reset naar default",
+                    )
+                _log("FOUT: reset staat open maar decide gaf", fresh["status"])
+                return True
+            # 2) al verstuurd / vandaag al geboost? Dan niet nóg een boost.
+            guard = _boost_pending_actions(state, start)
+            if guard != "send":
+                _log("blokstart bereikt, niets te versturen (", guard, ")")
+                return True
+            _log("blokstart bereikt — verstuur het boost-commando")
+            return send_with_retry(out, cfg.get("mqtt") or {}, tz, dry_run)
         time.sleep(min(30.0, max(0.5, rest)))
 
 

@@ -125,9 +125,9 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertEqual(out["status"], "wait")
 
     def test_no_second_boost_same_day(self):
-        """Blok grenst aan het gebooste blok (zelfde dag): op het vuurmoment
-        moet decide() 'already_boosted_today' geven, zodat await_block_start
-        géén tweede boost verstuurt."""
+        """Blok grenst aan het gebooste blok (zelfde dag): binnen het
+        trigger-venster moet decide() 'already_boosted_today' geven, zodat er
+        géén tweede boost verstuurd wordt."""
         self._write_state(DONE_STATE)
         adjacent = {
             "start": datetime.fromisoformat("2026-09-25T15:15:00+02:00"),
@@ -136,10 +136,49 @@ class DhwBoostResetTest(unittest.TestCase):
             "mean_corrected": 0.051,
         }
         self._next_block = adjacent
-        # In de trigger-venster van het aangrenzende blok (status zou 'send'
+        # In het trigger-venster van het aangrenzende blok (status zou 'send'
         # zijn zonder daglimiet):
         out = dhw_boost.decide(CFG, datetime.fromisoformat("2026-09-25T15:20:00+02:00"))
         self.assertEqual(out["status"], "already_boosted_today")
+
+    def test_guard_send_when_no_previous_boost(self):
+        """Zonder eerdere boost mag er verstuurd worden."""
+        self.assertEqual(
+            dhw_boost._boost_pending_actions(
+                {}, datetime.fromisoformat("2026-09-26T12:45:00+02:00")
+            ),
+            "send",
+        )
+
+    def test_guard_already_sent_same_block(self):
+        """Hetzelfde blok staat als verstuurd in de statusfile -> niet opnieuw."""
+        start = "2026-09-26T12:45:00+02:00"
+        self.assertEqual(
+            dhw_boost._boost_pending_actions(
+                {"last_sent_start": start}, datetime.fromisoformat(start)
+            ),
+            "already_sent",
+        )
+
+    def test_guard_no_second_boost_same_day_via_state(self):
+        """Alleen op statusfile gebaseerd: vandaag al een boost -> niet sturen."""
+        self.assertEqual(
+            dhw_boost._boost_pending_actions(
+                {"last_sent_start": "2026-09-26T09:00:00+02:00"},
+                datetime.fromisoformat("2026-09-26T12:45:00+02:00"),
+            ),
+            "already_boosted_today",
+        )
+
+    def test_guard_send_next_day(self):
+        """Volgende dag: gewoon weer versturen."""
+        self.assertEqual(
+            dhw_boost._boost_pending_actions(
+                {"last_sent_start": "2026-09-26T09:00:00+02:00"},
+                datetime.fromisoformat("2026-09-27T12:45:00+02:00"),
+            ),
+            "send",
+        )
 
     def test_reset_takes_priority_over_next_block_wake(self):
         """Een openstaande reset moet voorrang hebben op de wake van een
