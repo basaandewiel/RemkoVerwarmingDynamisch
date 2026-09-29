@@ -41,9 +41,11 @@ Werking (beide modi):
   4. een statusfile in ~/.cache/remko-wkf70 onthoudt per blok-start welke
      commando's (boost én reset) er al verstuurd zijn, zodat er geen dubbele
      berichten tijdens hetzelfde blok uitgaan.
-  5. er gaat maximaal één boost per lokale dag uit (het water wordt één keer
-     per dag bijverwarmd). Is de eerste boost van de dag gemist, dan mag de
-     eerstvolgende alsnog gaan.
+  5. er gaan maximaal `boosts_per_day` boosts per lokale dag uit (default 2).
+     De volgende boost wordt pas gepland ná `min_gap_hours` uur ná het einde
+     van de vorige, zodat een tweede opwarmperiode écht niet vlak na de
+     eerste ligt (geen aangrenzende/naburige goedkoopste momenten). Wordt een
+     boost gemist, dan mag de eerstvolgende alsnog gaan.
 
 Het reset-commando wordt alleen gestuurd ná een verstuurd boost-commando
 voor datzelfde blok; is het blok gemist, dan blijft de standaardwaarde
@@ -63,9 +65,12 @@ from zoneinfo import ZoneInfo
 
 import main as app
 import mqtt_out
+from optimizer import find_cheapest_blocks
 
 DEFAULT_DHW_TEMP = 53.0
 DEFAULT_RESET_TEMP = 40.0
+DEFAULT_BOOSTS_PER_DAY = 2    # meerdere opwarmmomenten per dag
+DEFAULT_BOOST_GAP_HOURS = 4.0  # min. uren tussen einde vorige boost en start volgende
 
 
 def build_boost_payload(dhw_temperature: float) -> dict:
@@ -171,12 +176,24 @@ def decide(cfg: dict, now: datetime) -> dict:
         # de reset te laat of helemaal niet versturen.
         out["pending_reset_at"] = sent_end
 
-    dhw = app.build_advice(cfg, _Args(), now).get("dhw") or {}
+    advice = app.build_advice(cfg, _Args(), now)
+    dhw = advice.get("dhw") or {}
     if not dhw.get("enabled") or not dhw.get("rows"):
         out["status"] = "no_dhw"
         return out
 
-    best = dhw.get("best")
+    boosts_per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
+    out["boosts_per_day"] = boosts_per_day
+    out["min_gap_hours"] = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
+    out["boosts_today"] = _count_boosts_today(state, now)
+
+    # Daglimiet bereikt (bv. 2 van de 2 boosts vandaag al verstuurd)? Dan geen
+    # nieuw blok meer plannen: wakker worden net na middernacht voor morgen.
+    if out["boosts_today"] >= boosts_per_day:
+        out["status"] = "already_boosted_today"
+        return out
+
+    best = _next_boost_block(cfg, advice, boost_cfg, state, now)
     if not best:
         out["status"] = "no_block"
         return out
@@ -203,25 +220,66 @@ def decide(cfg: dict, now: datetime) -> dict:
         return out
 
     # nu valt binnen het trigger-venster aan het begin van het blok
-    out["status"] = _boost_pending_actions(state, start)
+    out["status"] = _boost_pending_actions(state, start, boosts_per_day)
     return out
 
 
-def _boosted_same_day(state: dict, start: datetime) -> bool:
-    """Is er in dezelfde (lokale) dag al een boost verstuurd?
+def _count_boosts_today(state: dict, dt: datetime) -> int:
+    """Hoeveel boosts zijn er vandaag al verstuurd (geteld op de lokale
+    kalenderdag van de blokstart)? De boekhouding staat in
+    state['daily_boosts'] = { "lokale datum": ["blokstart-ISO", ...] }."""
+    day = dt.date().isoformat()
+    return len((state.get("daily_boosts") or {}).get(day, []))
 
-    Bedoeling: het DHW-water wordt één keer per dag bijverwarmd. Als de
-    ochtend-boost is gemist, blokkeert dit niets (dan is er geen boost
-    verstuurd vandaag en mag de eerste alsnog gaan).
+
+def _record_boost_today(state: dict, start: datetime) -> None:
+    """Registreer een verstuurde boost (voor de daglimiet-boekhouding)."""
+    day = start.date().isoformat()
+    daily = state.setdefault("daily_boosts", {})
+    daily.setdefault(day, []).append(start.isoformat())
+    # oude dagen weggooien; de limiet telt alleen per lokale dag
+    recent = sorted(daily)[-7:]
+    state["daily_boosts"] = {d: daily[d] for d in recent}
+
+
+def _next_boost_block(
+    cfg: dict, advice: dict, boost_cfg: dict, state: dict, now: datetime
+):
+    """Het goedkoopste beschikbare blok voor de VOLGENDE boost.
+
+    Wanneer er al een boost verstuurd is, mag het volgende blok pas starten
+    ná `min_gap_hours` uur ná het einde van die boost — anders zou de tweede
+    opwarmperiode vlak na de eerste liggen (het advies kiest 'slim' hetzelfde
+    of aangrenzende goedkope moment). Zonder eerdere boost is het gewoon het
+    goedkoopste blok vanaf nu.
     """
-    last = state.get("last_sent_start")
-    if not last:
-        return False
-    last_dt = datetime.fromisoformat(last)
-    return (start.year, start.month, start.day) == (last_dt.year, last_dt.month, last_dt.day)
+    gap_hours = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
+    dhw = advice.get("dhw") or {}
+    rows = dhw.get("rows") or []
+    granularity_min = int((advice.get("prices") or {}).get("granularity_min", 15))
+    opt_cfg = cfg.get("optimization") or {}
+    block_hours = int(opt_cfg.get("block_hours", 3))
+
+    earliest_start = now
+    last_end = state.get("last_sent_end")
+    if last_end:
+        after_prev = datetime.fromisoformat(last_end) + timedelta(hours=gap_hours)
+        if now < after_prev:
+            earliest_start = after_prev
+
+    blocks = find_cheapest_blocks(
+        rows,
+        granularity_min=granularity_min,
+        block_hours=block_hours,
+        only_future=True,
+        top_n=1,
+        now=now,
+        earliest_start=earliest_start,
+    )
+    return blocks[0] if blocks else None
 
 
-def _boost_pending_actions(state: dict, start: datetime) -> str:
+def _boost_pending_actions(state: dict, start: datetime, boosts_per_day: int) -> str:
     """Nogmaals de beslisregels tegenover de statusfile, nú voordat er een
     boost voor een gepland blok verstuurd wordt.
 
@@ -232,7 +290,7 @@ def _boost_pending_actions(state: dict, start: datetime) -> str:
     """
     if state.get("last_sent_start") == start.isoformat():
         return "already_sent"
-    if _boosted_same_day(state, start):
+    if _count_boosts_today(state, start) >= boosts_per_day:
         return "already_boosted_today"
     return "send"
 
@@ -266,6 +324,7 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
         else:
             state["last_sent_start"] = out["block"]["start"]
             state["last_sent_end"] = out["block"]["end"]
+            _record_boost_today(state, datetime.fromisoformat(out["block"]["start"]))
             state["sent_at"] = out["now"]
             if out["block"].get("mean_cop") is not None:
                 state["sent_mean_cop"] = out["block"]["mean_cop"]
@@ -373,8 +432,10 @@ def await_block_start(out: dict, cfg: dict, tz: ZoneInfo, dry_run: bool) -> bool
                     )
                 _log("FOUT: reset staat open maar decide gaf", fresh["status"])
                 return True
-            # 2) al verstuurd / vandaag al geboost? Dan niet nóg een boost.
-            guard = _boost_pending_actions(state, start)
+            # 2) al verstuurd / daglimiet bereikt? Dan niet nóg een boost.
+            guard = _boost_pending_actions(
+                state, start, out.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY)
+            )
             if guard != "send":
                 _log("blokstart bereikt, niets te versturen (", guard, ")")
                 return True
@@ -424,6 +485,7 @@ def send_with_retry(
             state[at_key] = datetime.now(tz).isoformat()
             if state_key == "last_sent_start":
                 state["last_sent_end"] = out["block"]["end"]
+                _record_boost_today(state, datetime.fromisoformat(out["block"]["start"]))
                 if out["block"].get("mean_cop") is not None:
                     state["sent_mean_cop"] = out["block"]["mean_cop"]
                     state["sent_mean_corrected"] = out["block"]["mean_corrected_eur_per_kwh_heat"]
@@ -529,6 +591,11 @@ def render_human(out: dict) -> List[str]:
     lines.append("SWW-boost — dynamisch stroomadvies")
     lines.append("=" * 64)
     lines.append(f"Nu      : {app.fmt_dt(datetime.fromisoformat(out['now']))}")
+    if "boosts_per_day" in out:
+        lines.append(
+            f"Plan    : {out['boosts_per_day']}x/dag, min. {out['min_gap_hours']:g} u "
+            f"tussen de blokken — vandaag {out.get('boosts_today', 0)}/{out['boosts_per_day']} verstuurd"
+        )
     if "block" in out:
         b = out["block"]
         start_txt = app.fmt_dt(datetime.fromisoformat(b["start"]))
@@ -558,7 +625,11 @@ def render_human(out: dict) -> List[str]:
     elif status == "already_sent":
         lines.append("Status  : al verstuurd voor dit blok (geen dubbele berichten)")
     elif status == "already_boosted_today":
-        lines.append("Status  : vandaag al geboost — geen tweede boost (wacht op morgen)")
+        n = out.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY)
+        t = out.get("boosts_today", n)
+        lines.append(
+            f"Status  : daglimiet bereikt ({t}/{n} boosts vandaag) — wacht op morgen"
+        )
     elif status == "reset":
         if dry:
             lines.append("Status  : dry-run — reset niet gepubliceerd")

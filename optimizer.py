@@ -57,14 +57,30 @@ def find_cheapest_blocks(
     only_future: bool = True,
     top_n: int = 3,
     now: Optional[datetime] = None,
+    earliest_start: Optional[datetime] = None,
 ) -> List[Dict]:
-    """Zoek de goedkoopste aaneengesloten blokken van `block_hours` uur."""
+    """Zoek de goedkoopste aaneengesloten blokken van `block_hours` uur.
+
+    `earliest_start` (optioneel): geen blok start vóór dit tijdstip. Handig
+    voor meerdere boosts per dag: het volgende blok moet pas beginnen ná een
+    minimale tussenruimte na het vorige (anders kiest het advies twee keer
+    hetzelfde/naburige goedkoopste moment).
+
+    Kies het goedkoopste blok na een bepaalde tijd (bijv. na het einde van
+    het vorige boost-blok + tussenruimte), zodat de tweede boost écht "niet
+    vlak na de eerste" ligt.
+    """
     if len(rows) < 2:
         return []
 
     now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     if not only_future:
         now_utc = datetime.min.replace(tzinfo=timezone.utc)
+    # earliest_start: elk blok mag pas beginnen op/na dit tijdstip (ook als
+    # dat vóór 'now' ligt, dan houdt only_future de boel al af).
+    earliest_utc = None
+    if earliest_start is not None:
+        earliest_utc = earliest_start.astimezone(timezone.utc)
 
     n_slots = max(1, round(block_hours * 60 / granularity_min))
     slot_delta = timedelta(minutes=granularity_min)
@@ -80,6 +96,8 @@ def find_cheapest_blocks(
         if not contiguous:
             continue
         if window[0]["dt_utc"] < now_utc:
+            continue
+        if earliest_utc is not None and window[0]["dt_utc"] < earliest_utc:
             continue
 
         mean_price = sum(r["price"] for r in window) / n_slots

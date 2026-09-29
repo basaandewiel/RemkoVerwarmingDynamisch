@@ -59,6 +59,8 @@
       "enabled": true,
       "trigger_minutes": 45,
       "default_temperature": 40,
+      "boosts_per_day": 2,
+      "min_gap_hours": 4.0,
       "qos": 1,
       "retain": false
     }
