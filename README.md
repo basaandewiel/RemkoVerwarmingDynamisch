@@ -68,7 +68,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.dhw_boost.enabled` | Master-schakelaar voor het boost-commando. |
 | `mqtt.dhw_boost.trigger_minutes` | Venster aan het begin van het SWW-blok (default 45) waarbinnen het commando verstuurd wordt. |
 | `mqtt.dhw_boost.default_temperature` | Temperatuur (°C) **waar de boiler na het goedkoopste blok weer naar teruggezet** wordt (reset-commando aan het blokeinde), default 40 °C. |
-| `mqtt.dhw_boost.boosts_per_day` | Maximaal aantal boosts per lokale dag (default 2). SWW-verwarming over de dag gespreid, i.p.v. één keer per dag. |
+| `mqtt.dhw_boost.boosts_per_day` | Maximaal aantal boosts per **rollend 24-uursvenster** (default 2). Géén kalenderdag-grens: de tweede boost mag gewoon op een andere dag vallen, mits er altijd ~2 opwarmmomenten binnen 24 uur plaatsvinden. |
 | `mqtt.dhw_boost.min_gap_hours` | Minimum uren tussen het **einde van de vorige boost** en de **start van de volgende** (default 4). Zorgt dat een tweede opwarmperiode niet vlak na de eerste ligt. |
 | `mqtt.dhw_boost.qos` | QoS-niveau voor de boost/reset-commando's (default `1`). Met QoS 1 moet de broker de ontvangst bevestigen (PUBACK) **voordat** `VERSTUURD` wordt getoond; bij QoS 0 is er geen garantie. |
 | `mqtt.dhw_boost.retain` | Retain-flag op het commando (default `false`). Zet op `true` als je het laatste commando in MQTT Explorer zichtbaar wilt houden (elke nieuwe boost/reset overschrijft dan de vorige). |
@@ -161,12 +161,16 @@ verwarmt de boiler niet de rest van de dag door op duur stroom. Dit
 reset-commando gaat alleen uit ná een verstuurd boost-commando voor
 hetzelfde blok; de *stop na het opwarmen* doet de warmtepomp zelf (setpoint).
 
-Er gaan maximaal **`mqtt.dhw_boost.boosts_per_day`** boosts per lokale dag uit
-(default 2 — één keer per dag bijverwarmen is vaak te weinig voor SWW). De
-volgende boost wordt pas gepland **ná `min_gap_hours` uur ná het einde** van
-de vorige (default 4 u), zodat een tweede opwarmperiode écht niet vlak na de
-eerste ligt — het advies zou anders twee keer (bijna) hetzelfde goedkope
-moment kiezen. Wordt een boost gemist, dan mag de eerstvolgende alsnog gaan.
+Er gaan maximaal **`mqtt.dhw_boost.boosts_per_day`** boosts per **rollend
+24-uursvenster** uit (default 2 — één keer per dag bijverwarmen is vaak te
+weinig voor SWW; de tweede boost hoeft dus **niet op dezelfde kalenderdag**
+te vallen). De volgende boost wordt pas gepland **ná `min_gap_hours` uur ná
+het einde** van de vorige (default 4 u), zodat een tweede opwarmperiode écht
+niet vlak na de eerste ligt — het advies zou anders twee keer (bijna)
+hetzelfde goedkope moment kiezen. Zit het venster vol, dan wacht de watcher
+tot het oudste blok er weer uit valt; een derde boost kan dus nooit binnen
+24 uur na de eerste twee starten. Wordt een boost gemist, dan mag de
+eerstvolgende alsnog gaan.
 
 **Aanbevolen: `--watch`** — een continu draaiend proces dat vrijwel exact op
 de blokstart verstuurt. Het wordt alleen wakker als er iets kan veranderen
@@ -305,7 +309,7 @@ Is `heatpump.dhw.enabled` aan, dan komt daar een aparte sectie
 beste 3-uursblok voor het opwarmen tot 53 °C (op basis van de SWW-COP)
 én de **geplande SWW-boosts**: de `boosts_per_day` opwarmmomenten die
 `dhw_boost` gaat uitsturen, telkens min. `min_gap_hours` uur na het
-einde van de vorige (dus écht gespreid over de dag).
+einde van de vorige (dus écht gespreid, over een rollend 24-uursvenster).
 
 Met MQTT ingeschakeld wordt gepubliceerd (paylod = JSON):
 

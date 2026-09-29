@@ -375,7 +375,7 @@ def render_human(result: dict) -> str:
             lines.append("")
             lines.append(
                 "GEPLANDE SWW-BOOSTS"
-                f" ({dhw.get('boosts_per_day')}x/dag, min. "
+                f" ({dhw.get('boosts_per_day')}x per 24 u, min. "
                 f"{dhw.get('min_gap_hours') or 0.0:g} u tussen de blokken):"
             )
             lines.append("-" * 64)

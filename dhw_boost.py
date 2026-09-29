@@ -41,11 +41,14 @@ Werking (beide modi):
   4. een statusfile in ~/.cache/remko-wkf70 onthoudt per blok-start welke
      commando's (boost én reset) er al verstuurd zijn, zodat er geen dubbele
      berichten tijdens hetzelfde blok uitgaan.
-  5. er gaan maximaal `boosts_per_day` boosts per lokale dag uit (default 2).
-     De volgende boost wordt pas gepland ná `min_gap_hours` uur ná het einde
-     van de vorige, zodat een tweede opwarmperiode écht niet vlak na de
-     eerste ligt (geen aangrenzende/naburige goedkoopste momenten). Wordt een
-     boost gemist, dan mag de eerstvolgende alsnog gaan.
+  5. er gaan maximaal `boosts_per_day` boosts per **rollend venster van 24 uur**
+   uit (default 2, niet gebonden aan een kalenderdag). De volgende boost wordt
+   pas gepland ná `min_gap_hours` uur ná het einde van de vorige, zodat een
+   tweede opwarmperiode écht niet vlak na de eerste ligt (geen aangrenzende/
+   naburige goedkoopste momenten). Is het venster vol, dan wacht de watcher
+   tot het oudste blok er weer uit valt (het derde blok kan nooit binnen 24 u
+   van de eerste twee starten). Wordt een boost gemist, dan mag de
+   eerstvolgende alsnog gaan.
 
 Het reset-commando wordt alleen gestuurd ná een verstuurd boost-commando
 voor datzelfde blok; is het blok gemist, dan blijft de standaardwaarde
@@ -60,7 +63,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 import main as app
@@ -69,8 +72,9 @@ from optimizer import find_cheapest_blocks
 
 DEFAULT_DHW_TEMP = 53.0
 DEFAULT_RESET_TEMP = 40.0
-DEFAULT_BOOSTS_PER_DAY = 2    # meerdere opwarmmomenten per dag
+DEFAULT_BOOSTS_PER_DAY = 2     # meerdere opwarmmomenten per dag
 DEFAULT_BOOST_GAP_HOURS = 4.0  # min. uren tussen einde vorige boost en start volgende
+ROLLING_WINDOW_HOURS = 24.0    # de boostlimiet telt per rollend 24-uursvenster
 
 
 def build_boost_payload(dhw_temperature: float) -> dict:
@@ -185,12 +189,17 @@ def decide(cfg: dict, now: datetime) -> dict:
     boosts_per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
     out["boosts_per_day"] = boosts_per_day
     out["min_gap_hours"] = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
-    out["boosts_today"] = _count_boosts_today(state, now)
+    out["boosts_recent"] = _count_boosts_last_24h(state, now)
 
-    # Daglimiet bereikt (bv. 2 van de 2 boosts vandaag al verstuurd)? Dan geen
-    # nieuw blok meer plannen: wakker worden net na middernacht voor morgen.
-    if out["boosts_today"] >= boosts_per_day:
-        out["status"] = "already_boosted_today"
+    # 24-uurslimiet bereikt (rollend venster, geen kalenderdag)? Dan geen
+    # nieuw blok meer plannen: wakker worden zodra het oudste blok uit het
+    # venster valt — dan mag de eerstvolgende boost weer.
+    if out["boosts_recent"] >= boosts_per_day:
+        oldest = _oldest_recent_boost(state, now)
+        out["status"] = "boost_limit"
+        out["limit_wake_at"] = (
+            oldest + timedelta(hours=ROLLING_WINDOW_HOURS) + timedelta(seconds=2)
+        ).isoformat()
         return out
 
     best = _next_boost_block(cfg, advice, boost_cfg, state, now)
@@ -224,20 +233,42 @@ def decide(cfg: dict, now: datetime) -> dict:
     return out
 
 
-def _count_boosts_today(state: dict, dt: datetime) -> int:
-    """Hoeveel boosts zijn er vandaag al verstuurd (geteld op de lokale
-    kalenderdag van de blokstart)? De boekhouding staat in
-    state['daily_boosts'] = { "lokale datum": ["blokstart-ISO", ...] }."""
-    day = dt.date().isoformat()
-    return len((state.get("daily_boosts") or {}).get(day, []))
+def _boost_starts(state: dict) -> List[datetime]:
+    """Alle geregistreerde boost-startmomenten (uit state['daily_boosts'];
+    de dag-sleutel is alleen voor opslag, de tĳdstempels tellen)."""
+    starts: List[datetime] = []
+    for iso_list in (state.get("daily_boosts") or {}).values():
+        for iso in iso_list:
+            try:
+                starts.append(datetime.fromisoformat(iso))
+            except ValueError:
+                pass  # oud/onvolledig formaat negeren
+    return starts
 
 
-def _record_boost_today(state: dict, start: datetime) -> None:
-    """Registreer een verstuurde boost (voor de daglimiet-boekhouding)."""
+def _count_boosts_last_24h(state: dict, dt: datetime) -> int:
+    """Aantal boost-starts binnen het rollende 24-uursvenster vóór `dt`
+    (geen kalenderdaggrens: morgen-middenacht maakt het venster niet leeg)."""
+    cutoff = dt - timedelta(hours=ROLLING_WINDOW_HOURS)
+    return sum(1 for s in _boost_starts(state) if s >= cutoff)
+
+
+def _oldest_recent_boost(state: dict, dt: datetime) -> datetime:
+    """Het oudste boost-moment binnen het 24-uursvenster (vanaf dan mag er
+    weer iets: dat blok valt eruit). Valt er niets uit, dan is `dt` het
+    antwoord (geen extra beperking)."""
+    cutoff = dt - timedelta(hours=ROLLING_WINDOW_HOURS)
+    recent = [s for s in _boost_starts(state) if s >= cutoff]
+    return min(recent) if recent else dt
+
+
+def _record_boost(state: dict, start: datetime) -> None:
+    """Registreer een verstuurde boost (moment van blokstart, voor de
+    24-uurslimiet-boekhouding)."""
     day = start.date().isoformat()
     daily = state.setdefault("daily_boosts", {})
     daily.setdefault(day, []).append(start.isoformat())
-    # oude dagen weggooien; de limiet telt alleen per lokale dag
+    # oude dagen weggooien; de limiet telt alleen het 24-uursvenster
     recent = sorted(daily)[-7:]
     state["daily_boosts"] = {d: daily[d] for d in recent}
 
@@ -283,15 +314,15 @@ def _boost_pending_actions(state: dict, start: datetime, boosts_per_day: int) ->
     """Nogmaals de beslisregels tegenover de statusfile, nú voordat er een
     boost voor een gepland blok verstuurd wordt.
 
-    Geeft 'send' | 'already_sent' | 'already_boosted_today'. Dit gebeurt
-    nadrukkelijk ZONDER het advies opnieuw te berekenen: een herberekening
-    zou het (inmiddels gestarte) blok door `only_future` verliezen en de
-    boost eindeloos doorschuiven.
+    Geeft 'send' | 'already_sent' | 'boost_limit'. Dit gebeurt nadrukkelijk
+    ZONDER het advies opnieuw te berekenen: een herberekening zou het
+    (inmiddels gestarte) blok door `only_future` verliezen en de boost
+    eindeloos doorschuiven.
     """
     if state.get("last_sent_start") == start.isoformat():
         return "already_sent"
-    if _count_boosts_today(state, start) >= boosts_per_day:
-        return "already_boosted_today"
+    if _count_boosts_last_24h(state, start) >= boosts_per_day:
+        return "boost_limit"
     return "send"
 
 
@@ -324,7 +355,7 @@ def execute(out: dict, mqtt_cfg: dict, dry_run: bool, force: bool) -> None:
         else:
             state["last_sent_start"] = out["block"]["start"]
             state["last_sent_end"] = out["block"]["end"]
-            _record_boost_today(state, datetime.fromisoformat(out["block"]["start"]))
+            _record_boost(state, datetime.fromisoformat(out["block"]["start"]))
             state["sent_at"] = out["now"]
             if out["block"].get("mean_cop") is not None:
                 state["sent_mean_cop"] = out["block"]["mean_cop"]
@@ -381,10 +412,10 @@ def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) ->
     if status == "already_sent" and out.get("block"):
         end = datetime.fromisoformat(out["block"]["end"])
         return end
-    if status == "already_boosted_today":
-        # vandaag al geboost: wakker worden net na middernacht voor morgen
-        midnight = datetime(now.year, now.month, now.day, 0, 0, 2, tzinfo=tz)
-        return midnight + timedelta(days=1)
+    if status == "boost_limit":
+        # 24-uurslimiet vol: wakker worden zodra het oudste blok uit het
+        # rollende venster valt (dan mág er weer een boost).
+        return datetime.fromisoformat(out["limit_wake_at"])
     return now + timedelta(seconds=RETRY_INTERVAL_DEFAULT)
 
 
@@ -485,7 +516,7 @@ def send_with_retry(
             state[at_key] = datetime.now(tz).isoformat()
             if state_key == "last_sent_start":
                 state["last_sent_end"] = out["block"]["end"]
-                _record_boost_today(state, datetime.fromisoformat(out["block"]["start"]))
+                _record_boost(state, datetime.fromisoformat(out["block"]["start"]))
                 if out["block"].get("mean_cop") is not None:
                     state["sent_mean_cop"] = out["block"]["mean_cop"]
                     state["sent_mean_corrected"] = out["block"]["mean_corrected_eur_per_kwh_heat"]
@@ -552,6 +583,9 @@ def watch(
 
             if status == "already_sent":
                 _log("status: al verstuurd voor dit blok")
+            elif status == "boost_limit":
+                _log("24-uurslimiet bereikt — volgende boost mogelijk om",
+                     out.get("limit_wake_at", "?"))
             else:
                 extra = (
                     f"blokstart over {out['wait_minutes']:g} min"
@@ -593,8 +627,9 @@ def render_human(out: dict) -> List[str]:
     lines.append(f"Nu      : {app.fmt_dt(datetime.fromisoformat(out['now']))}")
     if "boosts_per_day" in out:
         lines.append(
-            f"Plan    : {out['boosts_per_day']}x/dag, min. {out['min_gap_hours']:g} u "
-            f"tussen de blokken — vandaag {out.get('boosts_today', 0)}/{out['boosts_per_day']} verstuurd"
+            f"Plan    : {out['boosts_per_day']}x per 24 u, min. {out['min_gap_hours']:g} u "
+            f"tussen de blokken — {out.get('boosts_recent', 0)}/{out['boosts_per_day']} "
+            "in de afgelopen 24 u"
         )
     if "block" in out:
         b = out["block"]
@@ -624,12 +659,14 @@ def render_human(out: dict) -> List[str]:
             )
     elif status == "already_sent":
         lines.append("Status  : al verstuurd voor dit blok (geen dubbele berichten)")
-    elif status == "already_boosted_today":
+    elif status == "boost_limit":
         n = out.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY)
-        t = out.get("boosts_today", n)
-        lines.append(
-            f"Status  : daglimiet bereikt ({t}/{n} boosts vandaag) — wacht op morgen"
-        )
+        t = out.get("boosts_recent", n)
+        when = out.get("limit_wake_at")
+        msg = f"Status  : 24-uurslimiet bereikt ({t}/{n} in de afgelopen 24 u)"
+        if when:
+            msg += f" — volgende boost mogelijk om {app.fmt_dt(datetime.fromisoformat(when))}"
+        lines.append(msg)
     elif status == "reset":
         if dry:
             lines.append("Status  : dry-run — reset niet gepubliceerd")

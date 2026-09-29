@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Regressietests voor dhw_boost: de reset naar de default-temperatuur moet
 exact op het blokeinde (en anders bij de eerstvolgende wake ná het einde)
-worden verstuurd, en de watcher mag hooguit `boosts_per_day` boosts per dag
-sturen — minstens 2, gespreid over de dag (nooit vlak na elkaar).
+worden verstuurd, en de watcher mag hooguit `boosts_per_day` boosts binnen
+een rollend 24-uursvenster sturen — gespreid (nooit vlak na elkaar), zonder
+kalenderdaggrens.
 
 Draaien:  python3 -m unittest discover -s tests -v
 """
@@ -146,9 +147,10 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertIsNone(out.get("pending_reset_at"))
         self.assertEqual(out["status"], "wait")
 
-    def test_daily_cap_blocks_third_boost(self):
-        """boosts_per_day=2: zijn er al 2 boosts vandaag verstuurd, dan komt
-        er geen derde meer — wakker worden voor morgen."""
+    def test_rolling_twentyfour_limit_blocks_third_boost(self):
+        """boosts_per_day=2 over een rollend 24-uursvenster: 2 boosts in de
+        afgelopen 24 u -> geen derde; pas wakker als het oudste blok uit het
+        venster valt (oudste start + 24 u), niet al om middernacht."""
         state = dict(
             DONE_STATE,
             daily_boosts={
@@ -160,11 +162,55 @@ class DhwBoostResetTest(unittest.TestCase):
         )
         self._write_state(state)
         out = dhw_boost.decide(CFG, datetime.fromisoformat("2026-09-25T13:00:00+02:00"))
-        self.assertEqual(out["status"], "already_boosted_today")
-        self.assertEqual(out["boosts_today"], 2)
+        self.assertEqual(out["status"], "boost_limit")
+        self.assertEqual(out["boosts_recent"], 2)
         self.assertEqual(out["boosts_per_day"], 2)
         wake = dhw_boost.next_wake_time(out, datetime.fromisoformat("2026-09-25T13:00:00+02:00"), TZ, "13:30")
-        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T00:00:02+02:00"))
+        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T02:00:02+02:00"))
+
+    def test_second_boost_may_be_on_other_day(self):
+        """De tweede boost mag op een ándere kalenderdag vallen: boost1 op
+        25-09 23:00 (blok t/m 02:00), nu net ná middernacht 26-09 — er is nog
+        plaats in het 24-uursvenster, dus de tweede boost wordt gewoon gepland
+        (6:00 op 26-09: 4 u gap vanaf het blokeinde)."""
+        state = {
+            "last_sent_start": "2026-09-25T23:00:00+02:00",
+            "last_sent_end": "2026-09-26T02:00:00+02:00",
+            "sent_at": "2026-09-25T23:00:00+02:00",
+            "last_reset_start": "2026-09-25T23:00:00+02:00",
+            "reset_at": "2026-09-26T02:00:00+02:00",
+            "daily_boosts": {"2026-09-25": ["2026-09-25T23:00:00+02:00"]},
+        }
+        self._write_state(state)
+        self._rows_from = datetime.fromisoformat("2026-09-26T06:00:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T00:30:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertEqual(out["boosts_recent"], 1)
+        # gap vanaf blokeinde (02:00) + 4 u -> vroegste start 06:00 op 26-09
+        self.assertEqual(
+            out["block"]["start"],
+            datetime.fromisoformat("2026-09-26T06:00:00+02:00").isoformat(),
+        )
+
+    def test_third_boost_blocked_even_across_midnight(self):
+        """Geen kalenderdag meer maatgevend: boost1 (25-09 02:00) en boost2
+        (26-09 00:30) liggen allebei binnen 24 u van 'nu' (26-09 01:00) -> een
+        derde boost is geblokkeerd óók al is het inmiddels een nieuwe dag."""
+        state = dict(
+            DONE_STATE,
+            daily_boosts={
+                "2026-09-25": ["2026-09-25T02:00:00+02:00"],
+                "2026-09-26": ["2026-09-26T00:30:00+02:00"],
+            },
+        )
+        self._write_state(state)
+        out = dhw_boost.decide(CFG, datetime.fromisoformat("2026-09-26T01:00:00+02:00"))
+        self.assertEqual(out["status"], "boost_limit")
+        self.assertEqual(out["boosts_recent"], 2)
+        # oudste blok in het venster (02:00 25-09) valt uit op 02:00 26-09 + 2 s
+        wake = dhw_boost.next_wake_time(out, datetime.fromisoformat("2026-09-26T01:00:00+02:00"), TZ, "13:30")
+        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T02:00:02+02:00"))
 
     def test_second_boost_allowed_but_spaced(self):
         """Eén boost vandaag (02:00-05:00) -> een tweede is toegestaan, maar
@@ -174,7 +220,7 @@ class DhwBoostResetTest(unittest.TestCase):
         now = datetime.fromisoformat("2026-09-26T06:00:00+02:00")
         out = dhw_boost.decide(CFG, now)
         self.assertEqual(out["status"], "wait")
-        self.assertEqual(out["boosts_today"], 1)
+        self.assertEqual(out["boosts_recent"], 1)
         self.assertEqual(
             out["block"]["start"],
             datetime.fromisoformat("2026-09-26T09:00:00+02:00").isoformat(),
@@ -251,9 +297,9 @@ class DhwBoostResetTest(unittest.TestCase):
             "already_sent",
         )
 
-    def test_guard_daylimit_reached_via_state(self):
-        """Alleen op statusfile gebaseerd: daglimiet (2) is bereikt -> niet
-        nóg een boost sturen."""
+    def test_guard_twentyfour_limit_reached_via_state(self):
+        """Alleen op statusfile gebaseerd: 24-uurslimiet (2) is bereikt ->
+        niet nóg een boost sturen."""
         self.assertEqual(
             dhw_boost._boost_pending_actions(
                 {
@@ -267,7 +313,7 @@ class DhwBoostResetTest(unittest.TestCase):
                 datetime.fromisoformat("2026-09-26T12:45:00+02:00"),
                 2,
             ),
-            "already_boosted_today",
+            "boost_limit",
         )
 
     def test_guard_second_boost_below_cap(self):
