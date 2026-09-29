@@ -301,8 +301,11 @@ Wat het script per run doet:
 Tekstuitvoer toont per prijsslot: prijs, verwachte buitentemperatuur,
 COP en de gecorrigeerde prijs, plus het beste blok van 3 uur (en top-N).
 Is `heatpump.dhw.enabled` aan, dan komt daar een aparte sectie
-**Sanitair warm water (SWW)** achteraan: een eigen per-slot tabel en het
-beste 3-uursblok voor het opwarmen tot 53 °C (op basis van de SWW-COP).
+**Sanitair warm water (SWW)** achteraan: een eigen per-slot tabel, het
+beste 3-uursblok voor het opwarmen tot 53 °C (op basis van de SWW-COP)
+én de **geplande SWW-boosts**: de `boosts_per_day` opwarmmomenten die
+`dhw_boost` gaat uitsturen, telkens min. `min_gap_hours` uur na het
+einde van de vorige (dus écht gespreid over de dag).
 
 Met MQTT ingeschakeld wordt gepubliceerd (paylod = JSON):
 

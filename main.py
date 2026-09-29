@@ -19,8 +19,8 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
-from typing import List
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import cop_model as cop_mod
@@ -85,6 +85,48 @@ def _append_best_block(
                 f"  {i}. {fmt_dt(b['start'])} – {fmt_dt(b['end'])}  "
                 f"→ {nl(b['mean_corrected'], 4)} €/kWh warmte"
             )
+
+
+def _dhw_boost_plan(
+    cfg: dict,
+    granularity_min: int,
+    block_hours: int,
+    now: datetime,
+    dhw_rows: list,
+) -> Tuple[list, int, float]:
+    """De SWW-boost-momenten die dhw_boost --watch gaat uitsturen: max.
+    `boosts_per_day` blokken, telkens pas startend ná `min_gap_hours` uur ná
+    het einde van het vorige (zodat de opwarmmomenten gespreid staan en niet
+    'slim' vlak achter elkaar hetzelfde goedkope moment kiezen).
+
+    Geeft (plan, boosts_per_day, min_gap_hours): plan is de lijst gekozen
+    blokken in oplopende volgorde.
+    """
+    boost_cfg = (cfg.get("mqtt") or {}).get("dhw_boost") or {}
+    # lazy import: dhw_boost importeert main, dus niet op module-niveau
+    from dhw_boost import DEFAULT_BOOSTS_PER_DAY, DEFAULT_BOOST_GAP_HOURS
+
+    per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
+    gap_hours = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
+
+    plan: List[dict] = []
+    earliest = now
+    for _ in range(max(1, per_day)):
+        blocks = find_cheapest_blocks(
+            dhw_rows,
+            granularity_min=granularity_min,
+            block_hours=block_hours,
+            only_future=True,
+            top_n=1,
+            now=now,
+            earliest_start=earliest,
+        )
+        if not blocks:
+            break
+        block = blocks[0]
+        plan.append(block)
+        earliest = block["end"] + timedelta(hours=gap_hours)
+    return plan, per_day, gap_hours
 
 
 def build_advice(cfg: dict, args, now: datetime) -> dict:
@@ -212,6 +254,19 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         else []
     )
 
+    # 5c) SWW-boost-plan: de gespreide opwarmmomenten die de booster uitstuurt.
+    dhw_plan: List[dict] = []
+    dhw_boosts_per_day: Optional[int] = None
+    dhw_gap_hours: Optional[float] = None
+    if dhw_rows:
+        dhw_plan, dhw_boosts_per_day, dhw_gap_hours = _dhw_boost_plan(
+            cfg,
+            pr["granularity_min"],
+            int(args.block_hours or opt["block_hours"]),
+            now,
+            dhw_rows,
+        )
+
     return {
         "generated_at": now,
         "location": {
@@ -246,6 +301,9 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             "rows": dhw_rows,
             "blocks": dhw_blocks,
             "best": dhw_blocks[0] if dhw_blocks else None,
+            "plan": dhw_plan,
+            "boosts_per_day": dhw_boosts_per_day,
+            "min_gap_hours": dhw_gap_hours,
         },
     }
 
@@ -306,9 +364,27 @@ def render_human(result: dict) -> str:
         _append_best_block(
             lines,
             dhw["best"],
-            dhw["blocks"],
+            # alleen het beste blok tonen hier: de echt te verwachten momenten
+            # staan in het geplande boost-plan hieronder (de 'naast beste'
+            # blokken liggen immers vaak vlak tegen het beste aan)
+            dhw["blocks"][:1],
             "BESTE BLOK VAN 3 UUR VOOR SWW (op gecorrigeerde prijs):",
         )
+        plan = dhw.get("plan") or []
+        if plan:
+            lines.append("")
+            lines.append(
+                "GEPLANDE SWW-BOOSTS"
+                f" ({dhw.get('boosts_per_day')}x/dag, min. "
+                f"{dhw.get('min_gap_hours') or 0.0:g} u tussen de blokken):"
+            )
+            lines.append("-" * 64)
+            for i, b in enumerate(plan, start=1):
+                lines.append(
+                    f"  {i}. {fmt_dt(b['start'])} – {fmt_dt(b['end'])}  "
+                    f"→ {nl(b['mean_corrected'], 4)} €/kWh warmte  "
+                    f"(COP {nl(b['mean_cop'], 2)})"
+                )
     return "\n".join(lines)
 
 
@@ -447,6 +523,20 @@ def to_serializable(result: dict) -> dict:
                 }
                 for b in dhw["blocks"]
             ],
+            "plan": [
+                {
+                    "start": b["start"].isoformat(),
+                    "end": b["end"].isoformat(),
+                    "block_hours": b["block_hours"],
+                    "mean_price_eur_per_kwh": b["mean_price"],
+                    "mean_temp_c": b["mean_temp"],
+                    "mean_cop": b["mean_cop"],
+                    "mean_corrected_eur_per_kwh_heat": b["mean_corrected"],
+                }
+                for b in dhw.get("plan") or []
+            ],
+            "boosts_per_day": dhw.get("boosts_per_day"),
+            "min_gap_hours": dhw.get("min_gap_hours"),
         }
         out["dhw"]["best"] = out["dhw"]["blocks"][0] if out["dhw"]["blocks"] else None
     return out
