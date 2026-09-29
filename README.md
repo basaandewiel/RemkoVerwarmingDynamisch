@@ -180,7 +180,11 @@ of gebeuren:
   **blokeinde** → de reset terug naar de default-temperatuur;
 - de **dagelijkse prijs-update** rond 13:30 (`--price-refresh-time`,
   default `13:30`) → het moment waarop de day-ahead-prijzen van de volgende
-  dag binnenkomen, de enige keer dat het beste blok kan veranderen;
+  dag binnenkomen, de enige keer dat het beste blok kan veranderen. Zijn die
+  prijzen daar nog **niet** (late publicatie bij ENTSO-E), dan wekt de
+  watcher later nogmaals om te herberekenen (`--price-recheck-min`, default
+  45 min) — alleen zolang het geplande blok nog niet op het punt staat te
+  starten, zodat de trigger niet verstoord wordt;
 - alleen zolang er **nog geen blok bekend** is (bijv. vertraagde
   prijspublicatie) elke `--retry-interval` (default 30 min).
 

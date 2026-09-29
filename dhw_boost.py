@@ -16,7 +16,10 @@ Twee manieren:
          blokeinde altijd als wake gepland);
        * de dagelijkse prijs-update    -> rond 13:30 verschijnen de
          dag-ahead-prijzen van de volgende dag, de enige keer dat het beste
-         blok kan veranderen (--price-refresh-time, default 13:30);
+         blok kan veranderen (--price-refresh-time, default 13:30). Zijn
+         die prijzen daar nog niet (late publicatie), dan herberekent de
+         watcher later nogmaals (--price-recheck-min, default 45 min),
+         zolang het geplande blok nog niet in de LEAD-nadering zit;
        * (alleen zolang er nog géén blok bekend is, bijv. vertraagde
          prijzen) elke --retry-interval (default 30 min).
      Herberekenen om de paar minuten is bewust niet nodig: het DHW-water
@@ -185,6 +188,21 @@ def decide(cfg: dict, now: datetime) -> dict:
     if not dhw.get("enabled") or not dhw.get("rows"):
         out["status"] = "no_dhw"
         return out
+
+    # Late dag-ahead-publicatie detecteren: reikt de prijsdata nog niet tot in
+    # de dag van morgen (terwijl days_ahead daar wél heen zou reiken), dan is
+    # de nieuwe dag (nog) niet bekend. next_wake_time plant dan een extra
+    # hercontrole, zodat een late publicatie binnen het uur verwerkt wordt.
+    prices = advice.get("prices") or {}
+    horizon_end = prices.get("horizon_end")
+    if isinstance(horizon_end, str):
+        horizon_end = datetime.fromisoformat(horizon_end)
+    days_ahead = int((cfg.get("prices") or {}).get("days_ahead", 2))
+    out["next_day_missing"] = bool(
+        days_ahead >= 2
+        and horizon_end is not None
+        and horizon_end.date() < now.date() + timedelta(days=1)
+    )
 
     boosts_per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
     out["boosts_per_day"] = boosts_per_day
@@ -371,6 +389,11 @@ LEAD_SECONDS = 120.0               # wek deze tijd VÓÓR de blokstart: dan kan 
 RETRY_SECONDS = 30.0               # tussen pogingen als de broker niet bereikbaar is
 MIN_SLEEP = 5.0                    # ondergrens slaap (voorkomt busy-loop)
 PRICE_REFRESH_DEFAULT = "13:30"    # dagelijks moment waarop dag-ahead-prijzen binnenkomen
+LATE_PUBCHECK_MIN = 45.0           # hercontrole ná de prijs-update als de nieuwe dag
+                                   # ontbrak, zodat een late publicatie binnen het uur
+                                   # wordt verwerkt (--price-recheck-min, default 45)
+LATE_PUBCHECK_WINDOW_H = 4.0       # deze hercontroles alleen binnen dit venster ná de
+                                   # refresh-tijd (niet 's nachts op een blok blijven waken)
 RETRY_INTERVAL_DEFAULT = 1800.0    # fallback (30 min) zolang er nog geen blok bekend is
 
 
@@ -388,11 +411,21 @@ def next_price_refresh(now: datetime, tz: ZoneInfo, hhmm: str) -> datetime:
     return candidate
 
 
-def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) -> datetime:
+def next_wake_time(
+    out: dict,
+    now: datetime,
+    tz: ZoneInfo,
+    refresh_hhmm: str,
+    recheck_min: float = LATE_PUBCHECK_MIN,
+) -> datetime:
     """Het eerstvolgende moment dat iets nuttigs kan veranderen:
     - een openstaande reset: precies het einde van dat blok (hoogste prioriteit:
       zonder deze wake slaapt de watcher er met het 'volgende blok' voorbij);
     - blok komt eraan: min(blokstart - LEAD, eerstvolgende prijs-update ~13:30);
+    - late dag-ahead-publicatie (de nieuwe dag ontbrak): ná `recheck_min` nog een
+      hercontrole — alleen kort ná de refresh-tijd van vandaag en zolang het blok
+      nog niet in de LEAD-nadering zit (anders kan de extra wake de geplande
+      trigger verstoren);
     - boost is al verstuurd: het blok EINDE (dan volgt de reset naar default);
     - anders (nog geen blok/vertraagde prijzen): over RETRY_INTERVAL.
     """
@@ -404,11 +437,22 @@ def next_wake_time(out: dict, now: datetime, tz: ZoneInfo, refresh_hhmm: str) ->
         return datetime.fromisoformat(out["pending_reset_at"])
     if status == "wait" and out.get("block"):
         start = datetime.fromisoformat(out["block"]["start"])
+        lead_moment = start - timedelta(seconds=LEAD_SECONDS)
+        if out.get("next_day_missing"):
+            hh, mm = (int(x) for x in refresh_hhmm.split(":"))
+            today_refresh = datetime(now.year, now.month, now.day, hh, mm, tzinfo=tz)
+            window_end = today_refresh + timedelta(hours=LATE_PUBCHECK_WINDOW_H)
+            if (
+                now >= today_refresh
+                and now < window_end
+                and lead_moment > now + timedelta(minutes=recheck_min)
+            ):
+                return now + timedelta(minutes=recheck_min)
         # Vóór de start wakker worden (LEAD): een herberekening ná de start
         # zou het blok door `only_future` verliezen en naar het volgende blok
         # glijden (de oude 'start + 2s'-marge was te krap voor de trage
         # data-ophaal op de Pi).
-        return min(start - timedelta(seconds=LEAD_SECONDS), refresh)
+        return min(lead_moment, refresh)
     if status == "already_sent" and out.get("block"):
         end = datetime.fromisoformat(out["block"]["end"])
         return end
@@ -540,13 +584,15 @@ def watch(
     refresh_hhmm: str,
     retry_interval: float,
     dry_run: bool,
+    recheck_min: float = LATE_PUBCHECK_MIN,
 ) -> int:
     """Blijf draaien: slaap tot het relevante moment en verstuur dan precies.
 
     Samen met de status uit `decide` is elke wake een van vier dingen:
     - blokstart bereikt  -> verstuur het boost-commando;
     - blokeinde bereikt (reset staat open) -> zet terug naar de default;
-    - dagelijkse prijs-update ~13:30 -> herbereken het advies;
+    - dagelijkse prijs-update ~13:30 -> herbereken het advies (en, als de
+      nieuwe dag nog ontbrak, `recheck_min` later nogmaals);
     - (alleen als er nog geen blok is) elke `retry_interval` seconden.
     """
     _log("SWW-boost watchdog gestart — herberekent alleen bij blokstart of",
@@ -586,6 +632,10 @@ def watch(
             elif status == "boost_limit":
                 _log("24-uurslimiet bereikt — volgende boost mogelijk om",
                      out.get("limit_wake_at", "?"))
+            elif status == "wait" and out.get("next_day_missing"):
+                _log("blokstart over", f"{out['wait_minutes']:g} min — prijzen van "
+                     "de nieuwe dag nog niet beschikbaar (late publicatie), "
+                     "hercontrole later")
             else:
                 extra = (
                     f"blokstart over {out['wait_minutes']:g} min"
@@ -607,7 +657,7 @@ def watch(
                         return 1
                     continue
 
-            wake = next_wake_time(out, now, tz, refresh_hhmm)
+            wake = next_wake_time(out, now, tz, refresh_hhmm, recheck_min)
             delay = max(MIN_SLEEP, (wake - now).total_seconds())
             _log("slaapt tot", wake.strftime("%a %d-%m %H:%M:%S"),
                  f"(+{delay/3600:.1f}u)" if delay >= 3600 else f"(+{delay/60:.0f}min)")
@@ -718,6 +768,13 @@ def main(argv: List[str] | None = None) -> int:
         default=RETRY_INTERVAL_DEFAULT,
         help="seconden tussen herberekeningen zolang er nog geen blok bekend is (default 1800)",
     )
+    ap.add_argument(
+        "--price-recheck-min",
+        type=float,
+        default=LATE_PUBCHECK_MIN,
+        help="minuten ná de prijs-update nog een hercontrole als de nieuwe dag "
+             f"ontbrak (late publicatie, default {LATE_PUBCHECK_MIN:g})",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -728,7 +785,10 @@ def main(argv: List[str] | None = None) -> int:
             now = now.replace(tzinfo=tz)
 
         if args.watch and not args.now:
-            return watch(cfg, tz, args.price_refresh_time, args.retry_interval, args.dry_run)
+            return watch(
+                cfg, tz, args.price_refresh_time, args.retry_interval, args.dry_run,
+                args.price_recheck_min,
+            )
 
         out = decide(cfg, now)
         execute(out, cfg.get("mqtt") or {}, dry_run=args.dry_run, force=args.force)

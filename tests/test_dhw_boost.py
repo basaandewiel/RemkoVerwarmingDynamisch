@@ -71,11 +71,13 @@ def _rows(start_dt: datetime, n: int = 24, price: float = 0.12) -> list:
     return rows
 
 
-def _advice(rows_from: datetime, n: int = 24) -> dict:
+def _advice(rows_from: datetime, n: int = 24, horizon_end=None) -> dict:
     """Canned build_advice-resultaat: SWW-advies met reeële rijen (zonder
-    deze rijen kan _next_boost_block geen blok kiezen)."""
+    deze rijen kan _next_boost_block geen blok kiezen). `horizon_end` is het
+    uiteinde van de prijsdata (ontbreekt de nieuwe dag, dan reikt die tot
+    vandaag)."""
     return {
-        "prices": {"granularity_min": 15},
+        "prices": {"granularity_min": 15, "horizon_end": horizon_end},
         "dhw": {
             "enabled": True,
             "rows": _rows(rows_from, n),
@@ -96,9 +98,12 @@ class DhwBoostResetTest(unittest.TestCase):
         # en deterministisch blijven (geen ENTSO-E/met.no-oproepen).
         self._rows_from = datetime.fromisoformat("2026-09-26T00:00:00+02:00")
         self._n_rows = 24
+        # Uiteinde van de prijsdata (None = geen horizon-info -> geen
+        # 'late publicatie'-gedrag); per test te overschrijven.
+        self._horizon_end = None
 
         def fake_advice(_cfg, _args, _now):
-            return _advice(self._rows_from, self._n_rows)
+            return _advice(self._rows_from, self._n_rows, horizon_end=self._horizon_end)
 
         patchers.append(patch.object(dhw_boost.app, "build_advice", side_effect=fake_advice))
         self._patchers = patchers
@@ -246,6 +251,71 @@ class DhwBoostResetTest(unittest.TestCase):
             datetime.fromisoformat("2026-09-26T17:00:00+02:00").isoformat(),
             "niet verder doorgeschoven: end+gap (16:00) lag al achter ons",
         )
+
+    def test_late_publication_triggers_recheck_after_refresh(self):
+        """Late publicatie: om 13:31 is de nieuwe dag nog niet beschikbaar ->
+        de watcher wekt ná --price-recheck-min (default 45 min) opnieuw om te
+        herberekenen, i.p.v. pas vlak vóór de blokstart."""
+        self._write_state({})
+        self._rows_from = datetime.fromisoformat("2026-09-26T15:00:00+02:00")
+        # prijsdata reikt alleen tot vanavond -> de nieuwe dag ontbreekt
+        self._horizon_end = datetime.fromisoformat("2026-09-26T20:45:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T13:31:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertTrue(out["next_day_missing"])
+        wake = dhw_boost.next_wake_time(out, now, TZ, "13:30")
+        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T14:16:00+02:00"))
+
+    def test_late_publication_recheck_uses_custom_interval(self):
+        """Het hercontrole-interval is instelbaar (--price-recheck-min)."""
+        self._write_state({})
+        self._rows_from = datetime.fromisoformat("2026-09-26T15:00:00+02:00")
+        self._horizon_end = datetime.fromisoformat("2026-09-26T20:45:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T13:31:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        wake = dhw_boost.next_wake_time(out, now, TZ, "13:30", recheck_min=60.0)
+        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T14:31:00+02:00"))
+
+    def test_no_recheck_when_next_day_present(self):
+        """Zijn de prijzen van de nieuwe dag er wél, dan geen extra hercontrole:
+        normale wake = min(blokstart - LEAD, volgende prijs-update)."""
+        self._write_state({})
+        self._rows_from = datetime.fromisoformat("2026-09-26T15:00:00+02:00")
+        self._horizon_end = datetime.fromisoformat("2026-09-27T23:45:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T13:31:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertFalse(out["next_day_missing"])
+        wake = dhw_boost.next_wake_time(out, now, TZ, "13:30")
+        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T14:58:00+02:00"))
+
+    def test_no_recheck_outside_late_window_at_night(self):
+        """'s Nachts (buiten het venster ná de refresh-tijd) geen extra
+        hercontroles: een blok om 03:00 wordt normaal gevolgd, ook al reikt de
+        data nog niet tot morgen (morgen komt immers pas om 13:30)."""
+        self._write_state({})
+        self._rows_from = datetime.fromisoformat("2026-09-26T03:00:00+02:00")
+        self._horizon_end = datetime.fromisoformat("2026-09-26T08:45:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T00:30:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertTrue(out["next_day_missing"])
+        wake = dhw_boost.next_wake_time(out, now, TZ, "13:30")
+        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T02:58:00+02:00"))
+
+    def test_no_recheck_when_block_is_imminent(self):
+        """Blok start binnen de recheck-horizon: géén extra wake die de
+        geplande trigger kan verstoren — gewoon wakker vóór de start (LEAD)."""
+        self._write_state({})
+        self._rows_from = datetime.fromisoformat("2026-09-26T14:00:00+02:00")
+        self._horizon_end = datetime.fromisoformat("2026-09-26T20:00:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T13:31:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertTrue(out["next_day_missing"])
+        wake = dhw_boost.next_wake_time(out, now, TZ, "13:30")
+        self.assertEqual(wake, datetime.fromisoformat("2026-09-26T13:58:00+02:00"))
 
     def test_execute_records_daily_boost(self):
         """Na een geslaagde boost-publicatie wordt het blok in daily_boosts
