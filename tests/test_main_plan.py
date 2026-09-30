@@ -81,6 +81,44 @@ class MainDhwPlanTest(unittest.TestCase):
         plan, _, _ = main._dhw_boost_plan(cfg, 15, 3, now, _rows(now, n=12))
         self.assertEqual(len(plan), 1)
 
+    def _priced_rows(self, start_dt: datetime, prices: list) -> list:
+        rows = []
+        for i, p in enumerate(prices):
+            dt = start_dt + timedelta(minutes=15 * i)
+            rows.append(
+                {
+                    "dt_local": dt,
+                    "dt_utc": dt.astimezone(ZoneInfo("UTC")),
+                    "price": p,
+                    "temp": 18.0,
+                    "cop": 3.27,
+                    "corrected": p / 3.27,
+                }
+            )
+        return rows
+
+    def test_plan_flags_horizon_bound_block(self):
+        """Eindigt een gekozen blok precies op het einde van de prijsdata, dan
+        wordt het gemarkeerd als horizon-bound: de goedkopere uren kunnen ná
+        de horizon liggen (de watcher herberekent zodra die dag gepubliceerd
+        is en verschuift het blok dan eventueel)."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        prices = [0.30] * 12 + [0.05] * 12  # alleen de laatste 3 u zijn goedkoop
+        plan, _, _ = main._dhw_boost_plan(cfg, 15, 3, now, self._priced_rows(now, prices))
+        self.assertEqual(len(plan), 1)
+        self.assertTrue(plan[0]["horizon_bound"])
+        self.assertEqual(plan[0]["end"], datetime.fromisoformat("2026-09-30T12:00:00+02:00"))
+
+    def test_plan_not_horizon_bound_when_headroom(self):
+        """Eindigt het blok ruim vóór het einde van de data, dan géén markering."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        prices = [0.05] * 12 + [0.30] * 12  # goedkoopste periode = de eerste 3 u
+        plan, _, _ = main._dhw_boost_plan(cfg, 15, 3, now, self._priced_rows(now, prices))
+        self.assertEqual(len(plan), 1)
+        self.assertFalse(plan[0]["horizon_bound"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -195,7 +195,7 @@ def _find_text(el: Optional[ET.Element], name: str) -> Optional[str]:
 def fetch_prices(
     api_key: str,
     tz: str = "Europe/Amsterdam",
-    days_ahead: int = 2,
+    days_ahead: int = 3,
     in_domain: str = DEFAULT_DOMAIN,
     out_domain: str = DEFAULT_DOMAIN,
     cache_dir: Optional[str] = None,

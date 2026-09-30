@@ -56,7 +56,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `optimization.only_future` | `true`: alleen blokken die nu of later starten. |
 | `optimization.top_n` | Hoeveel beste blokken worden weergegeven. |
 | `prices.source` | `entsoe` (default) of `energyzero` als alternatief. |
-| `prices.days_ahead` | Hoeveel dagen vooruit plannen (day-ahead prijzen zijn meestal ~48 u bekend). |
+| `prices.days_ahead` | Hoeveel dagen vooruit plannen (day-ahead prijzen zijn meestal ~48 u bekend, default 3). Dag +1 +2 zijn pas net gepubliceerd als je tweede SWW-boost ná middernacht valt — met 2 kan het tweede blok zomaar op de laatste uren van de horizon klem komen te zitten (bijv. 21:00-00:00), terwijl de goedkopere vroege ochtend van de dag erop onzichtbaar blijft. |
 | `prices.entsoe.api_key` | **Jouw persoonlijke ENTSO-E API-key** (gratis account op https://transparency.entsoe.eu → My Account → API). |
 | `prices.entsoe.in_domain` / `out_domain` | Biedingszone; NL = `10YNL----------L`. |
 | `prices.entsoe.cache_ttl_seconds` | Houdt de opgehaalde day-ahead prijzen per dag op schijf (default 3600 s). Prijzen veranderen hooguit 1×/dag, dus een watcher hoeft niet bij elke wake de API te bevragen — scheelt aanzienlijk op een trage/overbelaste DNS-server. |

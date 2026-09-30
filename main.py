@@ -111,6 +111,11 @@ def _dhw_boost_plan(
 
     plan: List[dict] = []
     earliest = now
+    # data-horizon: het laatste moment waarop een blok nog kán eindigen in de
+    # aanwezige prijzen. Eindigt een gekozen blok daar (of nét ervóór), dan
+    # kan het optimum zomaar ná de horizon liggen — zie de hint in de output.
+    slot_delta = timedelta(minutes=granularity_min)
+    horizon_end = dhw_rows[-1]["dt_local"] + slot_delta if dhw_rows else None
     for _ in range(max(1, per_day)):
         blocks = find_cheapest_blocks(
             dhw_rows,
@@ -124,6 +129,8 @@ def _dhw_boost_plan(
         if not blocks:
             break
         block = blocks[0]
+        if horizon_end is not None:
+            block = dict(block, horizon_bound=block["end"] >= horizon_end)
         plan.append(block)
         earliest = block["end"] + timedelta(hours=gap_hours)
     return plan, per_day, gap_hours
@@ -183,7 +190,7 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
     # 3) stroomprijzen (keuze uit config: entsoe | energyzero)
     prices_cfg = cfg["prices"]
     source = prices_cfg.get("source", "entsoe")
-    days_ahead = int(prices_cfg.get("days_ahead", 2))
+    days_ahead = int(prices_cfg.get("days_ahead", 3))
     if source == "entsoe":
         ec = prices_cfg["entsoe"]
         pr = entsoe.fetch_prices(
@@ -385,6 +392,14 @@ def render_human(result: dict) -> str:
                     f"→ {nl(b['mean_corrected'], 4)} €/kWh warmte  "
                     f"(COP {nl(b['mean_cop'], 2)})"
                 )
+            if any(b.get("horizon_bound") for b in plan):
+                lines.append("")
+                lines.append(
+                    "  (laatste blok ligt tegen de data-horizon aan: de day-ahead "
+                    "prijzen van de dag daarop zijn nog niet gepubliceerd (≈13:30). "
+                    "De watcher herberekent dàn en verschuift dit blok naar de "
+                    "goedkoopste uren van de nieuwe dag.)"
+                )
     return "\n".join(lines)
 
 
@@ -532,6 +547,7 @@ def to_serializable(result: dict) -> dict:
                     "mean_temp_c": b["mean_temp"],
                     "mean_cop": b["mean_cop"],
                     "mean_corrected_eur_per_kwh_heat": b["mean_corrected"],
+                    "horizon_bound": bool(b.get("horizon_bound")),
                 }
                 for b in dhw.get("plan") or []
             ],

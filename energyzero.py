@@ -39,7 +39,7 @@ def _parse_iso(value: str) -> datetime:
 
 def fetch_prices(
     tz: str,
-    days_ahead: int = 2,
+    days_ahead: int = 3,
     api_url: str = API_URL_DEFAULT,
     usage_type: int = 1,
     incl_btw: bool = True,

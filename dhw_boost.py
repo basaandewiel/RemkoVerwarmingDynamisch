@@ -197,7 +197,7 @@ def decide(cfg: dict, now: datetime) -> dict:
     horizon_end = prices.get("horizon_end")
     if isinstance(horizon_end, str):
         horizon_end = datetime.fromisoformat(horizon_end)
-    days_ahead = int((cfg.get("prices") or {}).get("days_ahead", 2))
+    days_ahead = int((cfg.get("prices") or {}).get("days_ahead", 3))
     out["next_day_missing"] = bool(
         days_ahead >= 2
         and horizon_end is not None
