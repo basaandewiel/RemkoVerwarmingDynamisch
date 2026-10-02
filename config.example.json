@@ -61,6 +61,7 @@
       "default_temperature": 40,
       "boosts_per_day": 2,
       "min_gap_hours": 4.0,
+      "max_gap_hours": 12.0,
       "qos": 1,
       "retain": false
     }

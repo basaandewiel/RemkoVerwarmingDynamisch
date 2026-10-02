@@ -71,16 +71,35 @@ def _rows(start_dt: datetime, n: int = 24, price: float = 0.12) -> list:
     return rows
 
 
-def _advice(rows_from: datetime, n: int = 24, horizon_end=None) -> dict:
+def _priced_rows(start_dt: datetime, prices: list) -> list:
+    """Aaneengesloten 15-minuten-slots met per-slot prijs (voor tests waarin
+    een ver-weg goedkoop blok de keuze van de tweede boost op de proef stelt)."""
+    rows = []
+    for i, p in enumerate(prices):
+        dt = start_dt + timedelta(minutes=15 * i)
+        rows.append(
+            {
+                "dt_local": dt,
+                "dt_utc": dt.astimezone(ZoneInfo("UTC")),
+                "price": p,
+                "temp": 18.0,
+                "cop": 3.27,
+                "corrected": p / 3.27,
+            }
+        )
+    return rows
+
+
+def _advice(rows_from: datetime, n: int = 24, horizon_end=None, price_rows=None) -> dict:
     """Canned build_advice-resultaat: SWW-advies met reeële rijen (zonder
     deze rijen kan _next_boost_block geen blok kiezen). `horizon_end` is het
     uiteinde van de prijsdata (ontbreekt de nieuwe dag, dan reikt die tot
-    vandaag)."""
+    vandaag). `price_rows` overschrijft de standaard constante-prijs-rijen."""
     return {
         "prices": {"granularity_min": 15, "horizon_end": horizon_end},
         "dhw": {
             "enabled": True,
-            "rows": _rows(rows_from, n),
+            "rows": price_rows if price_rows is not None else _rows(rows_from, n),
             "best": None,
             "blocks": [],
         },
@@ -101,8 +120,17 @@ class DhwBoostResetTest(unittest.TestCase):
         # Uiteinde van de prijsdata (None = geen horizon-info -> geen
         # 'late publicatie'-gedrag); per test te overschrijven.
         self._horizon_end = None
+        # Optionele per-slot prijzen (anders constante prijs via _n_rows).
+        self._prices = None
 
         def fake_advice(_cfg, _args, _now):
+            if self._prices is not None:
+                return _advice(
+                    self._rows_from,
+                    n=len(self._prices),
+                    horizon_end=self._horizon_end,
+                    price_rows=_priced_rows(self._rows_from, self._prices),
+                )
             return _advice(self._rows_from, self._n_rows, horizon_end=self._horizon_end)
 
         patchers.append(patch.object(dhw_boost.app, "build_advice", side_effect=fake_advice))
@@ -250,6 +278,95 @@ class DhwBoostResetTest(unittest.TestCase):
             out["block"]["start"],
             datetime.fromisoformat("2026-09-26T17:00:00+02:00").isoformat(),
             "niet verder doorgeschoven: end+gap (16:00) lag al achter ons",
+        )
+
+    def test_second_boost_capped_by_max_gap(self):
+        """De 2e boost moet uiterlijk max_gap_hours (12 u) ná de start van de
+        1e beginnen. Zonder die bovengrens kiest decide het goedkoopste blok
+        'morgenmiddag' (de situatie uit de melding: 2 dagen achter elkaar maar
+        1x per dag opgewarmd, omdat de 2e boost telkens naar de volgende dag
+        doorschoof) in plaats van een blok binnen de grens."""
+        state = {
+            "last_sent_start": "2026-09-26T13:15:00+02:00",
+            "last_sent_end": "2026-09-26T16:15:00+02:00",
+            "sent_at": "2026-09-26T13:15:00+02:00",
+            "last_reset_start": "2026-09-26T13:15:00+02:00",
+            "reset_at": "2026-09-26T16:15:00+02:00",
+            "daily_boosts": {"2026-09-26": ["2026-09-26T13:15:00+02:00"]},
+        }
+        self._write_state(state)
+        cfg = {"mqtt": {"enabled": True, "dhw_boost": {"min_gap_hours": 4.0, "max_gap_hours": 12.0}}}
+        # data van 16:15 t/m de volgende dag 16:15; alleen morgen 12:00-15:00
+        # is goedkoop (het 'globale optimum' voor de 2e boost, ruim ná de grens
+        # 13:15 + 12 u = 01:15) -> de 2e boost moet binnen de grens worden
+        # gekozen: het goedkoopste blok v.a. 20:15 (16:15 + 4 u gap).
+        self._rows_from = datetime.fromisoformat("2026-09-26T16:15:00+02:00")
+        self._prices = [0.30] * 79 + [0.05] * 12 + [0.30] * 5
+        now = datetime.fromisoformat("2026-09-26T16:15:00+02:00")
+        out = dhw_boost.decide(cfg, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertEqual(out["boosts_recent"], 1)
+        self.assertEqual(out["max_gap_hours"], 12.0)
+        cap = datetime.fromisoformat("2026-09-26T13:15:00+02:00") + timedelta(hours=12)
+        self.assertLessEqual(
+            datetime.fromisoformat(out["block"]["start"]),
+            cap,
+            "2e boost moet binnen max_gap_hours ná de start van de 1e beginnen",
+        )
+        self.assertNotEqual(
+            out["block"]["start"],
+            datetime.fromisoformat("2026-09-27T12:00:00+02:00").isoformat(),
+            "het ver-weg goedkoopste blok (morgenmiddag) moet afgewezen worden",
+        )
+        self.assertEqual(
+            out["block"]["start"],
+            datetime.fromisoformat("2026-09-26T20:15:00+02:00").isoformat(),
+        )
+
+    def test_max_gap_never_clamps_stale_previous_boost(self):
+        """Lag de vorige boost lang genoeg terug (≥ max_gap_hours), dan klemt
+        de maximale tussenruimte niet: de grens ligt dan al in het verleden en
+        de volgende boost is gewoon het goedkoopste blok vanaf nu (geen
+        vastloop als een boost ooit gemist wordt)."""
+        state = {
+            "last_sent_start": "2026-09-25T02:00:00+02:00",
+            "last_sent_end": "2026-09-25T05:00:00+02:00",
+            "sent_at": "2026-09-25T02:00:00+02:00",
+            "last_reset_start": "2026-09-25T02:00:00+02:00",
+            "reset_at": "2026-09-25T05:00:00+02:00",
+            "daily_boosts": {"2026-09-25": ["2026-09-25T02:00:00+02:00"]},
+        }
+        self._write_state(state)
+        cfg = {"mqtt": {"enabled": True, "dhw_boost": {"min_gap_hours": 4.0, "max_gap_hours": 12.0}}}
+        self._rows_from = datetime.fromisoformat("2026-09-26T12:00:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T11:50:00+02:00")
+        out = dhw_boost.decide(cfg, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertEqual(out["boosts_recent"], 0)
+        self.assertEqual(
+            out["block"]["start"],
+            datetime.fromisoformat("2026-09-26T12:00:00+02:00").isoformat(),
+            "geen clamp: boost vanaf nu, de verouderde start klemt niet",
+        )
+
+    def test_wait_log_late_publication_only_when_recheck_is_next(self):
+        """De late-publicatie-hint in de watcher-log nóóit tonen als de
+        hercontrole níét de eerstvolgende wake is (blokstart/reset gaan
+        vóór) — anders belooft de melding een 'hercontrole later' die er
+        nooit komt."""
+        now = datetime.fromisoformat("2026-09-26T13:31:00+02:00")
+        out = {"status": "wait", "wait_minutes": 429.0, "next_day_missing": True}
+        # hercontrole is de volgende wake -> hint
+        msg = dhw_boost._wait_log(out, now + timedelta(minutes=45), now, 45.0)
+        self.assertIn("late publicatie", msg)
+        # een andere wake (bv. blokstart) volgt -> gewone melding
+        msg2 = dhw_boost._wait_log(out, now + timedelta(seconds=90), now, 45.0)
+        self.assertNotIn("late publicatie", msg2)
+        self.assertTrue(msg2.startswith("blokstart over"))
+        # géén late publicatie -> altijd de gewone melding
+        out2 = {"status": "wait", "wait_minutes": 30.0, "next_day_missing": False}
+        self.assertNotIn(
+            "late publicatie", dhw_boost._wait_log(out2, now + timedelta(minutes=45), now, 45.0)
         )
 
     def test_late_publication_triggers_recheck_after_refresh(self):

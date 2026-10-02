@@ -48,10 +48,14 @@ Werking (beide modi):
    uit (default 2, niet gebonden aan een kalenderdag). De volgende boost wordt
    pas gepland ná `min_gap_hours` uur ná het einde van de vorige, zodat een
    tweede opwarmperiode écht niet vlak na de eerste ligt (geen aangrenzende/
-   naburige goedkoopste momenten). Is het venster vol, dan wacht de watcher
-   tot het oudste blok er weer uit valt (het derde blok kan nooit binnen 24 u
-   van de eerste twee starten). Wordt een boost gemist, dan mag de
-   eerstvolgende alsnog gaan.
+   naburige goedkoopste momenten). Omgekeerd moet die volgende boost ook
+   uiterlijk `max_gap_hours` uur ná de start van de vorige beginnen (default
+   12): zonder die bovengrens glijdt de tweede boost met het 'goedkoopste
+   blok'-advies telkens een dag door zodra de nieuwe-dag-prijzen binnen zijn,
+   en wordt er effectief maar 1x per dag opgewarmd. Is het venster vol, dan
+   wacht de watcher tot het oudste blok er weer uit valt (het derde blok kan
+   nooit binnen 24 u van de eerste twee starten). Wordt een boost gemist, dan
+   mag de eerstvolgende alsnog gaan.
 
 Het reset-commando wordt alleen gestuurd ná een verstuurd boost-commando
 voor datzelfde blok; is het blok gemist, dan blijft de standaardwaarde
@@ -75,8 +79,12 @@ from optimizer import find_cheapest_blocks
 
 DEFAULT_DHW_TEMP = 53.0
 DEFAULT_RESET_TEMP = 40.0
-DEFAULT_BOOSTS_PER_DAY = 2     # meerdere opwarmmomenten per dag
-DEFAULT_BOOST_GAP_HOURS = 4.0  # min. uren tussen einde vorige boost en start volgende
+DEFAULT_BOOSTS_PER_DAY = 2      # meerdere opwarmmomenten per dag
+DEFAULT_BOOST_GAP_HOURS = 4.0   # min. uren tussen einde vorige boost en start volgende
+DEFAULT_BOOST_MAX_GAP_HOURS = 12.0  # max. uren tussen de START van twee opeenvolgende
+                                    # boosts: zonder deze bovengrens glijdt de tweede
+                                    # boost elke dag door (goedkoopste-blok-keuze) en
+                                    # wordt er effectief maar 1x per dag opgewarmd
 ROLLING_WINDOW_HOURS = 24.0    # de boostlimiet telt per rollend 24-uursvenster
 
 
@@ -207,6 +215,9 @@ def decide(cfg: dict, now: datetime) -> dict:
     boosts_per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
     out["boosts_per_day"] = boosts_per_day
     out["min_gap_hours"] = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
+    out["max_gap_hours"] = float(
+        boost_cfg.get("max_gap_hours", DEFAULT_BOOST_MAX_GAP_HOURS)
+    )
     out["boosts_recent"] = _count_boosts_last_24h(state, now)
 
     # 24-uurslimiet bereikt (rollend venster, geen kalenderdag)? Dan geen
@@ -301,8 +312,15 @@ def _next_boost_block(
     opwarmperiode vlak na de eerste liggen (het advies kiest 'slim' hetzelfde
     of aangrenzende goedkope moment). Zonder eerdere boost is het gewoon het
     goedkoopste blok vanaf nu.
+
+    Omgekeerd moet het volgende blok ook uiterlijk `max_gap_hours` uur ná de
+    start van de vorige boost beginnen: anders glijdt de tweede boost met het
+    goedkoopste-blok-advies telkens een dag door zodra de prijzen van een
+    nieuwe dag gepubliceerd zijn, en wordt er effectief maar 1x per dag
+    opgewarmd in plaats van de bedoelde 2x per 24 u.
     """
     gap_hours = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
+    max_gap = float(boost_cfg.get("max_gap_hours", DEFAULT_BOOST_MAX_GAP_HOURS))
     dhw = advice.get("dhw") or {}
     rows = dhw.get("rows") or []
     granularity_min = int((advice.get("prices") or {}).get("granularity_min", 15))
@@ -310,11 +328,22 @@ def _next_boost_block(
     block_hours = int(opt_cfg.get("block_hours", 3))
 
     earliest_start = now
+    last_start = state.get("last_sent_start")
     last_end = state.get("last_sent_end")
     if last_end:
         after_prev = datetime.fromisoformat(last_end) + timedelta(hours=gap_hours)
         if now < after_prev:
             earliest_start = after_prev
+    # Maximale tussenruimte: het volgende blok begint uiterlijk `max_gap_hours`
+    # ná de start van de vorige boost. Waarborg: een verouderde 'last_sent_start'
+    # (bijv. na een gemiste boost) klemt nooit — ligt de grens vóór of op het
+    # vroegst mogelijke startmoment, dan is er géén beperking (anders zou de
+    # watcher vastlopen).
+    latest_start = None
+    if last_start and max_gap > 0:
+        deadline = datetime.fromisoformat(last_start) + timedelta(hours=max_gap)
+        if deadline > earliest_start:
+            latest_start = deadline
 
     blocks = find_cheapest_blocks(
         rows,
@@ -324,6 +353,7 @@ def _next_boost_block(
         top_n=1,
         now=now,
         earliest_start=earliest_start,
+        latest_start=latest_start,
     )
     return blocks[0] if blocks else None
 
@@ -400,6 +430,24 @@ RETRY_INTERVAL_DEFAULT = 1800.0    # fallback (30 min) zolang er nog geen blok b
 def _log(*parts) -> None:
     ts = datetime.now().strftime("%d-%m %H:%M:%S")
     print(f"[{ts}] " + " ".join(str(p) for p in parts), flush=True)
+
+
+def _wait_log(out: dict, wake: datetime, now: datetime, recheck_min: float) -> str:
+    """Watcher-melding bij status 'wait'.
+
+    De hint over een late publicatie wordt alleen getoond als die hercontrole
+    ook écht de eerstvolgende wake is (blokstart/reset gaan vóór) — anders
+    belooft de melding een 'hercontrole later' die er nooit komt (de watcher
+    wordt dan eerst wakker voor het blokeinde of de blokstart).
+    """
+    wait_txt = f"blokstart over {out['wait_minutes']:g} min"
+    if out.get("next_day_missing") and wake == now + timedelta(minutes=recheck_min):
+        return (
+            wait_txt
+            + " — prijzen van de nieuwe dag nog niet zichtbaar (late publicatie), "
+            f"herberekening over {recheck_min:g} min"
+        )
+    return wait_txt
 
 
 def next_price_refresh(now: datetime, tz: ZoneInfo, hhmm: str) -> datetime:
@@ -632,17 +680,12 @@ def watch(
             elif status == "boost_limit":
                 _log("24-uurslimiet bereikt — volgende boost mogelijk om",
                      out.get("limit_wake_at", "?"))
-            elif status == "wait" and out.get("next_day_missing"):
-                _log("blokstart over", f"{out['wait_minutes']:g} min — prijzen van "
-                     "de nieuwe dag nog niet beschikbaar (late publicatie), "
-                     "hercontrole later")
             else:
-                extra = (
-                    f"blokstart over {out['wait_minutes']:g} min"
-                    if status == "wait"
-                    else f"status: {status}"
-                )
-                _log(extra)
+                wake = next_wake_time(out, now, tz, refresh_hhmm, recheck_min)
+                if status == "wait":
+                    _log(_wait_log(out, wake, now, recheck_min))
+                else:
+                    _log(f"status: {status}")
 
             # Blok komt binnen LEAD-nadering: niet meer alleen slapen, maar in
             # kleine stapjes naar de start wachten en dan versturen zonder het
@@ -677,8 +720,9 @@ def render_human(out: dict) -> List[str]:
     lines.append(f"Nu      : {app.fmt_dt(datetime.fromisoformat(out['now']))}")
     if "boosts_per_day" in out:
         lines.append(
-            f"Plan    : {out['boosts_per_day']}x per 24 u, min. {out['min_gap_hours']:g} u "
-            f"tussen de blokken — {out.get('boosts_recent', 0)}/{out['boosts_per_day']} "
+            f"Plan    : {out['boosts_per_day']}x per 24 u, tussen de blokken "
+            f"min. {out['min_gap_hours']:g} u en max. {out['max_gap_hours']:g} u "
+            f"— {out.get('boosts_recent', 0)}/{out['boosts_per_day']} "
             "in de afgelopen 24 u"
         )
     if "block" in out:

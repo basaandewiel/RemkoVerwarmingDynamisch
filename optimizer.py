@@ -58,6 +58,7 @@ def find_cheapest_blocks(
     top_n: int = 3,
     now: Optional[datetime] = None,
     earliest_start: Optional[datetime] = None,
+    latest_start: Optional[datetime] = None,
 ) -> List[Dict]:
     """Zoek de goedkoopste aaneengesloten blokken van `block_hours` uur.
 
@@ -66,9 +67,13 @@ def find_cheapest_blocks(
     minimale tussenruimte na het vorige (anders kiest het advies twee keer
     hetzelfde/naburige goedkoopste moment).
 
-    Kies het goedkoopste blok na een bepaalde tijd (bijv. na het einde van
-    het vorige boost-blok + tussenruimte), zodat de tweede boost écht "niet
-    vlak na de eerste" ligt.
+    `latest_start` (optioneel): geen blok start ná dit tijdstip. Handig om de
+    maximale tussenruimte af te dwingen: zonder deze grens glijdt de tweede
+    boost met het 'goedkoopste blok'-advies naar het volgende dagdeel zodra de
+    prijzen van een nieuwe dag verschijnen (dan lijkt het of er maar 1 boost
+    per dag nodig is). Windows die ná `latest_start` beginnen worden
+    overgeslagen; een window dat precies op `latest_start` begint telt nog
+    wel mee.
     """
     if len(rows) < 2:
         return []
@@ -81,6 +86,11 @@ def find_cheapest_blocks(
     earliest_utc = None
     if earliest_start is not None:
         earliest_utc = earliest_start.astimezone(timezone.utc)
+    # latest_start: elk blok moet beginnen op/óver dát tijdstip al gestart zijn
+    # (windows ná latest_start doen niet meer mee).
+    latest_utc = None
+    if latest_start is not None:
+        latest_utc = latest_start.astimezone(timezone.utc)
 
     n_slots = max(1, round(block_hours * 60 / granularity_min))
     slot_delta = timedelta(minutes=granularity_min)
@@ -98,6 +108,8 @@ def find_cheapest_blocks(
         if window[0]["dt_utc"] < now_utc:
             continue
         if earliest_utc is not None and window[0]["dt_utc"] < earliest_utc:
+            continue
+        if latest_utc is not None and window[0]["dt_utc"] > latest_utc:
             continue
 
         mean_price = sum(r["price"] for r in window) / n_slots
