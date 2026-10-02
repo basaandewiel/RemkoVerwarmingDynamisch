@@ -97,26 +97,28 @@ def _dhw_boost_plan(
     """De SWW-boost-momenten die dhw_boost --watch gaat uitsturen: max.
     `boosts_per_day` blokken, telkens pas startend ná `min_gap_hours` uur ná
     het einde van het vorige (zodat de opwarmmomenten gespreid staan en niet
-    'slim' vlak achter elkaar hetzelfde goedkope moment kiezen), én uiterlijk
-    `max_gap_hours` uur ná de start van het vorige (anders glijdt de volgende
-    boost met het goedkoopste-blok-advies telkens een dag door zodra de
-    nieuwe-dag-prijzen gepubliceerd zijn, en warmt het water maar 1x per dag
-    op i.p.v. de bedoelde ~2x per 24 u).
+    'slim' vlak achter elkaar hetzelfde goedkope moment kiezen). Het LAATSTE
+    blok eindigt bovendien tussen `last_block_end_from` en `last_block_end_to`
+    (default 19:00–08:00 de volgende ochtend): de laatste opwarmperiode van
+    de dag eindigt dan nooit midden op de dag.
 
-    Geeft (plan, boosts_per_day, min_gap_hours, max_gap_hours): plan is de
-    lijst gekozen blokken in oplopende volgorde.
+    Geeft (plan, boosts_per_day, min_gap_hours, last_block_end_from,
+    last_block_end_to): plan is de lijst gekozen blokken in oplopende
+    volgorde.
     """
     boost_cfg = (cfg.get("mqtt") or {}).get("dhw_boost") or {}
     # lazy import: dhw_boost importeert main, dus niet op module-niveau
     from dhw_boost import (
         DEFAULT_BOOSTS_PER_DAY,
         DEFAULT_BOOST_GAP_HOURS,
-        DEFAULT_BOOST_MAX_GAP_HOURS,
+        LAST_BLOCK_END_FROM,
+        LAST_BLOCK_END_TO,
     )
 
     per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
     gap_hours = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
-    max_gap = float(boost_cfg.get("max_gap_hours", DEFAULT_BOOST_MAX_GAP_HOURS))
+    end_from = boost_cfg.get("last_block_end_from", LAST_BLOCK_END_FROM)
+    end_to = boost_cfg.get("last_block_end_to", LAST_BLOCK_END_TO)
 
     plan: List[dict] = []
     earliest = now
@@ -125,16 +127,12 @@ def _dhw_boost_plan(
     # kan het optimum zomaar ná de horizon liggen — zie de hint in de output.
     slot_delta = timedelta(minutes=granularity_min)
     horizon_end = dhw_rows[-1]["dt_local"] + slot_delta if dhw_rows else None
-    for _ in range(max(1, per_day)):
-        # Maximale tussenruimte ná de start van het vorige geplande blok; een
-        # volgelopen venster klemt nooit: ligt de grens vóór of op het vroegst
-        # mogelijke startmoment ('earliest'), dan géén beperking (zie
-        # dhw_boost._next_boost_block).
-        latest = None
-        if plan and max_gap > 0:
-            deadline = plan[-1]["start"] + timedelta(hours=max_gap)
-            if deadline > earliest:
-                latest = deadline
+    last_index = max(1, per_day) - 1
+    for i in range(max(1, per_day)):
+        # Alleen het laatste geplande blok (en dus alleen bij meerdere blokken)
+        # moet binnen het avond/nacht-venster eindigen; de eerdere blokken en
+        # het enkele blok bij boosts_per_day=1 zijn vrij (goedkoopste moment).
+        end_window = (end_from, end_to) if per_day >= 2 and i == last_index else None
         blocks = find_cheapest_blocks(
             dhw_rows,
             granularity_min=granularity_min,
@@ -143,7 +141,7 @@ def _dhw_boost_plan(
             top_n=1,
             now=now,
             earliest_start=earliest,
-            latest_start=latest,
+            end_window=end_window,
         )
         if not blocks:
             break
@@ -152,7 +150,7 @@ def _dhw_boost_plan(
             block = dict(block, horizon_bound=block["end"] >= horizon_end)
         plan.append(block)
         earliest = block["end"] + timedelta(hours=gap_hours)
-    return plan, per_day, gap_hours, max_gap
+    return plan, per_day, gap_hours, end_from, end_to
 
 
 def build_advice(cfg: dict, args, now: datetime) -> dict:
@@ -284,9 +282,16 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
     dhw_plan: List[dict] = []
     dhw_boosts_per_day: Optional[int] = None
     dhw_gap_hours: Optional[float] = None
-    dhw_max_gap: Optional[float] = None
+    dhw_last_end_from: Optional[str] = None
+    dhw_last_end_to: Optional[str] = None
     if dhw_rows:
-        dhw_plan, dhw_boosts_per_day, dhw_gap_hours, dhw_max_gap = _dhw_boost_plan(
+        (
+            dhw_plan,
+            dhw_boosts_per_day,
+            dhw_gap_hours,
+            dhw_last_end_from,
+            dhw_last_end_to,
+        ) = _dhw_boost_plan(
             cfg,
             pr["granularity_min"],
             int(args.block_hours or opt["block_hours"]),
@@ -331,7 +336,8 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             "plan": dhw_plan,
             "boosts_per_day": dhw_boosts_per_day,
             "min_gap_hours": dhw_gap_hours,
-            "max_gap_hours": dhw_max_gap,
+            "last_block_end_from": dhw_last_end_from,
+            "last_block_end_to": dhw_last_end_to,
         },
     }
 
@@ -403,9 +409,10 @@ def render_human(result: dict) -> str:
             lines.append("")
             lines.append(
                 "GEPLANDE SWW-BOOSTS"
-                f" ({dhw.get('boosts_per_day')}x per 24 u, tussen de blokken "
-                f"min. {dhw.get('min_gap_hours') or 0.0:g} u en "
-                f"max. {dhw.get('max_gap_hours') or 0.0:g} u):"
+                f" ({dhw.get('boosts_per_day')}x per 24 u, min. "
+                f"{dhw.get('min_gap_hours') or 0.0:g} u tussen de blokken; "
+                f"laatste blok eindigt {dhw.get('last_block_end_from') or '19:00'}–"
+                f"{dhw.get('last_block_end_to') or '08:00'}):"
             )
             lines.append("-" * 64)
             for i, b in enumerate(plan, start=1):
@@ -575,7 +582,8 @@ def to_serializable(result: dict) -> dict:
             ],
             "boosts_per_day": dhw.get("boosts_per_day"),
             "min_gap_hours": dhw.get("min_gap_hours"),
-            "max_gap_hours": dhw.get("max_gap_hours"),
+            "last_block_end_from": dhw.get("last_block_end_from"),
+            "last_block_end_to": dhw.get("last_block_end_to"),
         }
         out["dhw"]["best"] = out["dhw"]["blocks"][0] if out["dhw"]["blocks"] else None
     return out

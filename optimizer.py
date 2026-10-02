@@ -7,7 +7,7 @@ alleen aan de verste horizon voorkomen, waar ook geen prijzen meer zijn).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from cop_model import CopModel
@@ -58,7 +58,7 @@ def find_cheapest_blocks(
     top_n: int = 3,
     now: Optional[datetime] = None,
     earliest_start: Optional[datetime] = None,
-    latest_start: Optional[datetime] = None,
+    end_window: Optional[Tuple[str, str]] = None,
 ) -> List[Dict]:
     """Zoek de goedkoopste aaneengesloten blokken van `block_hours` uur.
 
@@ -67,13 +67,12 @@ def find_cheapest_blocks(
     minimale tussenruimte na het vorige (anders kiest het advies twee keer
     hetzelfde/naburige goedkoopste moment).
 
-    `latest_start` (optioneel): geen blok start ná dit tijdstip. Handig om de
-    maximale tussenruimte af te dwingen: zonder deze grens glijdt de tweede
-    boost met het 'goedkoopste blok'-advies naar het volgende dagdeel zodra de
-    prijzen van een nieuwe dag verschijnen (dan lijkt het of er maar 1 boost
-    per dag nodig is). Windows die ná `latest_start` beginnen worden
-    overgeslagen; een window dat precies op `latest_start` begint telt nog
-    wel mee.
+    `end_window` (optioneel): het blok moet eindigen binnen dit
+    tijdsvenster, gegeven als twee "HH:MM"-tijden, bijv. ("19:00", "08:00")
+    = tussen 19:00 's avonds en 08:00 de volgende ochtend (loopt dus over
+    middernacht heen). Bedoeld voor het LAATSTE boost-blok van het
+    24-uursvenster, zodat de laatste (nachtelijke) opwarmperiode nooit
+    midden op de dag eindigt maar de boiler 's avonds/nachts vol is.
     """
     if len(rows) < 2:
         return []
@@ -86,11 +85,12 @@ def find_cheapest_blocks(
     earliest_utc = None
     if earliest_start is not None:
         earliest_utc = earliest_start.astimezone(timezone.utc)
-    # latest_start: elk blok moet beginnen op/óver dát tijdstip al gestart zijn
-    # (windows ná latest_start doen niet meer mee).
-    latest_utc = None
-    if latest_start is not None:
-        latest_utc = latest_start.astimezone(timezone.utc)
+    # end_window: het einde van het blok moet binnen dit (circulaire) venster
+    # vallen, bijv. 19:00-08:00 -> einde ≥ 19:00 óf einde ≤ 08:00.
+    end_from_t = end_to_t = None
+    if end_window is not None:
+        end_from_t = time(*[int(x) for x in end_window[0].split(":")])
+        end_to_t = time(*[int(x) for x in end_window[1].split(":")])
 
     n_slots = max(1, round(block_hours * 60 / granularity_min))
     slot_delta = timedelta(minutes=granularity_min)
@@ -109,8 +109,13 @@ def find_cheapest_blocks(
             continue
         if earliest_utc is not None and window[0]["dt_utc"] < earliest_utc:
             continue
-        if latest_utc is not None and window[0]["dt_utc"] > latest_utc:
-            continue
+        if end_from_t is not None:
+            end_dt = window[-1]["dt_local"] + slot_delta
+            end_tod = end_dt.time()
+            # circulair venster over middernacht: einde ná 'from' (19:00) of
+            # vóór/op 'to' (08:00 de volgende ochtend)
+            if not (end_tod >= end_from_t or end_tod <= end_to_t):
+                continue
 
         mean_price = sum(r["price"] for r in window) / n_slots
         mean_temp = sum(r["temp"] for r in window) / n_slots
