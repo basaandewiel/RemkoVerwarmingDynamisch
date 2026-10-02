@@ -52,7 +52,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `heatpump.dhw.enabled` | `true` (default): bereken ook het advies voor sanitair warm water. |
 | `heatpump.dhw.temperature` | Doeltemperatuur warmwaterboiler (default `53`). |
 | `heatpump.dhw.curve_key` | Welke config-curve voor SWW wordt gebruikt (default `cop_curve_w53`). |
-| `optimization.block_hours` | Lengte van het goedkoopste blok (default 3). |
+| `optimization.block_hours` | Lengte van het goedkoopste blok voor de **ruimteverwarming** (default 3). |
 | `optimization.only_future` | `true`: alleen blokken die nu of later starten. |
 | `optimization.top_n` | Hoeveel beste blokken worden weergegeven. |
 | `prices.source` | `entsoe` (default) of `energyzero` als alternatief. |
@@ -70,6 +70,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.dhw_boost.default_temperature` | Temperatuur (°C) **waar de boiler na het goedkoopste blok weer naar teruggezet** wordt (reset-commando aan het blokeinde), default 40 °C. |
 | `mqtt.dhw_boost.boosts_per_day` | Maximaal aantal boosts per **rollend 24-uursvenster** (default 2). Géén kalenderdag-grens: de tweede boost mag gewoon op een andere dag vallen, mits er altijd ~2 opwarmmomenten binnen 24 uur plaatsvinden. |
 | `mqtt.dhw_boost.min_gap_hours` | Minimum uren tussen het **einde van de vorige boost** en de **start van de volgende** (default 4). Zorgt dat een tweede opwarmperiode niet vlak na de eerste ligt. |
+| `mqtt.dhw_boost.block_hours` | Lengte van één SWW-boost-blok (default **1**, los van `optimization.block_hours` voor de ruimteverwarming). Een korte boost volstaat voor SWW: het water hoeft niet 3 uur na te verwarmen, en blokken passen zo makkelijker in het goedkope avond/nacht-venster. |
 | `mqtt.dhw_boost.last_block_end_from` / `last_block_end_to` | Het **laatste** boost-blok van het 24-uursvenster eindigt tussen deze tijden (default `"19:00"` en `"08:00"`, de volgende ochtend). Zonder deze eis glijdt de laatste opwarmperiode met het goedkoopste-blok-advies naar de volgende middag en is de boiler overdag 'leeg' in plaats van 's avonds/nachts vol. |
 | `mqtt.dhw_boost.qos` | QoS-niveau voor de boost/reset-commando's (default `1`). Met QoS 1 moet de broker de ontvangst bevestigen (PUBACK) **voordat** `VERSTUURD` wordt getoond; bij QoS 0 is er geen garantie. |
 | `mqtt.dhw_boost.retain` | Retain-flag op het commando (default `false`). Zet op `true` als je het laatste commando in MQTT Explorer zichtbaar wilt houden (elke nieuwe boost/reset overschrijft dan de vorige). |

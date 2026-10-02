@@ -224,10 +224,11 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertEqual(out["status"], "wait")
         self.assertEqual(out["boosts_recent"], 1)
         # gap vanaf blokeinde (02:00) + 4 u -> vroegste start 06:00 op 26-09;
-        # als laatste blok moet het echter ≥ 19:00 eindigen -> 16:00-19:00
+        # 06:00-07:00 eindigt om 07:00 (≤ 08:00): binnen het eind-venster,
+        # dus als laatste blok gewoon het eerst mogelijke blok.
         self.assertEqual(
             out["block"]["start"],
-            datetime.fromisoformat("2026-09-26T16:00:00+02:00").isoformat(),
+            datetime.fromisoformat("2026-09-26T06:00:00+02:00").isoformat(),
         )
 
     def test_third_boost_blocked_even_across_midnight(self):
@@ -252,7 +253,7 @@ class DhwBoostResetTest(unittest.TestCase):
     def test_second_boost_allowed_but_spaced(self):
         """Eén boost vanmorgen (02:00-05:00) -> een tweede is toegestaan, maar
         moet pas ná min_gap_hours (4 u) ná het einde beginnen én — als laatste
-        blok van het venster — eindigen tussen 19:00 en 08:00 (16:00-19:00)."""
+        blok van het venster — eindigen tussen 19:00 en 08:00 (18:00-19:00)."""
         self._write_state(GAP_STATE)
         self._rows_from = datetime.fromisoformat("2026-09-26T08:00:00+02:00")
         self._n_rows = 48  # data t/m 20:00: einde ≥ 19:00 kan gekozen worden
@@ -262,14 +263,15 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertEqual(out["boosts_recent"], 1)
         self.assertEqual(
             out["block"]["start"],
-            datetime.fromisoformat("2026-09-26T16:00:00+02:00").isoformat(),
+            datetime.fromisoformat("2026-09-26T18:00:00+02:00").isoformat(),
             "2e boost niet vóór 09:00 (gap) en niet eindigend vóór 19:00 (venster)",
         )
 
     def test_no_gap_needed_after_gap_elapsed(self):
         """Lag de vorige boost lang genoeg terug (≥ min_gap_hours), dan mag de
         volgende gewoon het goedkoopste blok vanaf nu zijn (geen kunstmatige
-        verdere spreiding)."""
+        verdere spreiding) — mits het als laatste blok tussen 19:00 en 08:00
+        eindigt (hier: 18:00-19:00)."""
         state = dict(GAP_STATE)
         state["last_sent_start"] = "2026-09-26T09:00:00+02:00"
         state["last_sent_end"] = "2026-09-26T12:00:00+02:00"
@@ -282,7 +284,7 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertEqual(out["status"], "wait")
         self.assertEqual(
             out["block"]["start"],
-            datetime.fromisoformat("2026-09-26T17:00:00+02:00").isoformat(),
+            datetime.fromisoformat("2026-09-26T18:00:00+02:00").isoformat(),
             "niet verder doorgeschoven: end+gap (16:00) lag al achter ons",
         )
 
@@ -292,7 +294,7 @@ class DhwBoostResetTest(unittest.TestCase):
         (12:00-15:00 de volgende dag) en leek het water maar 1x per dag op te
         warmen — zo'n blok eindigt midden op de dag en mag niet gekozen worden;
         in plaats daarvan het goedkoopste blok ná 20:15 (16:15 + 4 u gap) dat
-        vóór 08:00 of ná 19:00 eindigt: 20:15-23:15 (einde 23:15)."""
+        vóór 08:00 of ná 19:00 eindigt: 20:15-21:15 (einde 21:15)."""
         state = {
             "last_sent_start": "2026-09-26T13:15:00+02:00",
             "last_sent_end": "2026-09-26T16:15:00+02:00",
@@ -306,7 +308,7 @@ class DhwBoostResetTest(unittest.TestCase):
         # data van 16:15 t/m morgen 16:15; alleen morgen 12:00-15:00 is goedkoop
         # (het 'globale optimum', einde 15:00: buiten het venster) -> de watcher
         # kiest het goedkoopste blok v.a. 20:15 dat vóór 08:00 of ná 19:00
-        # eindigt: 20:15-23:15.
+        # eindigt: 20:15-21:15.
         self._rows_from = datetime.fromisoformat("2026-09-26T16:15:00+02:00")
         self._prices = [0.30] * 79 + [0.05] * 12 + [0.30] * 5
         now = datetime.fromisoformat("2026-09-26T16:15:00+02:00")

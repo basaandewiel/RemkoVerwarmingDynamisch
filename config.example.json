@@ -61,6 +61,7 @@
       "default_temperature": 40,
       "boosts_per_day": 2,
       "min_gap_hours": 4.0,
+      "block_hours": 1,
       "last_block_end_from": "19:00",
       "last_block_end_to": "08:00",
       "qos": 1,

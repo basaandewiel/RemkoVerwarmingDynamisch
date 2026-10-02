@@ -90,17 +90,17 @@ def _append_best_block(
 def _dhw_boost_plan(
     cfg: dict,
     granularity_min: int,
-    block_hours: int,
     now: datetime,
     dhw_rows: list,
 ) -> Tuple[list, int, float]:
     """De SWW-boost-momenten die dhw_boost --watch gaat uitsturen: max.
-    `boosts_per_day` blokken, telkens pas startend ná `min_gap_hours` uur ná
-    het einde van het vorige (zodat de opwarmmomenten gespreid staan en niet
-    'slim' vlak achter elkaar hetzelfde goedkope moment kiezen). Het LAATSTE
-    blok eindigt bovendien tussen `last_block_end_from` en `last_block_end_to`
-    (default 19:00–08:00 de volgende ochtend): de laatste opwarmperiode van
-    de dag eindigt dan nooit midden op de dag.
+    `boosts_per_day` blokken van `mqtt.dhw_boost.block_hours` uur (default 1 —
+    los van het langere blok voor de ruimteverwarming), telkens pas startend ná
+    `min_gap_hours` uur ná het einde van het vorige (zodat de opwarmmomenten
+    gespreid staan en niet 'slim' vlak achter elkaar hetzelfde goedkope moment
+    kiezen). Het LAATSTE blok eindigt bovendien tussen `last_block_end_from`
+    en `last_block_end_to` (default 19:00–08:00 de volgende ochtend): de
+    laatste opwarmperiode van de dag eindigt dan nooit midden op de dag.
 
     Geeft (plan, boosts_per_day, min_gap_hours, last_block_end_from,
     last_block_end_to): plan is de lijst gekozen blokken in oplopende
@@ -111,6 +111,7 @@ def _dhw_boost_plan(
     from dhw_boost import (
         DEFAULT_BOOSTS_PER_DAY,
         DEFAULT_BOOST_GAP_HOURS,
+        DEFAULT_BOOST_BLOCK_HOURS,
         LAST_BLOCK_END_FROM,
         LAST_BLOCK_END_TO,
     )
@@ -119,6 +120,7 @@ def _dhw_boost_plan(
     gap_hours = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
     end_from = boost_cfg.get("last_block_end_from", LAST_BLOCK_END_FROM)
     end_to = boost_cfg.get("last_block_end_to", LAST_BLOCK_END_TO)
+    block_hours = int(boost_cfg.get("block_hours", DEFAULT_BOOST_BLOCK_HOURS))
 
     plan: List[dict] = []
     earliest = now
@@ -258,8 +260,14 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         now=now,
     )
 
-    # 5b) SWW: zelfde prijzen en temperaturen, maar een andere COP-curve.
-    #     Het goedkoopste blok kan daardoor anders uitvallen dan voor ruimtes.
+    # 5b) SWW: zelfde prijzen en temperaturen, maar een andere COP-curve én
+    #     een eigen, kortere bloklengte (mqtt.dhw_boost.block_hours, default
+    #     1 u; het blok voor de ruimteverwarming is optimization.block_hours).
+    dhw_boost_cfg = (cfg.get("mqtt") or {}).get("dhw_boost") or {}
+    # lazy import: dhw_boost importeert main, dus niet op module-niveau
+    from dhw_boost import DEFAULT_BOOST_BLOCK_HOURS
+
+    dhw_bh = int(dhw_boost_cfg.get("block_hours", DEFAULT_BOOST_BLOCK_HOURS))
     dhw_rows = (
         build_corrected_rows(pr["slots"], temps_by_hour, dhw_model)
         if dhw_model
@@ -269,7 +277,7 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         find_cheapest_blocks(
             dhw_rows,
             granularity_min=pr["granularity_min"],
-            block_hours=int(args.block_hours or opt["block_hours"]),
+            block_hours=dhw_bh,
             only_future=bool(opt["only_future"]),
             top_n=int(opt["top_n"]),
             now=now,
@@ -294,7 +302,6 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
         ) = _dhw_boost_plan(
             cfg,
             pr["granularity_min"],
-            int(args.block_hours or opt["block_hours"]),
             now,
             dhw_rows,
         )

@@ -82,6 +82,9 @@ DEFAULT_DHW_TEMP = 53.0
 DEFAULT_RESET_TEMP = 40.0
 DEFAULT_BOOSTS_PER_DAY = 2      # meerdere opwarmmomenten per dag
 DEFAULT_BOOST_GAP_HOURS = 4.0   # min. uren tussen einde vorige boost en start volgende
+DEFAULT_BOOST_BLOCK_HOURS = 1   # bloklengte van één SWW-boost (het blok voor de
+                                # ruimteverwarming blijft optimization.block_hours,
+                                # default 3 — mqtt.dhw_boost.block_hours)
 LAST_BLOCK_END_FROM = "19:00"   # het LAATSTE boost-blok van het 24-u-venster
 LAST_BLOCK_END_TO = "08:00"     # eindigt tussen 19:00 's avonds en 08:00 's ochtends
                                 # (de boiler is dan 's avonds/nachts opgewarmd in
@@ -234,7 +237,7 @@ def decide(cfg: dict, now: datetime) -> dict:
         ).isoformat()
         return out
 
-    best = _next_boost_block(cfg, advice, boost_cfg, state, now)
+    best = _next_boost_block(advice, boost_cfg, state, now)
     if not best:
         out["status"] = "no_block"
         return out
@@ -306,7 +309,7 @@ def _record_boost(state: dict, start: datetime) -> None:
 
 
 def _next_boost_block(
-    cfg: dict, advice: dict, boost_cfg: dict, state: dict, now: datetime
+    advice: dict, boost_cfg: dict, state: dict, now: datetime
 ):
     """Het goedkoopste beschikbare blok voor de VOLGENDE boost.
 
@@ -328,8 +331,9 @@ def _next_boost_block(
     dhw = advice.get("dhw") or {}
     rows = dhw.get("rows") or []
     granularity_min = int((advice.get("prices") or {}).get("granularity_min", 15))
-    opt_cfg = cfg.get("optimization") or {}
-    block_hours = int(opt_cfg.get("block_hours", 3))
+    # SWW-boosts hebben hun eigen bloklengte (default 1 u); het langere blok
+    # voor de ruimteverwarming is optimization.block_hours (default 3).
+    block_hours = int(boost_cfg.get("block_hours", DEFAULT_BOOST_BLOCK_HOURS))
 
     earliest_start = now
     last_end = state.get("last_sent_end")
