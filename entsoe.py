@@ -27,6 +27,7 @@ import json
 import os
 import re
 import time as _time
+import urllib.error  # noqa: F401 — gebruikt voor HTTPError/URLError hieronder
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -38,6 +39,28 @@ from zoneinfo import ZoneInfo
 API_URL = "https://web-api.tp.entsoe.eu/api"
 DEFAULT_DOMAIN = "10YNL----------L"  # Nederland
 DEFAULT_CACHE_TTL = 3600  # dag-ahead prijzen veranderen hooguit 1×/dag
+REQUEST_TIMEOUT = 30  # seconden per HTTP-verzoek (ENTSO-E kan traag zijn)
+# Wachttijd tussen retries van één dag (4 pogingen totaal = max ~50 s extra).
+# Kort genoeg om binnen het trigger-venster van 45 min. te blijven.
+RETRY_DELAYS = (5, 15, 30)
+
+
+class _TransientDayError(RuntimeError):
+    """Tijdelijke ophaalfout voor één dag (HTTP 5xx/408/429, timeout,
+    verbindingsfout, half afgegeven XML). Waarschijnlijk vanzelf over; het
+    deugt dus om opnieuw te proberen of op een oudere cache te terugvallen."""
+
+
+def _is_transient_http(code: int) -> bool:
+    """Is deze HTTP-status tijdelijk (dus waard om te herhalen)?
+
+    De Transparency Platform zit achter een CDN dat ook niet-standaard
+    statussen teruggeeft: 527 (Railgun) en 599 (non-standard connection
+    reset) zijn allebei CDN-/netwerkproblemen, geen probleem met de key.
+    Daarom: alles >= 500, plus de 4xx die expliciet om "later opnieuw" vragen.
+    401/403 zijn géén tijdelijk — dat is een slechte api_key.
+    """
+    return code >= 500 or code in (408, 425, 429)
 
 
 def _default_cache_dir() -> str:
@@ -49,12 +72,20 @@ def _day_cache_path(cache_dir: str, day: date, in_domain: str) -> str:
     return os.path.join(cache_dir, f"entsoe_{day:%Y%m%d}_{safe_domain}.json")
 
 
-def _load_day_cache(path: str, ttl_seconds: int) -> Optional[List[Tuple[datetime, float]]]:
-    """Lees een eerder opgehaalde dag uit de cache (None als verlopen/ongeldig)."""
+def _load_day_cache(
+    path: str, ttl_seconds: int, allow_stale: bool = False
+) -> Optional[List[Tuple[datetime, float]]]:
+    """Lees een eerder opgehaalde dag uit de cache (None als verlopen/ongeldig).
+
+    Met `allow_stale=True` wordt de leeftijd genegeerd: dat is de terugval
+    wanneer de API net even onbereikbaar is. Dag-ahead prijzen veranderen
+    hooguit één keer per dag, dus een paar uur oud is ruim bruikbaar en
+    oneindig wachten op een herstelde API is dat niet.
+    """
     try:
         if not os.path.exists(path):
             return None
-        if _time.time() - os.path.getmtime(path) >= ttl_seconds:
+        if not allow_stale and _time.time() - os.path.getmtime(path) >= ttl_seconds:
             return None
         with open(path, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -120,6 +151,44 @@ def _request_day(
         if cached is not None:
             return cached
 
+    # Tijdelijke fouten (5xx/599/527, timeout) herhalen met korte pauzes; pas
+    # als het nóg misgaat terugvallen op een oudere cachekopie van dezelfde dag.
+    # De eerste poging gaat direct (geen pauze vóór een request die nog niet
+    # mislukt is); de wachttijd zit steeds ná de mislukte poging.
+    result: Optional[List[Tuple[datetime, float]]] = None
+    last_error: Optional[Exception] = None
+    for delay in (None, *RETRY_DELAYS):
+        if delay:
+            _time.sleep(delay)
+        try:
+            result = _fetch_day_once(api_key, day, in_domain, out_domain, expected_start_utc)
+            break
+        except _TransientDayError as exc:
+            last_error = exc
+    else:
+        if cache_path:
+            stale = _load_day_cache(cache_path, cache_ttl_seconds, allow_stale=True)
+            if stale is not None:
+                return stale
+        raise last_error  # type: ignore[misc]  # altijd gezet in de else-tak
+
+    if cache_path and result:
+        # alleen niet-lege dagen cachen (een "nog niet gepubliceerde" dag
+        # mag na de TTL gewoon opnieuw worden gevraagd)
+        _save_day_cache(cache_path, result)
+    return result
+
+
+def _fetch_day_once(
+    api_key: str,
+    day: date,
+    in_domain: str,
+    out_domain: str,
+    expected_start_utc: datetime,
+) -> List[Tuple[datetime, float]]:
+    """Eén HTTP-poging voor één dag: netwerkfouten en serverfouten worden
+    als `_TransientDayError` gemeld (→ opnieuw proberen), een echte
+    client-fout (401/403) meteen als `RuntimeError` (key/config-probleem)."""
     start_str = f"{day:%Y%m%d}0000"
     end_str = f"{day:%Y%m%d}2359"
     params = {
@@ -133,15 +202,28 @@ def _request_day(
     url = f"{API_URL}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={"Accept": "application/xml"})
     try:
-        with urllib.request.urlopen(req, timeout=40) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:  # noqa: S310
             xml_text = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
+        if _is_transient_http(exc.code):
+            raise _TransientDayError(
+                f"ENTSO-E HTTP-fout {exc.code} voor dag {day} (tijdelijk)"
+            ) from exc
         raise RuntimeError(
             f"ENTSO-E HTTP-fout {exc.code} voor dag {day} — "
             "geldige key? te veel requests? (zie https://transparency.entsoe.eu)"
         ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # read-timeout, DNS-flap, verbinding geweigerd: allemaal tijdelijk
+        raise _TransientDayError(f"ENTSO-E netwerkfout voor dag {day}: {exc}") from exc
 
-    root = ET.fromstring(xml_text)
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise _TransientDayError(
+            f"ENTSO-E gaf ongeldige XML terug voor dag {day}"
+        ) from exc
+
     if _local(root.tag) == _ACK_TAG:
         # geen data (of authenticatiefout) voor deze dag
         code = _find_text(root, "code")
@@ -176,10 +258,6 @@ def _request_day(
             price_eur_kwh = float(amount) * conversion
             slot_utc = start + timedelta(minutes=(int(position) - 1) * slot_min)
             result.append((slot_utc, price_eur_kwh))
-    if cache_path and result:
-        # alleen niet-lege dagen cachen (een "nog niet gepubliceerde" dag
-        # mag na de TTL gewoon opnieuw worden gevraagd)
-        _save_day_cache(cache_path, result)
     return result
 
 
@@ -211,6 +289,7 @@ def fetch_prices(
     now_local = datetime.now(local_tz).date()
     cache_dir = cache_dir or _default_cache_dir()
     slots: List[Tuple[datetime, float]] = []
+    warnings: List[str] = []
     for offset in range(days_ahead):
         day = now_local + timedelta(days=offset)
         expected_start_utc = datetime.combine(
@@ -226,17 +305,22 @@ def fetch_prices(
                 cache_dir=cache_dir,
                 cache_ttl_seconds=cache_ttl_seconds,
             )
-        except ET.ParseError as exc:
-            raise RuntimeError(f"ENTSO-E gaf ongeldige XML terug voor dag {day}") from exc
+        except RuntimeError as exc:
+            # Eén mislukte dag (CDN-storing, dag nog niet gepubliceerd, ...) mag
+            # de andere dagen niet blokkeren: één bruikbare dag is al genoeg om te
+            # plannen, en de ontbrekende dag komt bij de volgende wake weer mee.
+            warnings.append(f"{day}: {exc}")
+            continue
         slots.extend(day_slots)
 
     # sorteeren + dubbelen eruit, en omzetten naar lokale tijd
     slots = sorted(set(slots), key=lambda s: s[0])
     slots = [(dt.astimezone(local_tz), price) for dt, price in slots]
     if not slots:
+        detail = f" — {warnings[-1]}" if warnings else ""
         raise RuntimeError(
             "ENTSO-E leverde geen day-ahead prijzen voor het gevraagde venster "
-            "(nog niet gepubliceerd? verkeerde biedingszone?)"
+            "(nog niet gepubliceerd? verkeerde biedingszone?)" + detail
         )
 
     # granulariteit = meest voorkomende slotduur (een incidenteel ontbrekend
@@ -254,4 +338,8 @@ def fetch_prices(
             f"ENTSO-E day-ahead (web-api.tp.entsoe.eu, zone {in_domain}, "
             "EUR/MWh → EUR/kWh, excl. btw)"
         ),
+        # dagen die deze ronde niet opgehaald konden worden (CDN-storing,
+        # nog niet gepubliceerd); de watcher logt dit zodat het zichtbaar is
+        # dat er met een kortere horizon is gepland.
+        "warnings": warnings,
     }

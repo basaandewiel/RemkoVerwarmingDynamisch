@@ -91,13 +91,19 @@ def _priced_rows(start_dt: datetime, prices: list) -> list:
     return rows
 
 
-def _advice(rows_from: datetime, n: int = 24, horizon_end=None, price_rows=None) -> dict:
+def _advice(rows_from: datetime, n: int = 24, horizon_end=None, price_rows=None,
+            price_warnings=None) -> dict:
     """Canned build_advice-resultaat: SWW-advies met reeële rijen (zonder
     deze rijen kan _next_boost_block geen blok kiezen). `horizon_end` is het
     uiteinde van de prijsdata (ontbreekt de nieuwe dag, dan reikt die tot
-    vandaag). `price_rows` overschrijft de standaard constante-prijs-rijen."""
+    vandaag). `price_rows` overschrijft de standaard constante-prijs-rijen.
+    `price_warnings` simuleert dagen die de prijsbron niet kon ophalen."""
     return {
-        "prices": {"granularity_min": 15, "horizon_end": horizon_end},
+        "prices": {
+            "granularity_min": 15,
+            "horizon_end": horizon_end,
+            "warnings": price_warnings or [],
+        },
         "dhw": {
             "enabled": True,
             "rows": price_rows if price_rows is not None else _rows(rows_from, n),
@@ -123,6 +129,8 @@ class DhwBoostResetTest(unittest.TestCase):
         self._horizon_end = None
         # Optionele per-slot prijzen (anders constante prijs via _n_rows).
         self._prices = None
+        # Dagen die de prijsbron niet op kon halen (ENTSO-E-storing).
+        self._price_warnings = None
 
         def fake_advice(_cfg, _args, _now):
             if self._prices is not None:
@@ -131,8 +139,14 @@ class DhwBoostResetTest(unittest.TestCase):
                     n=len(self._prices),
                     horizon_end=self._horizon_end,
                     price_rows=_priced_rows(self._rows_from, self._prices),
+                    price_warnings=self._price_warnings,
                 )
-            return _advice(self._rows_from, self._n_rows, horizon_end=self._horizon_end)
+            return _advice(
+                self._rows_from,
+                self._n_rows,
+                horizon_end=self._horizon_end,
+                price_warnings=self._price_warnings,
+            )
 
         patchers.append(patch.object(dhw_boost.app, "build_advice", side_effect=fake_advice))
         self._patchers = patchers
@@ -412,6 +426,30 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertTrue(out["next_day_missing"])
         wake = dhw_boost.next_wake_time(out, now, TZ, "13:30")
         self.assertEqual(wake, datetime.fromisoformat("2026-09-26T14:16:00+02:00"))
+
+    def test_price_warnings_reported_but_plan_still_usable(self):
+        """Een dag die ENTSO-E niet wilde geven (599/timeout) blokkeert het
+        advies niet: er wordt gewoon gepland met de dagen die er wél zijn,
+        en de ontbrekende dag wordt zichtbaar gemeld."""
+        self._write_state({})
+        self._rows_from = datetime.fromisoformat("2026-09-26T06:00:00+02:00")
+        self._n_rows = 56  # data t/m 20:00
+        self._price_warnings = ["2026-09-27: ENTSO-E HTTP-fout 599 voor dag 2026-09-27 (tijdelijk)"]
+        now = datetime.fromisoformat("2026-09-26T06:00:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        # een blok is gevonden en het advies is dus bruikbaar, ondanks de fout
+        self.assertIn(out["status"], ("wait", "send"))
+        self.assertIn("block", out)
+        self.assertIn("price_warnings", out)
+        self.assertIn("599", out["price_warnings"][0])
+
+    def test_no_price_warnings_key_when_all_days_fetched(self):
+        """Geen enkel probleem -> geen (lege) prijswaarschuwing in de output."""
+        self._write_state({})
+        self._rows_from = datetime.fromisoformat("2026-09-26T06:00:00+02:00")
+        now = datetime.fromisoformat("2026-09-26T06:00:00+02:00")
+        out = dhw_boost.decide(CFG, now)
+        self.assertNotIn("price_warnings", out)
 
     def test_late_publication_recheck_uses_custom_interval(self):
         """Het hercontrole-interval is instelbaar (--price-recheck-min)."""

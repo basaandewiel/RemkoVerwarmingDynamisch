@@ -207,6 +207,12 @@ def decide(cfg: dict, now: datetime) -> dict:
     # de nieuwe dag (nog) niet bekend. next_wake_time plant dan een extra
     # hercontrole, zodat een late publicatie binnen het uur verwerkt wordt.
     prices = advice.get("prices") or {}
+    # Dagen die de prijsbron deze ronde niet opgehaald kreeg (ENTSO-E-CDN
+    # flak, of een dag die nog niet gepubliceerd is). Het advies is
+    # bruikbaar, maar met een kortere horizon — zichtbaar maken.
+    price_warnings = prices.get("warnings") or []
+    if price_warnings:
+        out["price_warnings"] = list(price_warnings)
     horizon_end = prices.get("horizon_end")
     if isinstance(horizon_end, str):
         horizon_end = datetime.fromisoformat(horizon_end)
@@ -656,11 +662,21 @@ def watch(
     """
     _log("SWW-boost watchdog gestart — herberekent alleen bij blokstart of",
          f"dagelijkse prijs-update {refresh_hhmm} (fallback elke {retry_interval/60:.0f} min)")
+    seen_price_warnings: Optional[list] = None
     while True:
         try:
             now = datetime.now(tz)
             out = decide(cfg, now)
             status = out["status"]
+
+            # Dagen die deze ronde niet opgehaald konden worden (ENTSO-E-CDN
+            # flak of een dag die nog niet gepubliceerd is): het advies is
+            # bruikbaar, maar met een kortere horizon. Eén keer per wake
+            # melden, niet hinderlijk herhalen.
+            warnings = out.get("price_warnings")
+            if warnings and warnings != seen_price_warnings:
+                _log("LET OP: prijzen ontbreken voor", "; ".join(warnings))
+                seen_price_warnings = list(warnings)
 
             if status == "send":
                 _log("blokstart bereikt — verstuur het boost-commando")

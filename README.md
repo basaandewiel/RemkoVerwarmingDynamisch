@@ -59,7 +59,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `prices.days_ahead` | Hoeveel dagen vooruit plannen (day-ahead prijzen zijn meestal ~48 u bekend, default 3). Dag +1 +2 zijn pas net gepubliceerd als je tweede SWW-boost ná middernacht valt — met 2 kan het tweede blok zomaar op de laatste uren van de horizon klem komen te zitten (bijv. 21:00-00:00), terwijl de goedkopere vroege ochtend van de dag erop onzichtbaar blijft. |
 | `prices.entsoe.api_key` | **Jouw persoonlijke ENTSO-E API-key** (gratis account op https://transparency.entsoe.eu → My Account → API). |
 | `prices.entsoe.in_domain` / `out_domain` | Biedingszone; NL = `10YNL----------L`. |
-| `prices.entsoe.cache_ttl_seconds` | Houdt de opgehaalde day-ahead prijzen per dag op schijf (default 3600 s). Prijzen veranderen hooguit 1×/dag, dus een watcher hoeft niet bij elke wake de API te bevragen — scheelt aanzienlijk op een trage/overbelaste DNS-server. |
+| `prices.entsoe.cache_ttl_seconds` | Houdt de opgehaalde day-ahead prijzen per dag op schijf (default 3600 s). Prijzen veranderen hooguit 1×/dag, dus een watcher hoeft niet bij elke wake de API te bevragen — scheelt aanzienlijk op een trage/overbelaste DNS-server. Bij een API-storing wordt deze cache (ook als hij ouder is dan de TTL) als terugvaloptie gebruikt. |
 | `prices.energyzero.*` | Alleen gebruikt als `source` = `energyzero` (gratis, zonder key, maar uurprijzen). |
 | `prices.price_adjustments.vat_pct` | Btw-percentage op de groothandelsprijs (bv. `21`). Constante factor, verandert de blokkeuze niet. |
 | `prices.price_adjustments.fixed_tax_per_kwh` | Vaste belasting per kWh (bv. energiebelasting €/kWh). **Verandert de blokkeuze wel** (want `(prijs + belasting)/COP`). Standaard 0,12 €/kWh in de config. |
@@ -277,6 +277,28 @@ en koos het script het volgende. Los het op door de nieuwste versie te
 draaien (fix: wake-ahead + wachten in stapjes) **en** `prices.entsoe.cache_ttl_seconds`
 in de config (of `rm -f ~/.cache/remko-wkf70/entsoe_*.json` om een oude
 test-cache te wissen).
+
+> **Krijg je `ENTSO-E HTTP-fout 599/527` of `The read operation timed out` in
+> het log?** Bijna altijd een storing of een overbelaste CDN tussen jou en de
+> Transparency Platform — **niet** je API-key (die zou `401/403` geven). De
+> watcher logt `FOUT (ga verder)` en probeert het gewoon opnieuw; de boost zelf
+> gaat daarna gewoon door (zoals in het log: fouten om 04:15, gewoon een plan
+> om 04:24). Wat het script nu doet om hier minder last van te hebben:
+> 1. **4 pogingen per dag** met korte tussenpauzes (5/15/30 s) in plaats van
+>    meteen opgeven;
+> 2. **terugval op de laatst bekende prijzen**: is de API onbereikbaar en ligt
+>    er een cachekopie van die dag op schijf, dan wordt die gebruikt in plaats
+>    van niets — dag-ahead prijzen veranderen hooguit één keer per dag, dus dat
+>    is prima bruikbaar;
+> 3. **één dag die mislukt blokkeert de rest niet**: als vandaag binnenkomt maar
+>    morgen niet, wordt er gewoon gepland met wat er is (het log toont dan één
+>    regel `LET OP: prijzen ontbreken voor ...`) en bij de volgende wake komt de
+>    ontbrekende dag alsnog mee.
+>
+> Blijft het storingsgedrag aanhouden, dan is de watcher waarschijnlijk de
+> oorzaak: het pollt 3 dagen vooruit en start telkens opnieuw na een fout. Laat
+> hem dan een paar uur met rust of verhoog `prices.entsoe.cache_ttl_seconds`
+> (bijv. 7200).
 
 > **Zie je het bericht niet in MQTT Explorer?** Boost/reset worden met
 > **QoS 1** verzonden en het script wacht op de broker-bevestiging (PUBACK):
