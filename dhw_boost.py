@@ -314,6 +314,52 @@ def _record_boost(state: dict, start: datetime) -> None:
     state["daily_boosts"] = {d: daily[d] for d in recent}
 
 
+def next_deadline(t: datetime, hhmm: str) -> datetime:
+    """Het eerstvolgende moment waarop lokale tijd `hhmm` bereikt wordt,
+    streng ná `t`. Wordt gebruikt als start-grens voor het laatste
+    boost-blok: dat hoort in de eerstvolgende nacht te liggen."""
+    hour, minute = (int(x) for x in hhmm.split(":"))
+    candidate = t.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return candidate if candidate > t else candidate + timedelta(days=1)
+
+
+def find_boost_block(
+    rows: list,
+    granularity_min: int,
+    block_hours: int,
+    now: datetime,
+    earliest_start: datetime,
+    end_window: Optional[tuple] = None,
+    start_before: Optional[datetime] = None,
+):
+    """Het goedkoopste boost-blok, met terugval op `start_before`.
+
+    Als de start-grens geen enkele kandidaat oplevert (bijv. als `earliest_start`
+    kort vóór het ochtend-venstereinde ligt, waardoor geen enkel blok meer
+    én vóór de grens start én in het venster eindigt), dan wordt eerst één
+    nacht verder geprobeerd en valt de grens uiteindelijk helemaal weg: liever
+    een iets te laat blok dan helemaal geen boost.
+    """
+    attempts = [start_before]
+    if start_before is not None:
+        attempts += [start_before + timedelta(days=1), None]
+    for before in attempts:
+        blocks = find_cheapest_blocks(
+            rows,
+            granularity_min=granularity_min,
+            block_hours=block_hours,
+            only_future=True,
+            top_n=1,
+            now=now,
+            earliest_start=earliest_start,
+            end_window=end_window,
+            start_before=before,
+        )
+        if blocks:
+            return blocks[0]
+    return None
+
+
 def _next_boost_block(
     advice: dict, boost_cfg: dict, state: dict, now: datetime
 ):
@@ -329,8 +375,14 @@ def _next_boost_block(
     daglimiet op `boosts_per_day` brengt), dan moet het bovendien eindigen
     tussen `last_block_end_from` en `last_block_end_to` (default 19:00 en
     08:00 de volgende ochtend): de laatste opwarmperiode eindigt dan nooit
-    midden op de dag (zoals toen de tweede boost met het goedkoopste-blok-
-    advies naar de volgende middag doorschoof).
+    midden op de dag.
+
+    Elke boost start bovendien vóór het ochtend-`last_block_end_to` (ook het
+    vrij gekozen eerste blok). Zonder die grens glijdt het blok door naar het
+    goedkoopste uur van de hele horizon zodra de prijzen van een nieuwe dag
+    verschijnen — en dat gebeurt juist ook vlak vóór de blokstart: als de
+    vorige boost net uit het 24-uursvenster is gevallen (recent=0, dus geen
+    eind-venster meer) en de LEAD-wake opnieuw optimaliseert.
     """
     gap_hours = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
     boosts_per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
@@ -355,24 +407,27 @@ def _next_boost_block(
         recent = _count_boosts_last_24h(state, now)
         is_last = (recent + 1) == boosts_per_day
 
+    end_to = boost_cfg.get("last_block_end_to", LAST_BLOCK_END_TO)
     end_window = None
     if is_last:
-        end_window = (
-            boost_cfg.get("last_block_end_from", LAST_BLOCK_END_FROM),
-            boost_cfg.get("last_block_end_to", LAST_BLOCK_END_TO),
-        )
+        end_window = (boost_cfg.get("last_block_end_from", LAST_BLOCK_END_FROM), end_to)
+    # De start-grens geldt voor ÉLK boost-blok, ook het 'vrije' eerste: het
+    # mag nooit later starten dan het ochtend-`last_block_end_to`. Want zodra
+    # de vorige boost uit het 24-uursvenster is gevallen (recent=0) verdwijnt
+    # het eind-venster — en dat gebeurt juist vlak voor de blokstart, als de
+    # LEAD-wake opnieuw optimaliseert. Zonder deze grens schuift het blok dan
+    # alsnog door naar het goedkoopste uur van de hele horizon.
+    start_before = next_deadline(earliest_start, end_to)
 
-    blocks = find_cheapest_blocks(
+    return find_boost_block(
         rows,
-        granularity_min=granularity_min,
-        block_hours=block_hours,
-        only_future=True,
-        top_n=1,
-        now=now,
-        earliest_start=earliest_start,
+        granularity_min,
+        block_hours,
+        now,
+        earliest_start,
         end_window=end_window,
+        start_before=start_before,
     )
-    return blocks[0] if blocks else None
 
 
 def _boost_pending_actions(state: dict, start: datetime, boosts_per_day: int) -> str:

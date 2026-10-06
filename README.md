@@ -71,7 +71,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.dhw_boost.boosts_per_day` | Maximaal aantal boosts per **rollend 24-uursvenster** (default 2). Géén kalenderdag-grens: de tweede boost mag gewoon op een andere dag vallen, mits er altijd ~2 opwarmmomenten binnen 24 uur plaatsvinden. |
 | `mqtt.dhw_boost.min_gap_hours` | Minimum uren tussen het **einde van de vorige boost** en de **start van de volgende** (default 4). Zorgt dat een tweede opwarmperiode niet vlak na de eerste ligt. |
 | `mqtt.dhw_boost.block_hours` | Lengte van één SWW-boost-blok (default **1**, los van `optimization.block_hours` voor de ruimteverwarming). Een korte boost volstaat voor SWW: het water hoeft niet 3 uur na te verwarmen, en blokken passen zo makkelijker in het goedkope avond/nacht-venster. |
-| `mqtt.dhw_boost.last_block_end_from` / `last_block_end_to` | Het **laatste** boost-blok van het 24-uursvenster eindigt tussen deze tijden (default `"19:00"` en `"08:00"`, de volgende ochtend). Zonder deze eis glijdt de laatste opwarmperiode met het goedkoopste-blok-advies naar de volgende middag en is de boiler overdag 'leeg' in plaats van 's avonds/nachts vol. |
+| `mqtt.dhw_boost.last_block_end_from` / `last_block_end_to` | Het **laatste** boost-blok van het 24-uursvenster eindigt tussen deze tijden (default `"19:00"` en `"08:00"`, de volgende ochtend). Zonder deze eis glijdt de laatste opwarmperiode met het goedkoopste-blok-advies naar de volgende middag en is de boiler overdag 'leeg' in plaats van 's avonds/nachts vol. Daarnaast **start élk** boost-blok vóór `last_block_end_to`: het blok hoort in de eerstvolgende nacht te liggen en schuift niet door naar een goedkopere dag verderop. |
 | `mqtt.dhw_boost.qos` | QoS-niveau voor de boost/reset-commando's (default `1`). Met QoS 1 moet de broker de ontvangst bevestigen (PUBACK) **voordat** `VERSTUURD` wordt getoond; bij QoS 0 is er geen garantie. |
 | `mqtt.dhw_boost.retain` | Retain-flag op het commando (default `false`). Zet op `true` als je het laatste commando in MQTT Explorer zichtbaar wilt houden (elke nieuwe boost/reset overschrijft dan de vorige). |
 | `mqtt.dhw_boost.payload` | Wordt **afgeleid**: boost-setting = `heatpump.dhw.temperature` × 10 als hex, reset = `mqtt.dhw_boost.default_temperature` × 10 als hex (53 °C → `"0212"`, 40 °C → `"0190"`), in het formaat dat de gateway accepteert incl. `FORCE_RESPONSE`. Niet handmatig instellen. |
@@ -179,6 +179,16 @@ toen het water maar 1× per dag leek op te warmen). Zit het venster vol, dan
 wacht de watcher tot het oudste blok er weer uit valt; een derde boost kan
 dus nooit binnen 24 uur na de eerste twee starten. Wordt een boost gemist,
 dan mag de eerstvolgende alsnog gaan.
+
+De prijzen zijn pas een dag vooruit bekend, dus het goedkoopste blok van
+morgen kan goedkoper zijn dan dat van vanavond. Zonder meer zou de planner
+dan wachten — met tientallen uren koud water als gevolg (gemeten: 36 u tussen
+twee boosts, terwijl de besparing €0,08 per opwarming was). Daarom **start
+élk boost-blok vóór het ochtend-`last_block_end_to`** (default 08:00): het
+optimum kijkt dan maximaal tot de eerstvolgende nacht. Past er binnen die
+grens geen blok (bijv. doordat het pas ná 07:00 mag starten), dan wordt één
+nacht verder gekeken en valt de grens uiteindelijk weg — liever een iets te
+laat blok dan helemaal geen boost.
 
 **Aanbevolen: `--watch`** — een continu draaiend proces dat vrijwel exact op
 de blokstart verstuurt. Het wordt alleen wakker als er iets kan veranderen
@@ -344,8 +354,9 @@ beste 3-uursblok voor het opwarmen tot 53 °C (op basis van de SWW-COP)
 én de **geplande SWW-boosts**: de `boosts_per_day` opwarmmomenten die
 `dhw_boost` gaat uitsturen, telkens min. `min_gap_hours` uur na het
 einde van de vorige, en met het laatste blok dat eindigt tussen
-`last_block_end_from` en `last_block_end_to` (dus écht gespreid, over een
-rollend 24-uursvenster).
+`last_block_end_from` en `last_block_end_to` terwijl élk blok start vóór
+`last_block_end_to` (dus écht gespreid, over een rollend 24-uursvenster, en
+nooit doorgeschoven naar een goedkopere dag verderop).
 
 Met MQTT ingeschakeld wordt gepubliceerd (paylod = JSON):
 

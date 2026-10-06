@@ -59,6 +59,7 @@ def find_cheapest_blocks(
     now: Optional[datetime] = None,
     earliest_start: Optional[datetime] = None,
     end_window: Optional[Tuple[str, str]] = None,
+    start_before: Optional[datetime] = None,
 ) -> List[Dict]:
     """Zoek de goedkoopste aaneengesloten blokken van `block_hours` uur.
 
@@ -73,6 +74,14 @@ def find_cheapest_blocks(
     middernacht heen). Bedoeld voor het LAATSTE boost-blok van het
     24-uursvenster, zodat de laatste (nachtelijke) opwarmperiode nooit
     midden op de dag eindigt maar de boiler 's avonds/nachts vol is.
+
+    `start_before` (optioneel): geen blok mag ná dit tijdstip starten. Zonder
+    zo'n grens kijkt het optimum over de héle horizon (nu + dagen) en glijdt
+    het blok door naar het goedkoopste uur zodra de prijzen van een nieuwe dag
+    verschijnen — met tot gevolg dat er tientallen uren niet opgewarmd wordt.
+    Bedoeld voor elk boost-blok: dat hoort in de eerstvolgende nacht te liggen,
+    dus vóór het ochtend-`last_block_end_to`. Een blok dat precies op
+    `start_before` begint telt nog wél mee.
     """
     if len(rows) < 2:
         return []
@@ -91,6 +100,11 @@ def find_cheapest_blocks(
     if end_window is not None:
         end_from_t = time(*[int(x) for x in end_window[0].split(":")])
         end_to_t = time(*[int(x) for x in end_window[1].split(":")])
+    # start_before: het blok mag pas tot dit tijdstip beginnen (blokken die
+    # er ná beginnen doen niet mee).
+    start_before_utc = None
+    if start_before is not None:
+        start_before_utc = start_before.astimezone(timezone.utc)
 
     n_slots = max(1, round(block_hours * 60 / granularity_min))
     slot_delta = timedelta(minutes=granularity_min)
@@ -108,6 +122,8 @@ def find_cheapest_blocks(
         if window[0]["dt_utc"] < now_utc:
             continue
         if earliest_utc is not None and window[0]["dt_utc"] < earliest_utc:
+            continue
+        if start_before_utc is not None and window[0]["dt_utc"] > start_before_utc:
             continue
         if end_from_t is not None:
             end_dt = window[-1]["dt_local"] + slot_delta

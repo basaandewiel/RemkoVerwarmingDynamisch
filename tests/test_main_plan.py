@@ -135,6 +135,37 @@ class MainDhwPlanTest(unittest.TestCase):
             datetime.fromisoformat("2026-10-01T08:00:00+02:00"),
         )
 
+    def test_plan_last_block_starts_before_next_morning(self):
+        """Het laatste geplande blok start bovendien vóór het ochtend-venster-
+        einde (08:00): het hoort in de eerstvolgende nacht te liggen. Zonder
+        die grens schuift het blok door naar het goedkoopste venster-blok van
+        de volgende avond — ruim ná 08:00 — en blijft de boiler dus een dag
+        langer koud (praktijkgeval: 36 uur tussen twee boosts)."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}  # defaults: 2 / 4.0 / 1 u / 19:00-08:00
+        # 06:00-09:00 goedkoop -> blok 1 (vrij gekozen); daarna duur tot
+        # 10-01 17:00; 10-01 17:00-21:00 goedkoop, met daarin het
+        # venster-blok 18:00-19:00 — dat ligt ná de start-grens van vandaag.
+        prices = (
+            [0.05] * 12    # 09-30 06:00-09:00
+            + [0.30] * 128  # 09:00 - 10-01 17:00
+            + [0.05] * 16   # 10-01 17:00-21:00
+            + [0.30] * 8    # 10-01 21:00-23:00
+        )
+        plan, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, self._priced_rows(now, prices)
+        )
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(
+            plan[1]["start"],
+            datetime.fromisoformat("2026-09-30T18:00:00+02:00"),
+            "laatste blok blijft in de eerstvolgende nacht i.p.v. morgenavond",
+        )
+        self.assertLess(
+            plan[1]["start"],
+            datetime.fromisoformat("2026-10-01T08:00:00+02:00"),
+        )
+
     def test_plan_stops_when_horizon_exhausted(self):
         """Raken de prijsdata op, dan stopt het plan netjes i.p.v. te crashen."""
         now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")

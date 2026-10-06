@@ -99,8 +99,10 @@ def _dhw_boost_plan(
     `min_gap_hours` uur ná het einde van het vorige (zodat de opwarmmomenten
     gespreid staan en niet 'slim' vlak achter elkaar hetzelfde goedkope moment
     kiezen). Het LAATSTE blok eindigt bovendien tussen `last_block_end_from`
-    en `last_block_end_to` (default 19:00–08:00 de volgende ochtend): de
-    laatste opwarmperiode van de dag eindigt dan nooit midden op de dag.
+    en `last_block_end_to` (default 19:00–08:00 de volgende ochtend), en élk
+    blok start vóór `last_block_end_to`: het hoort dus in de eerstvolgende
+    nacht te liggen, zodat de laatste opwarmperiode nooit midden op de dag
+    eindigt en een blok niet doorschuift naar een goedkopere dag verderop.
 
     Geeft (plan, boosts_per_day, min_gap_hours, last_block_end_from,
     last_block_end_to): plan is de lijst gekozen blokken in oplopende
@@ -114,6 +116,8 @@ def _dhw_boost_plan(
         DEFAULT_BOOST_BLOCK_HOURS,
         LAST_BLOCK_END_FROM,
         LAST_BLOCK_END_TO,
+        find_boost_block,
+        next_deadline,
     )
 
     per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
@@ -134,20 +138,22 @@ def _dhw_boost_plan(
         # Alleen het laatste geplande blok (en dus alleen bij meerdere blokken)
         # moet binnen het avond/nacht-venster eindigen; de eerdere blokken en
         # het enkele blok bij boosts_per_day=1 zijn vrij (goedkoopste moment).
+        # De start-grens geldt wél voor elk blok: niets start later dan de
+        # eerstvolgende ochtend, zodat ook een uitgesteld blok niet doorschuift
+        # naar een goedkopere dag verderop.
         end_window = (end_from, end_to) if per_day >= 2 and i == last_index else None
-        blocks = find_cheapest_blocks(
+        start_before = next_deadline(earliest, end_to)
+        block = find_boost_block(
             dhw_rows,
-            granularity_min=granularity_min,
-            block_hours=block_hours,
-            only_future=True,
-            top_n=1,
-            now=now,
-            earliest_start=earliest,
+            granularity_min,
+            block_hours,
+            now,
+            earliest,
             end_window=end_window,
+            start_before=start_before,
         )
-        if not blocks:
+        if not block:
             break
-        block = blocks[0]
         if horizon_end is not None:
             block = dict(block, horizon_bound=block["end"] >= horizon_end)
         plan.append(block)
