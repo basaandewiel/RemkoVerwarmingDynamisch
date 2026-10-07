@@ -70,7 +70,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
@@ -90,6 +90,13 @@ LAST_BLOCK_END_TO = "08:00"     # eindigt tussen 19:00 's avonds en 08:00 's och
                                 # (de boiler is dan 's avonds/nachts opgewarmd in
                                 # plaats van dat de 2e opwarmperiode overdag
                                 # eindigt — mqtt.dhw_boost.last_block_end_from/to)
+AFTERNOON_FROM = "12:00"        # verplicht dagblok: één van de boosts per dag
+AFTERNOON_TO = "23:00"          # start binnen dit venster (mqtt.dhw_boost.
+                                # afternoon_from/to). Warm water als het buiten
+                                # warm is (weinig verlies), vaak de laagste
+                                # dagprijzen door zonneschijn, en een avondblok
+                                # vangt ook de winddip op. Het eind-venster en de
+                                # ochtend-start-grens gelden dáár niet.
 ROLLING_WINDOW_HOURS = 24.0    # de boostlimiet telt per rollend 24-uursvenster
 
 
@@ -230,6 +237,8 @@ def decide(cfg: dict, now: datetime) -> dict:
         "last_block_end_from", LAST_BLOCK_END_FROM
     )
     out["last_block_end_to"] = boost_cfg.get("last_block_end_to", LAST_BLOCK_END_TO)
+    out["afternoon_from"] = boost_cfg.get("afternoon_from", AFTERNOON_FROM)
+    out["afternoon_to"] = boost_cfg.get("afternoon_to", AFTERNOON_TO)
     out["boosts_recent"] = _count_boosts_last_24h(state, now)
 
     # 24-uurslimiet bereikt (rollend venster, geen kalenderdag)? Dan geen
@@ -253,6 +262,8 @@ def decide(cfg: dict, now: datetime) -> dict:
         "end": best["end"].isoformat(),
         "mean_cop": best["mean_cop"],
         "mean_corrected_eur_per_kwh_heat": best["mean_corrected"],
+        # True als dit het verplichte dagblok (afternoon_from–afternoon_to) is
+        "dagblok": bool(best.get("dagblok")),
     }
     start, end = best["start"], best["end"]
 
@@ -314,13 +325,64 @@ def _record_boost(state: dict, start: datetime) -> None:
     state["daily_boosts"] = {d: daily[d] for d in recent}
 
 
+def _hhmm_minuten(hhmm: str) -> int:
+    """'12:45' -> 765 minuten na middernacht (lokaal)."""
+    hour, minute = (int(x) for x in str(hhmm).split(":"))
+    return hour * 60 + minute
+
+
 def next_deadline(t: datetime, hhmm: str) -> datetime:
     """Het eerstvolgende moment waarop lokale tijd `hhmm` bereikt wordt,
     streng ná `t`. Wordt gebruikt als start-grens voor het laatste
     boost-blok: dat hoort in de eerstvolgende nacht te liggen."""
-    hour, minute = (int(x) for x in hhmm.split(":"))
-    candidate = t.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    minuten = _hhmm_minuten(hhmm)
+    candidate = t.replace(
+        hour=minuten // 60, minute=minuten % 60, second=0, microsecond=0
+    )
     return candidate if candidate > t else candidate + timedelta(days=1)
+
+
+def _dagvenster(anker: datetime, van_hhmm: str, tot_hhmm: str):
+    """Het venster [van, tot] op de kalenderdag van `anker`, in de tijdzone
+    van `anker`. Geeft (None, None) als er zo'n venster niet bestaat
+    (van > tot, of geen geldige HH:MM-waarde)."""
+    try:
+        van_min = _hhmm_minuten(van_hhmm)
+        tot_min = _hhmm_minuten(tot_hhmm)
+    except (TypeError, ValueError):
+        return None, None
+    if van_min > tot_min:
+        return None, None
+    tz = anker.tzinfo
+    van = datetime.combine(anker.date(), dtime(van_min // 60, van_min % 60), tzinfo=tz)
+    tot = datetime.combine(anker.date(), dtime(tot_min // 60, tot_min % 60), tzinfo=tz)
+    return van, tot
+
+
+def _dagboost_in_venster(
+    state: dict, now: datetime, van_hhmm: str, tot_hhmm: str
+) -> bool:
+    """Zit er binnen het rollende 24-uursvenster al een boost die binnen het
+    dagvenster [van, tot] (beide grenzen inbegrepen) startte? Dan is het
+    verplichte dagblok van deze cyclus al gedekt en wordt er niet opnieuw
+    één gepland. Bij een onbruikbaar venster: altijd 'gedekt' (nooit forceren)."""
+    try:
+        van_min = _hhmm_minuten(van_hhmm)
+        tot_min = _hhmm_minuten(tot_hhmm)
+    except (TypeError, ValueError):
+        return True
+    cutoff = now - timedelta(hours=ROLLING_WINDOW_HOURS)
+    for s in _boost_starts(state):
+        if s < cutoff:
+            continue
+        minuten = s.hour * 60 + s.minute
+        if van_min <= tot_min:
+            in_venster = van_min <= minuten <= tot_min
+        else:  # rond middernacht, bijv. 22:00-02:00
+            in_venster = minuten >= van_min or minuten <= tot_min
+        if in_venster:
+            return True
+    return False
 
 
 def find_boost_block(
@@ -377,6 +439,13 @@ def _next_boost_block(
     08:00 de volgende ochtend): de laatste opwarmperiode eindigt dan nooit
     midden op de dag.
 
+    Tenzij dit het verplichte DAGBLOK is: zit er al een boost in het
+    24-uursvenster maar géén daarvan binnen `afternoon_from`–`afternoon_to`
+    (default 12:00–23:00), dan wordt juist dáár gepland — één van de twee
+    opwarmmomenten per dag hoort in de middag/avond. Het eind-venster en de
+    start-grens hieronder gelden daar niet (dat venster begrenst het blok
+    immers al tot dezelfde dag).
+
     Elke boost start bovendien vóór het ochtend-`last_block_end_to` (ook het
     vrij gekozen eerste blok). Zonder die grens glijdt het blok door naar het
     goedkoopste uur van de hele horizon zodra de prijzen van een nieuwe dag
@@ -392,6 +461,8 @@ def _next_boost_block(
     # SWW-boosts hebben hun eigen bloklengte (default 1 u); het langere blok
     # voor de ruimteverwarming is optimization.block_hours (default 3).
     block_hours = int(boost_cfg.get("block_hours", DEFAULT_BOOST_BLOCK_HOURS))
+    afternoon_from = boost_cfg.get("afternoon_from", AFTERNOON_FROM)
+    afternoon_to = boost_cfg.get("afternoon_to", AFTERNOON_TO)
 
     earliest_start = now
     last_end = state.get("last_sent_end")
@@ -402,9 +473,9 @@ def _next_boost_block(
 
     # Laatste blok van het venster? (per_day=1 heeft geen 'eerste+laatste'
     # onderscheid -> dan blijft het enkele blok vrij.)
+    recent = _count_boosts_last_24h(state, now)
     is_last = False
     if boosts_per_day >= 2:
-        recent = _count_boosts_last_24h(state, now)
         is_last = (recent + 1) == boosts_per_day
 
     end_to = boost_cfg.get("last_block_end_to", LAST_BLOCK_END_TO)
@@ -419,7 +490,39 @@ def _next_boost_block(
     # alsnog door naar het goedkoopste uur van de hele horizon.
     start_before = next_deadline(earliest_start, end_to)
 
-    return find_boost_block(
+    # Verplicht dagblok (afternoon_from–afternoon_to, default 12:00–23:00):
+    # er zit wél al een boost in het venster, maar géén binnen dat dagvenster.
+    # Dan wordt dit blok dáár gepland — pas ná een eerste boost, zodat het
+    # allereerste blok van een cyclus (en boosts_per_day=1) vrij blijft, en
+    # alleen als het venster op de dag van `earliest_start` nog past (aan het
+    # eind van de avond schuift de verplichting gewoon door naar morgen).
+    # Geen eind-venster en géén ochtend-start-grens: het dagvenster is zelf
+    # al de grens (het loopt immers nooit verder dan dezelfde dag).
+    if (
+        boosts_per_day >= 2
+        and recent >= 1
+        and not _dagboost_in_venster(state, now, afternoon_from, afternoon_to)
+    ):
+        van, tot = _dagvenster(earliest_start, afternoon_from, afternoon_to)
+        if van is not None:
+            dag_start = max(earliest_start, van)
+            if dag_start <= tot:
+                blocks = find_cheapest_blocks(
+                    rows,
+                    granularity_min=granularity_min,
+                    block_hours=block_hours,
+                    only_future=True,
+                    top_n=1,
+                    now=now,
+                    earliest_start=dag_start,
+                    start_before=tot,
+                )
+                if blocks:
+                    blocks[0]["dagblok"] = True
+                    return blocks[0]
+                # geen data tot in het venster -> gewoon de gewone weg
+
+    best = find_boost_block(
         rows,
         granularity_min,
         block_hours,
@@ -428,6 +531,9 @@ def _next_boost_block(
         end_window=end_window,
         start_before=start_before,
     )
+    if best:
+        best["dagblok"] = bool(best.get("dagblok"))
+    return best
 
 
 def _boost_pending_actions(state: dict, start: datetime, boosts_per_day: int) -> str:
@@ -804,7 +910,9 @@ def render_human(out: dict) -> List[str]:
         lines.append(
             f"Plan    : {out['boosts_per_day']}x per 24 u, min. {out['min_gap_hours']:g} u "
             f"tussen de blokken; laatste blok eindigt "
-            f"{out['last_block_end_from']}–{out['last_block_end_to']} — "
+            f"{out['last_block_end_from']}–{out['last_block_end_to']}; dagvenster "
+            f"{out.get('afternoon_from', AFTERNOON_FROM)}–"
+            f"{out.get('afternoon_to', AFTERNOON_TO)} — "
             f"{out.get('boosts_recent', 0)}/{out['boosts_per_day']} "
             "in de afgelopen 24 u"
         )
@@ -812,14 +920,16 @@ def render_human(out: dict) -> List[str]:
         b = out["block"]
         start_txt = app.fmt_dt(datetime.fromisoformat(b["start"]))
         end_txt = app.fmt_dt(datetime.fromisoformat(b["end"]))
+        dag_txt = " [dagvenster]" if b.get("dagblok") else ""
         if b.get("mean_cop") is not None and b.get("mean_corrected_eur_per_kwh_heat") is not None:
             lines.append(
                 f"Beste SWW-blok : {start_txt} – {end_txt} "
                 f"(COP {app.nl(b['mean_cop'], 2)}, "
                 f"{app.nl(b['mean_corrected_eur_per_kwh_heat'], 4)} €/kWh warmte)"
+                f"{dag_txt}"
             )
         else:
-            lines.append(f"Beste SWW-blok : {start_txt} – {end_txt}")
+            lines.append(f"Beste SWW-blok : {start_txt} – {end_txt}{dag_txt}")
 
     status = out["status"]
     dry = out.get("mqtt_detail", "").startswith("dry-run")

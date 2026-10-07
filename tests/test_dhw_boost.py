@@ -4,7 +4,9 @@ exact op het blokeinde (en anders bij de eerstvolgende wake ná het einde)
 worden verstuurd, en de watcher mag hooguit `boosts_per_day` boosts binnen
 een rollend 24-uursvenster sturen — gespreid (nooit vlak na elkaar), zonder
 kalenderdaggrens, en met het LAATSTE blok van het venster dat eindigt tussen
-19:00 en 08:00 (de volgende ochtend, instelbaar).
+19:00 en 08:00 (de volgende ochtend, instelbaar). Zodra er al een boost in
+het venster zit maar géén daarvan in het dagvenster afternoon_from–afternoon_to
+(default 12:00–23:00), wordt díe boost het verplichte dagvenster-blok.
 
 Draaien:  python3 -m unittest discover -s tests -v
 """
@@ -265,9 +267,11 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertEqual(wake, datetime.fromisoformat("2026-09-26T02:00:02+02:00"))
 
     def test_second_boost_allowed_but_spaced(self):
-        """Eén boost vanmorgen (02:00-05:00) -> een tweede is toegestaan, maar
-        moet pas ná min_gap_hours (4 u) ná het einde beginnen én — als laatste
-        blok van het venster — eindigen tussen 19:00 en 08:00 (18:00-19:00)."""
+        """Eén boost vanmorgen (02:00-05:00, buiten het dagvenster) -> een
+        tweede is toegestaan, maar wordt het verplichte dagblok: het
+        goedkoopste blok binnen afternoon_from–afternoon_to (12:00–23:00).
+        Hier met constante prijzen: 12:00-13:00 (de gap 09:00 is ruim
+        gepasseerd)."""
         self._write_state(GAP_STATE)
         self._rows_from = datetime.fromisoformat("2026-09-26T08:00:00+02:00")
         self._n_rows = 48  # data t/m 20:00: einde ≥ 19:00 kan gekozen worden
@@ -277,15 +281,16 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertEqual(out["boosts_recent"], 1)
         self.assertEqual(
             out["block"]["start"],
-            datetime.fromisoformat("2026-09-26T18:00:00+02:00").isoformat(),
-            "2e boost niet vóór 09:00 (gap) en niet eindigend vóór 19:00 (venster)",
+            datetime.fromisoformat("2026-09-26T12:00:00+02:00").isoformat(),
+            "2e boost = verplicht dagblok in 12:00-23:00, niet later in de avond",
         )
+        self.assertTrue(out["block"]["dagblok"], "blok moet als dagvenster-blok gemarkeerd zijn")
 
     def test_no_gap_needed_after_gap_elapsed(self):
         """Lag de vorige boost lang genoeg terug (≥ min_gap_hours), dan mag de
         volgende gewoon het goedkoopste blok vanaf nu zijn (geen kunstmatige
-        verdere spreiding) — mits het als laatste blok tussen 19:00 en 08:00
-        eindigt (hier: 18:00-19:00)."""
+        verdere spreiding) — hier als verplicht dagblok binnen 12:00-23:00
+        (17:00-18:00), niet doorgeschoven naar de avond/nacht."""
         state = dict(GAP_STATE)
         state["last_sent_start"] = "2026-09-26T09:00:00+02:00"
         state["last_sent_end"] = "2026-09-26T12:00:00+02:00"
@@ -298,9 +303,10 @@ class DhwBoostResetTest(unittest.TestCase):
         self.assertEqual(out["status"], "wait")
         self.assertEqual(
             out["block"]["start"],
-            datetime.fromisoformat("2026-09-26T18:00:00+02:00").isoformat(),
-            "niet verder doorgeschoven: end+gap (16:00) lag al achter ons",
+            datetime.fromisoformat("2026-09-26T17:00:00+02:00").isoformat(),
+            "dagblok: eerste mogelijke blok in 12:00-23:00 (end+gap was al gepasseerd)",
         )
+        self.assertTrue(out["block"]["dagblok"])
 
     def test_last_boost_ends_in_evening_window(self):
         """Het LAATSTE blok van het venster eindigt tussen 19:00 en 08:00. Uit
@@ -329,6 +335,7 @@ class DhwBoostResetTest(unittest.TestCase):
         out = dhw_boost.decide(cfg, now)
         self.assertEqual(out["status"], "wait")
         self.assertEqual(out["boosts_recent"], 1)
+        self.assertFalse(out["block"]["dagblok"], "13:15-boost dekt het dagvenster al -> geen force")
         self.assertEqual(out["last_block_end_from"], "19:00")
         self.assertEqual(out["last_block_end_to"], "08:00")
         end = datetime.fromisoformat(out["block"]["end"])
@@ -370,6 +377,7 @@ class DhwBoostResetTest(unittest.TestCase):
         out = dhw_boost.decide(cfg, now)
         self.assertEqual(out["status"], "wait")
         self.assertEqual(out["boosts_recent"], 0)
+        self.assertFalse(out["block"]["dagblok"], "recent=0 -> nooit geforceerd dagblok")
         self.assertEqual(
             out["block"]["start"],
             datetime.fromisoformat("2026-09-26T12:00:00+02:00").isoformat(),
@@ -387,18 +395,115 @@ class DhwBoostResetTest(unittest.TestCase):
         now = datetime.fromisoformat("2026-09-26T08:00:00+02:00")
         out = dhw_boost.decide(cfg, now)
         self.assertEqual(out["status"], "wait")
+        self.assertFalse(out["block"]["dagblok"], "per_day=1 kent geen dagblok")
         self.assertEqual(
             out["block"]["start"],
             datetime.fromisoformat("2026-09-26T12:00:00+02:00").isoformat(),
         )
 
+    def test_night_boost_forces_daytime_block_within_window(self):
+        """Ná een nachtboost (02:00, buiten 12:00-23:00) wordt de tweede boost
+        het verplichte dagblok: het goedkoopste blok binnen 12:00-23:00, óók
+        als het globale optimum vóór 12:00 ligt (10:00-11:00, 0.05)."""
+        state = {
+            "last_sent_start": "2026-09-26T02:00:00+02:00",
+            "last_sent_end": "2026-09-26T05:00:00+02:00",
+            "sent_at": "2026-09-26T02:00:00+02:00",
+            "last_reset_start": "2026-09-26T02:00:00+02:00",
+            "reset_at": "2026-09-26T05:00:00+02:00",
+            "daily_boosts": {"2026-09-26": ["2026-09-26T02:00:00+02:00"]},
+        }
+        self._write_state(state)
+        cfg = {"mqtt": {"enabled": True, "dhw_boost": {"min_gap_hours": 4.0}}}
+        # 10:00-12:00 goedkoop (vóór het venster), 12:00-15:00 duur, daarna
+        # goedkoop tot 20:00: het dagblok wordt 15:00-16:00, niet 10:00-11:00.
+        self._rows_from = datetime.fromisoformat("2026-09-26T10:00:00+02:00")
+        self._prices = [0.05] * 8 + [0.30] * 12 + [0.05] * 20 + [0.30] * 8
+        now = datetime.fromisoformat("2026-09-26T10:00:00+02:00")
+        out = dhw_boost.decide(cfg, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertEqual(out["boosts_recent"], 1)
+        self.assertTrue(out["block"]["dagblok"], "tweede boost ná een nachtboost = dagblok")
+        start = datetime.fromisoformat(out["block"]["start"])
+        self.assertGreaterEqual(start, datetime.fromisoformat("2026-09-26T12:00:00+02:00"))
+        self.assertLessEqual(start, datetime.fromisoformat("2026-09-26T23:00:00+02:00"))
+        self.assertEqual(
+            out["block"]["start"],
+            datetime.fromisoformat("2026-09-26T15:00:00+02:00").isoformat(),
+        )
+        self.assertEqual(out["afternoon_from"], "12:00")
+        self.assertEqual(out["afternoon_to"], "23:00")
+
+    def test_force_skipped_when_window_not_reachable(self):
+        """Om 23:15 is het dagvenster (einde 23:00) niet meer haalbaar: de
+        gewone weg blijft gewoon werken (hier: eerst mogelijke blok ná nu dat
+        als laatste blok in het 19:00-08:00-venster eindigt: 23:15-00:15)."""
+        state = {
+            "last_sent_start": "2026-09-26T04:00:00+02:00",
+            "last_sent_end": "2026-09-26T08:00:00+02:00",
+            "sent_at": "2026-09-26T04:00:00+02:00",
+            "last_reset_start": "2026-09-26T04:00:00+02:00",
+            "reset_at": "2026-09-26T08:00:00+02:00",
+            "daily_boosts": {"2026-09-26": ["2026-09-26T04:00:00+02:00"]},
+        }
+        self._write_state(state)
+        cfg = {"mqtt": {"enabled": True, "dhw_boost": {"min_gap_hours": 4.0}}}
+        self._rows_from = datetime.fromisoformat("2026-09-26T23:15:00+02:00")
+        self._n_rows = 40  # data t/m 09:15 de volgende ochtend
+        now = datetime.fromisoformat("2026-09-26T23:15:00+02:00")
+        out = dhw_boost.decide(cfg, now)
+        self.assertEqual(out["status"], "send", "blok start direct (nú) na de terugval")
+        self.assertEqual(out["boosts_recent"], 1)
+        self.assertFalse(out["block"]["dagblok"], "dagvenster niet haalbaar -> terugval")
+        self.assertEqual(
+            out["block"]["start"],
+            datetime.fromisoformat("2026-09-26T23:15:00+02:00").isoformat(),
+        )
+
+    def test_custom_afternoon_window_respected(self):
+        """Een afwijkend dagvenster uit de config (14:00-20:00) wordt gevolgd:
+        het verplichte blok valt binnen díe grenzen (16:00-17:00), ook al is
+        12:00-13:00 het globale optimum."""
+        state = {
+            "last_sent_start": "2026-09-26T06:00:00+02:00",
+            "last_sent_end": "2026-09-26T10:00:00+02:00",
+            "sent_at": "2026-09-26T06:00:00+02:00",
+            "last_reset_start": "2026-09-26T06:00:00+02:00",
+            "reset_at": "2026-09-26T10:00:00+02:00",
+            "daily_boosts": {"2026-09-26": ["2026-09-26T06:00:00+02:00"]},
+        }
+        self._write_state(state)
+        cfg = {
+            "mqtt": {
+                "enabled": True,
+                "dhw_boost": {
+                    "min_gap_hours": 4.0,
+                    "afternoon_from": "14:00",
+                    "afternoon_to": "20:00",
+                },
+            }
+        }
+        # 12:00-14:00 goedkoop, 14:00-16:00 duur, 16:00-22:00 goedkoop.
+        self._rows_from = datetime.fromisoformat("2026-09-26T12:00:00+02:00")
+        self._prices = [0.05] * 8 + [0.30] * 8 + [0.05] * 24 + [0.30] * 8
+        now = datetime.fromisoformat("2026-09-26T12:00:00+02:00")
+        out = dhw_boost.decide(cfg, now)
+        self.assertEqual(out["status"], "wait")
+        self.assertTrue(out["block"]["dagblok"])
+        self.assertEqual(
+            out["block"]["start"],
+            datetime.fromisoformat("2026-09-26T16:00:00+02:00").isoformat(),
+        )
+        self.assertEqual(out["afternoon_from"], "14:00")
+        self.assertEqual(out["afternoon_to"], "20:00")
+
     def test_last_block_starts_in_next_night_not_next_day(self):
-        """Het LAATSTE blok mag niet doorschuiven naar een goedkopere dag
-        verderop. Praktijkgeval 06-10: toen de 24-uurslimiet vrijkwam
-        (recent=1) koos de planner het goedkoopste venster-blok van de héle
-        horizon — 07-10 23:00 in plaats van de avond ervoor (0,1008 i.p.v.
-        0,0825) — met 36 uur niet-opwarmen tot gevolg. Nu: starten vóór het
-        ochtend-`last_block_end_to`, dus in de eerstvolgende nacht."""
+        """Het laatste blok mag niet doorschuiven naar een goedkopere dag
+        verderop. Praktijkgeval 06-10: na een nachtboost koos de planner het
+        goedkoopste blok van de héle horizon — 07-10 23:00 in plaats van de
+        avond ervoor — met 36 uur niet-opwarmen tot gevolg. Nu treedt ná zo'n
+        nachtboost het verplichte dagvenster (12:00–23:00) in werking: het
+        blok blijft in de middag/avond van vandaag (18:00-19:00)."""
         state = {
             "last_sent_start": "2026-09-30T00:45:00+02:00",
             "last_sent_end": "2026-09-30T01:45:00+02:00",
@@ -424,10 +529,11 @@ class DhwBoostResetTest(unittest.TestCase):
         out = dhw_boost.decide(cfg, now)
         self.assertEqual(out["status"], "wait")
         self.assertEqual(out["boosts_recent"], 1, "dit is het laatste blok van de cyclus")
+        self.assertTrue(out["block"]["dagblok"], "ná een nachtboost wordt dit het dagvenster-blok")
         self.assertEqual(
             out["block"]["start"],
             datetime.fromisoformat("2026-09-30T18:00:00+02:00").isoformat(),
-            "goedkoopste venster-blok in de eerstvolgende nacht, niet morgenavond",
+            "goedkoopste blok in 12:00-23:00, niet morgenavond",
         )
         self.assertLess(
             datetime.fromisoformat(out["block"]["start"]),
@@ -462,6 +568,7 @@ class DhwBoostResetTest(unittest.TestCase):
         out = dhw_boost.decide(cfg, now)
         self.assertEqual(out["status"], "wait")
         self.assertEqual(out["boosts_recent"], 1)
+        self.assertFalse(out["block"]["dagblok"], "18:00-boost dekt het dagvenster al")
         self.assertEqual(
             out["block"]["start"],
             datetime.fromisoformat("2026-10-01T18:00:00+02:00").isoformat(),
@@ -495,6 +602,7 @@ class DhwBoostResetTest(unittest.TestCase):
         out = dhw_boost.decide(cfg, now)
         self.assertEqual(out["status"], "wait")
         self.assertEqual(out["boosts_recent"], 0, "vorige boost valt al buiten het venster")
+        self.assertFalse(out["block"]["dagblok"], "recent=0 -> nooit geforceerd dagblok")
         self.assertEqual(
             out["block"]["start"],
             datetime.fromisoformat("2026-10-07T02:15:00+02:00").isoformat(),

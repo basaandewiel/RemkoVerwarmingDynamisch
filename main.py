@@ -87,78 +87,119 @@ def _append_best_block(
             )
 
 
+def _trim_state_to(state: dict, moment: datetime) -> dict:
+    """Kopie van de state zonder boosts die op `moment` al buiten het
+    rollende 24-uursvenster vallen — voor het advies-plan na het bereiken
+    van de daglimiet (de watcher wacht dan tot het oudste blok weg is)."""
+    cutoff = moment - timedelta(hours=24)
+    daily: dict = {}
+    for _dag, iso_list in (state.get("daily_boosts") or {}).items():
+        bewaard = []
+        for iso in iso_list:
+            try:
+                if datetime.fromisoformat(iso) >= cutoff:
+                    bewaard.append(iso)
+            except ValueError:
+                bewaard.append(iso)  # onbekend formaat: maar bewaren
+        if bewaard:
+            daily[_dag] = bewaard
+    return dict(state, daily_boosts=daily)
+
+
 def _dhw_boost_plan(
     cfg: dict,
     granularity_min: int,
     now: datetime,
     dhw_rows: list,
-) -> Tuple[list, int, float]:
-    """De SWW-boost-momenten die dhw_boost --watch gaat uitsturen: max.
-    `boosts_per_day` blokken van `mqtt.dhw_boost.block_hours` uur (default 1 —
-    los van het langere blok voor de ruimteverwarming), telkens pas startend ná
-    `min_gap_hours` uur ná het einde van het vorige (zodat de opwarmmomenten
-    gespreid staan en niet 'slim' vlak achter elkaar hetzelfde goedkope moment
-    kiezen). Het LAATSTE blok eindigt bovendien tussen `last_block_end_from`
-    en `last_block_end_to` (default 19:00–08:00 de volgende ochtend), en élk
-    blok start vóór `last_block_end_to`: het hoort dus in de eerstvolgende
-    nacht te liggen, zodat de laatste opwarmperiode nooit midden op de dag
-    eindigt en een blok niet doorschuift naar een goedkopere dag verderop.
+    state: Optional[dict] = None,
+) -> Tuple[list, int, float, str, str, str, str]:
+    """De SWW-boost-momenten die dhw_boost --watch gaat uitsturen.
+
+    Het plan volgt dezelfde beslisregels als de watcher (_next_boost_block):
+    het resterende aantal boosts binnen het rollend 24-uursvenster (niet
+    opnieuw vanaf nul!), telkens pas ná `min_gap_hours` uur ná het einde van
+    het vorige blok, één blok per cyclus verplicht binnen
+    `afternoon_from`–`afternoon_to` (default 12:00–23:00), het laatste blok
+    dat bovendien eindigt tussen `last_block_end_from` en
+    `last_block_end_to` (default 19:00–08:00), en élk blok startend vóór
+    dat ochtend-`last_block_end_to` zodat niets doorschuift naar een
+    goedkopere dag verderop.
+
+    Zonder meegegeven `state` wordt de statusfile van de watcher gelezen, zodat
+    het getoonde tijdstip ook daadwerkelijk wordt uitgevoerd.
 
     Geeft (plan, boosts_per_day, min_gap_hours, last_block_end_from,
-    last_block_end_to): plan is de lijst gekozen blokken in oplopende
-    volgorde.
+    last_block_end_to, afternoon_from, afternoon_to): plan is de lijst
+    gekozen blokken in oplopende volgorde.
     """
     boost_cfg = (cfg.get("mqtt") or {}).get("dhw_boost") or {}
     # lazy import: dhw_boost importeert main, dus niet op module-niveau
     from dhw_boost import (
         DEFAULT_BOOSTS_PER_DAY,
         DEFAULT_BOOST_GAP_HOURS,
-        DEFAULT_BOOST_BLOCK_HOURS,
         LAST_BLOCK_END_FROM,
         LAST_BLOCK_END_TO,
-        find_boost_block,
-        next_deadline,
+        AFTERNOON_FROM,
+        AFTERNOON_TO,
+        _count_boosts_last_24h,
+        _next_boost_block,
+        _oldest_recent_boost,
+        _record_boost,
+        load_state,
     )
 
     per_day = int(boost_cfg.get("boosts_per_day", DEFAULT_BOOSTS_PER_DAY))
     gap_hours = float(boost_cfg.get("min_gap_hours", DEFAULT_BOOST_GAP_HOURS))
     end_from = boost_cfg.get("last_block_end_from", LAST_BLOCK_END_FROM)
     end_to = boost_cfg.get("last_block_end_to", LAST_BLOCK_END_TO)
-    block_hours = int(boost_cfg.get("block_hours", DEFAULT_BOOST_BLOCK_HOURS))
+    dag_from = boost_cfg.get("afternoon_from", AFTERNOON_FROM)
+    dag_to = boost_cfg.get("afternoon_to", AFTERNOON_TO)
+
+    # De échte staat van de watcher: als die al een boost in het afgelopen
+    # 24-uursvenster heeft, plant dit plan díe resterende blokken — precies
+    # wat --watch ook gaat sturen.
+    if state is None:
+        state = load_state()
+    else:
+        state = dict(state)  # de state van de caller niet muteren
+
+    step_now = now
+    if _count_boosts_last_24h(state, step_now) >= per_day:
+        # Daglimiet bereikt: de watcher wacht tot het oudste blok uit het
+        # venster valt. Vanaf dat moment telt dit plan opnieuw op.
+        step_now = _oldest_recent_boost(state, step_now) + timedelta(
+            hours=24, seconds=2
+        )
+        state = _trim_state_to(state, step_now)
+
+    # Dezelfde beslisregels als de watcher, op een advies-dict dat alleen de
+    # prijsrijen bevat (wat de planner nodig heeft).
+    pseudo = {
+        "dhw": {"rows": dhw_rows},
+        "prices": {"granularity_min": granularity_min},
+    }
 
     plan: List[dict] = []
-    earliest = now
     # data-horizon: het laatste moment waarop een blok nog kán eindigen in de
     # aanwezige prijzen. Eindigt een gekozen blok daar (of nét ervóór), dan
     # kan het optimum zomaar ná de horizon liggen — zie de hint in de output.
     slot_delta = timedelta(minutes=granularity_min)
     horizon_end = dhw_rows[-1]["dt_local"] + slot_delta if dhw_rows else None
-    last_index = max(1, per_day) - 1
-    for i in range(max(1, per_day)):
-        # Alleen het laatste geplande blok (en dus alleen bij meerdere blokken)
-        # moet binnen het avond/nacht-venster eindigen; de eerdere blokken en
-        # het enkele blok bij boosts_per_day=1 zijn vrij (goedkoopste moment).
-        # De start-grens geldt wél voor elk blok: niets start later dan de
-        # eerstvolgende ochtend, zodat ook een uitgesteld blok niet doorschuift
-        # naar een goedkopere dag verderop.
-        end_window = (end_from, end_to) if per_day >= 2 and i == last_index else None
-        start_before = next_deadline(earliest, end_to)
-        block = find_boost_block(
-            dhw_rows,
-            granularity_min,
-            block_hours,
-            now,
-            earliest,
-            end_window=end_window,
-            start_before=start_before,
-        )
+    openstaand = max(0, per_day - _count_boosts_last_24h(state, step_now))
+    for _ in range(openstaand):
+        block = _next_boost_block(pseudo, boost_cfg, state, step_now)
         if not block:
             break
         if horizon_end is not None:
             block = dict(block, horizon_bound=block["end"] >= horizon_end)
         plan.append(block)
-        earliest = block["end"] + timedelta(hours=gap_hours)
-    return plan, per_day, gap_hours, end_from, end_to
+        # Alsof deze boost verstuurd is: de volgende keuze houdt dan rekening
+        # met de 24-uurslimiet, de minimale afstand én of het dagblok al
+        # gedekt is.
+        _record_boost(state, block["start"])
+        state["last_sent_end"] = block["end"].isoformat()
+        step_now = block["end"]
+    return plan, per_day, gap_hours, end_from, end_to, dag_from, dag_to
 
 
 def build_advice(cfg: dict, args, now: datetime) -> dict:
@@ -298,6 +339,8 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
     dhw_gap_hours: Optional[float] = None
     dhw_last_end_from: Optional[str] = None
     dhw_last_end_to: Optional[str] = None
+    dhw_afternoon_from: Optional[str] = None
+    dhw_afternoon_to: Optional[str] = None
     if dhw_rows:
         (
             dhw_plan,
@@ -305,6 +348,8 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             dhw_gap_hours,
             dhw_last_end_from,
             dhw_last_end_to,
+            dhw_afternoon_from,
+            dhw_afternoon_to,
         ) = _dhw_boost_plan(
             cfg,
             pr["granularity_min"],
@@ -351,6 +396,8 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             "min_gap_hours": dhw_gap_hours,
             "last_block_end_from": dhw_last_end_from,
             "last_block_end_to": dhw_last_end_to,
+            "afternoon_from": dhw_afternoon_from,
+            "afternoon_to": dhw_afternoon_to,
         },
     }
 
@@ -425,14 +472,17 @@ def render_human(result: dict) -> str:
                 f" ({dhw.get('boosts_per_day')}x per 24 u, min. "
                 f"{dhw.get('min_gap_hours') or 0.0:g} u tussen de blokken; "
                 f"laatste blok eindigt {dhw.get('last_block_end_from') or '19:00'}–"
-                f"{dhw.get('last_block_end_to') or '08:00'}):"
+                f"{dhw.get('last_block_end_to') or '08:00'}; verplicht dagvenster "
+                f"{dhw.get('afternoon_from') or '12:00'}–"
+                f"{dhw.get('afternoon_to') or '23:00'}):"
             )
             lines.append("-" * 64)
             for i, b in enumerate(plan, start=1):
+                dag = "  [dagvenster]" if b.get("dagblok") else ""
                 lines.append(
                     f"  {i}. {fmt_dt(b['start'])} – {fmt_dt(b['end'])}  "
                     f"→ {nl(b['mean_corrected'], 4)} €/kWh warmte  "
-                    f"(COP {nl(b['mean_cop'], 2)})"
+                    f"(COP {nl(b['mean_cop'], 2)}){dag}"
                 )
             if any(b.get("horizon_bound") for b in plan):
                 lines.append("")

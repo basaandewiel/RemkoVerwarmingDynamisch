@@ -64,6 +64,8 @@
       "block_hours": 1,
       "last_block_end_from": "19:00",
       "last_block_end_to": "08:00",
+      "afternoon_from": "12:00",
+      "afternoon_to": "23:00",
       "qos": 1,
       "retain": false
     }

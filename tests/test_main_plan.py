@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Tests voor het gespreide SWW-boost-plan in main.py (_dhw_boost_plan):
-boosts_per_day blokken, telkens min. min_gap_hours ná het einde van de vorige,
-en met het LAATSTE blok dat eindigt tussen last_block_end_from en
-last_block_end_to (default 19:00-08:00) — anders glijdt de tweede boost met
-het goedkoopste-blok-advies naar de volgende middag door (effectief 1x per dag).
+"""Tests voor het gespreide SWW-boost-plan in main.py (_dhw_boost_plan).
+
+Het plan volgt de échte staat van de watcher (de nog resterende boosts binnen
+het rollend 24-uursvenster, niet opnieuw vanaf nul), en gebruikt dezelfde
+beslisregels: min. min_gap_hours ná het einde van de vorige boost, één blok
+per cyclus (het verplichte dagblok) binnen afternoon_from–afternoon_to
+(default 12:00–23:00) zodra er al een boost in het venster zit zonder
+dagblok, het LAATSTE blok dat eindigt tussen last_block_end_from en
+last_block_end_to (default 19:00–08:00), en élk blok dat start vóór het
+ochtend-`last_block_end_to`.
 
 Draaien:  python3 -m unittest discover -s tests -v
 """
@@ -12,8 +17,10 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import dhw_boost
 import main
 
 
@@ -37,143 +44,6 @@ def _rows(start_dt: datetime, n: int = 40, price: float = 0.12) -> list:
 
 
 class MainDhwPlanTest(unittest.TestCase):
-    def test_plan_spaces_second_boost_after_gap(self):
-        """Met de default (2x/dag, 4 u gap) moet de tweede boost pas ná
-        4 u ná het einde van de eerste starten (niet vlak erna), en — als
-        laatste blok van het venster — eindigen tussen 19:00 en 08:00."""
-        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
-        cfg = {"mqtt": {"dhw_boost": {}}}  # defaults: 2 / 4.0 / 1 u / 19:00-08:00
-        plan, per_day, gap, end_from, end_to = main._dhw_boost_plan(
-            cfg, 15, now, _rows(now, n=56)  # data t/m 20:00: laatste blok kan eindigen ≥ 19:00
-        )
-        self.assertEqual(per_day, 2)
-        self.assertEqual(gap, 4.0)
-        self.assertEqual(end_from, "19:00")
-        self.assertEqual(end_to, "08:00")
-        self.assertEqual(len(plan), 2)
-        first_end = plan[0]["end"]
-        self.assertGreaterEqual(
-            plan[1]["start"],
-            first_end + timedelta(hours=4),
-            "2e boost mag pas ná min_gap_hours ná het einde van de 1e",
-        )
-        # 2e (laatste) blok eindigt vóór 08:00 / ná 19:00 (hier: 19:00)
-        last_end = plan[1]["end"].time()
-        self.assertGreaterEqual(
-            last_end,
-            datetime.strptime(end_from, "%H:%M").time(),
-            "laatste blok eindigt niet vóór last_block_end_from",
-        )
-
-    def test_plan_respects_boosts_per_day(self):
-        """boosts_per_day=1 in de config -> maar één gepland moment; met één
-        blok is er geen 'eerste + laatste'-onderscheid, dus geen eind-venster."""
-        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
-        cfg = {"mqtt": {"dhw_boost": {"boosts_per_day": 1}}}
-        plan, per_day, _, _, _ = main._dhw_boost_plan(cfg, 15, now, _rows(now))
-        self.assertEqual(per_day, 1)
-        self.assertEqual(len(plan), 1)
-        self.assertEqual(plan[0]["start"], now)  # vrij gekozen, geen venster
-
-    def test_plan_custom_gap(self):
-        """min_gap_hours uit de config (bv. 6 u) wordt toegepast."""
-        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
-        cfg = {"mqtt": {"dhw_boost": {"boosts_per_day": 3, "min_gap_hours": 6.0}}}
-        plan, per_day, gap, _, _ = main._dhw_boost_plan(
-            cfg, 15, now, _rows(now, n=96)  # 24 u data: 3×1 u + 2×6 u gap
-        )
-        self.assertEqual(per_day, 3)
-        self.assertEqual(gap, 6.0)
-        self.assertEqual(len(plan), 3)
-        for a, b in zip(plan, plan[1:]):
-            self.assertGreaterEqual(b["start"], a["end"] + timedelta(hours=6))
-
-    def test_plan_last_block_ends_between_1900_and_0800(self):
-        """Het LAATSTE geplande blok eindigt tussen 19:00 en 08:00 (volgende
-        ochtend). Het 'goedkoopste-blok'-optimum van de 2e boost mag immers
-        niet midden op de dag eindigen (uit de melding: de 2e boost schoof
-        telkens door naar de volgende middag) — dan kiezen we het goedkoopste
-        blok binnen het avond/nacht-venster."""
-        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
-        cfg = {"mqtt": {"dhw_boost": {}}}  # defaults: 2 / 4.0 / 1 u / 19:00-08:00
-        # 06:00-09:00 goedkoopst (0.03) -> boost 1 (vrij gekozen); daarna duur;
-        # 16:00-22:00 goedkoop (0.05, eindigt binnen het venster); 08:00-11:00
-        # de volgende ochtend nét goedkoper (0.045) maar eindigt om 09:00+:
-        # buiten het venster -> voor het LAATSTE blok afgewezen.
-        prices = (
-            [0.03] * 12
-            + [0.30] * 28
-            + [0.05] * 12
-            + [0.05] * 12
-            + [0.30] * 24
-            + [0.30] * 12
-            + [0.30] * 4
-            + [0.045] * 12
-        )
-        plan, _, _, end_from, end_to = main._dhw_boost_plan(
-            cfg, 15, now, self._priced_rows(now, prices)
-        )
-        self.assertEqual(end_from, "19:00")
-        self.assertEqual(end_to, "08:00")
-        self.assertEqual(len(plan), 2)
-        last_end = plan[1]["end"]
-        self.assertGreaterEqual(
-            last_end, datetime.fromisoformat("2026-09-30T19:00:00+02:00")
-        )
-        self.assertLessEqual(
-            last_end, datetime.fromisoformat("2026-10-01T08:00:00+02:00")
-        )
-        # het goedkoopste blok ná de minimale gap dat binnen het venster
-        # eindigt is 18:00-19:00 (einde 19:00); het goedkopere 08:00-09:00
-        # (0.045, einde 09:00) moet afgewezen worden.
-        self.assertEqual(
-            plan[1]["start"],
-            datetime.fromisoformat("2026-09-30T18:00:00+02:00"),
-        )
-        self.assertNotEqual(
-            plan[1]["start"],
-            datetime.fromisoformat("2026-10-01T08:00:00+02:00"),
-        )
-
-    def test_plan_last_block_starts_before_next_morning(self):
-        """Het laatste geplande blok start bovendien vóór het ochtend-venster-
-        einde (08:00): het hoort in de eerstvolgende nacht te liggen. Zonder
-        die grens schuift het blok door naar het goedkoopste venster-blok van
-        de volgende avond — ruim ná 08:00 — en blijft de boiler dus een dag
-        langer koud (praktijkgeval: 36 uur tussen twee boosts)."""
-        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
-        cfg = {"mqtt": {"dhw_boost": {}}}  # defaults: 2 / 4.0 / 1 u / 19:00-08:00
-        # 06:00-09:00 goedkoop -> blok 1 (vrij gekozen); daarna duur tot
-        # 10-01 17:00; 10-01 17:00-21:00 goedkoop, met daarin het
-        # venster-blok 18:00-19:00 — dat ligt ná de start-grens van vandaag.
-        prices = (
-            [0.05] * 12    # 09-30 06:00-09:00
-            + [0.30] * 128  # 09:00 - 10-01 17:00
-            + [0.05] * 16   # 10-01 17:00-21:00
-            + [0.30] * 8    # 10-01 21:00-23:00
-        )
-        plan, _, _, _, _ = main._dhw_boost_plan(
-            cfg, 15, now, self._priced_rows(now, prices)
-        )
-        self.assertEqual(len(plan), 2)
-        self.assertEqual(
-            plan[1]["start"],
-            datetime.fromisoformat("2026-09-30T18:00:00+02:00"),
-            "laatste blok blijft in de eerstvolgende nacht i.p.v. morgenavond",
-        )
-        self.assertLess(
-            plan[1]["start"],
-            datetime.fromisoformat("2026-10-01T08:00:00+02:00"),
-        )
-
-    def test_plan_stops_when_horizon_exhausted(self):
-        """Raken de prijsdata op, dan stopt het plan netjes i.p.v. te crashen."""
-        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
-        cfg = {"mqtt": {"dhw_boost": {}}}
-        # slechts 1 blok data (12 slots) -> tweede boost kan er niet meer bij
-        plan, _, _, _, _ = main._dhw_boost_plan(cfg, 15, now, _rows(now, n=12))
-        self.assertEqual(len(plan), 1)
-
     def _priced_rows(self, start_dt: datetime, prices: list) -> list:
         rows = []
         for i, p in enumerate(prices):
@@ -190,6 +60,179 @@ class MainDhwPlanTest(unittest.TestCase):
             )
         return rows
 
+    def test_plan_spaces_second_boost_after_gap(self):
+        """Verse cyclus (geen boost in het venster): blok 1 is vrij (het
+        goedkoopste moment, 06:00), blok 2 wordt het verplichte dagvenster-
+        blok binnen 12:00-23:00 (12:00) — ruim ná de 4-u-gap ná blok 1."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}  # defaults: 2 / 4.0 / 1 u / 19:00-08:00
+        plan, per_day, gap, end_from, end_to, dag_from, dag_to = main._dhw_boost_plan(
+            cfg, 15, now, _rows(now, n=56), state={}
+        )
+        self.assertEqual(per_day, 2)
+        self.assertEqual(gap, 4.0)
+        self.assertEqual(end_from, "19:00")
+        self.assertEqual(end_to, "08:00")
+        self.assertEqual((dag_from, dag_to), ("12:00", "23:00"))
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[0]["start"], now, "blok 1 is vrij gekozen")
+        self.assertFalse(plan[0]["dagblok"])
+        self.assertGreaterEqual(
+            plan[1]["start"],
+            plan[0]["end"] + timedelta(hours=4),
+            "2e boost mag pas ná min_gap_hours ná het einde van de 1e",
+        )
+        self.assertTrue(plan[1]["dagblok"], "blok 2 is het verplichte dagvenster-blok")
+        self.assertEqual(
+            plan[1]["start"].hour, 12, "dagvenster-blok binnen 12:00-23:00"
+        )
+
+    def test_plan_respects_boosts_per_day(self):
+        """boosts_per_day=1 -> maar één gepland moment; vrij, geen dagblok."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {"boosts_per_day": 1}}}
+        plan, per_day, _, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, _rows(now), state={}
+        )
+        self.assertEqual(per_day, 1)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["start"], now)  # vrij gekozen, geen venster
+        self.assertFalse(plan[0]["dagblok"])
+
+    def test_plan_custom_gap(self):
+        """min_gap_hours uit de config (bv. 6 u) wordt toegepast; met 3 boosts
+        is er een vrij blok (06:00), een dagvenster-blok (13:00) en een
+        laatste blok dat alsnog in het avond-venster eindigt (20:00-21:00)."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {"boosts_per_day": 3, "min_gap_hours": 6.0}}}
+        plan, per_day, gap, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, _rows(now, n=96), state={}
+        )
+        self.assertEqual(per_day, 3)
+        self.assertEqual(gap, 6.0)
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(plan[0]["start"], now)
+        self.assertEqual(plan[1]["start"].hour, 13, "dagvenster-blok")
+        self.assertTrue(plan[1]["dagblok"])
+        self.assertEqual(plan[2]["start"].hour, 20, "laatste blok in avond-venster")
+        self.assertFalse(plan[2]["dagblok"])
+        for a, b in zip(plan, plan[1:]):
+            self.assertGreaterEqual(b["start"], a["end"] + timedelta(hours=6))
+
+    def test_plan_last_block_ends_between_1900_and_0800(self):
+        """Het LAATSTE (hier: resterende) blok eindigt tussen 19:00 en 08:00.
+        Met al een dagboost (20:00 gisteravond) is het niet aan het dagvenster
+        gebonden: het goedkoopste blok ná de gap dat in het avond/nacht-venster
+        eindigt is 18:00-19:00 — niet midden op de dag."""
+        now = datetime.fromisoformat("2026-09-30T10:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        state = {
+            "last_sent_start": "2026-09-29T20:00:00+02:00",
+            "last_sent_end": "2026-09-29T21:00:00+02:00",
+            "daily_boosts": {"2026-09-29": ["2026-09-29T20:00:00+02:00"]},
+        }
+        # 10:00-18:00 duur, alleen 18:00-19:00 goedkoop (einde 19:00).
+        prices = [0.30] * 32 + [0.05] * 4 + [0.30] * 8
+        plan, _, _, end_from, end_to, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, self._priced_rows(now, prices), state=state
+        )
+        self.assertEqual(end_from, "19:00")
+        self.assertEqual(end_to, "08:00")
+        self.assertEqual(len(plan), 1, "recent=1 -> nog één resterende boost")
+        self.assertFalse(plan[0]["dagblok"], "dagboost is al gedekt")
+        start, end = plan[0]["start"], plan[0]["end"]
+        self.assertEqual(start, datetime.fromisoformat("2026-09-30T18:00:00+02:00"))
+        self.assertGreaterEqual(end, datetime.fromisoformat("2026-09-30T19:00:00+02:00"))
+        self.assertLessEqual(end, datetime.fromisoformat("2026-10-01T08:00:00+02:00"))
+        self.assertLess(start, datetime.fromisoformat("2026-10-01T08:00:00+02:00"))
+
+    def test_plan_last_block_starts_before_next_morning(self):
+        """Het resterende blok na een eerdere dagboost blijft in de eerstvolgende
+        nacht: start vóór het ochtend-08:00 (23:00, einde 00:00), ook als de
+        avond erna goedkoper is (17:00-21:00 op 01-10, buiten de start-grens)."""
+        now = datetime.fromisoformat("2026-09-30T20:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        state = {
+            "last_sent_start": "2026-09-30T18:00:00+02:00",
+            "last_sent_end": "2026-09-30T19:00:00+02:00",
+            "daily_boosts": {"2026-09-30": ["2026-09-30T18:00:00+02:00"]},
+        }
+        # 20:00-23:00 duur, 23:00-08:00 goedkoop (nacht), daarna duur tot
+        # 17:00; 01-10 17:00-21:00 nog goedkoper (0.04) maar ná de start-grens.
+        prices = (
+            [0.30] * 12 + [0.05] * 36 + [0.30] * 36 + [0.04] * 16 + [0.30] * 8
+        )
+        plan, _, _, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, self._priced_rows(now, prices), state=state
+        )
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(
+            plan[0]["start"],
+            datetime.fromisoformat("2026-09-30T23:00:00+02:00"),
+            "laatste blok in de eerstvolgende nacht, niet de goedkopere avond erna",
+        )
+        self.assertLess(plan[0]["start"], datetime.fromisoformat("2026-10-01T08:00:00+02:00"))
+        self.assertNotEqual(
+            plan[0]["start"], datetime.fromisoformat("2026-10-01T18:00:00+02:00")
+        )
+
+    def test_plan_stops_when_horizon_exhausted(self):
+        """Raken de prijsdata op, dan stopt het plan netjes i.p.v. te crashen."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        # slechts 1 blok data (12 slots) -> tweede boost kan er niet meer bij
+        plan, _, _, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, _rows(now, n=12), state={}
+        )
+        self.assertEqual(len(plan), 1)
+
+    def test_plan_follows_status_state(self):
+        """Zonder state-argument leest het plan de échte statusfile (patched)
+        en plant het de RESTERENDE boosts — één nachtboost al gedaan -> nog één
+        boost, en dat is het verplichte dagvenster-blok (12:00)."""
+        now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        gekende = {
+            "last_sent_start": "2026-09-30T02:00:00+02:00",
+            "last_sent_end": "2026-09-30T05:00:00+02:00",
+            "daily_boosts": {"2026-09-30": ["2026-09-30T02:00:00+02:00"]},
+        }
+        with patch.object(dhw_boost, "load_state", return_value=dict(gekende)):
+            plan, per_day, _, _, _, dag_from, dag_to = main._dhw_boost_plan(
+                cfg, 15, now, _rows(now)
+            )
+        self.assertEqual(per_day, 2)
+        self.assertEqual(len(plan), 1, "recent=1 -> het dagblok rest nog")
+        self.assertEqual(
+            plan[0]["start"], datetime.fromisoformat("2026-09-30T12:00:00+02:00")
+        )
+        self.assertTrue(plan[0]["dagblok"])
+        self.assertEqual((dag_from, dag_to), ("12:00", "23:00"))
+
+    def test_plan_at_limit_wakes_window_before_next_block(self):
+        """Recent=2 (daglimiet bereikt): het plan toont het blok ná het vrijkomen
+        van het venster (oudste boost + 24 u), niet een onmogelijke derde boost.
+        De meegegeven state wordt bovendien niet gemuteerd."""
+        now = datetime.fromisoformat("2026-09-30T10:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        state = {
+            "daily_boosts": {
+                "2026-09-29": ["2026-09-29T08:00:00+02:00"],
+                "2026-09-30": ["2026-09-30T02:00:00+02:00"],
+            },
+        }
+        plan, _, _, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, _rows(now, n=120), state=state
+        )
+        self.assertEqual(len(state["daily_boosts"]), 2, "input-state niet aanpassen")
+        self.assertEqual(len(plan), 1)
+        self.assertTrue(plan[0]["dagblok"])
+        self.assertGreaterEqual(
+            plan[0]["start"],
+            datetime.fromisoformat("2026-09-30T08:00:02+02:00"),
+            "pas ná het vrijkomen van het venster (oudste boost + 24 u)",
+        )
+
     def test_plan_flags_horizon_bound_block(self):
         """Eindigt een gekozen blok precies op het einde van de prijsdata, dan
         wordt het gemarkeerd als horizon-bound: de goedkopere uren kunnen ná
@@ -198,7 +241,9 @@ class MainDhwPlanTest(unittest.TestCase):
         now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
         cfg = {"mqtt": {"dhw_boost": {}}}
         prices = [0.30] * 8 + [0.05] * 4  # alleen het laatste uur (08:00-09:00) is goedkoop
-        plan, _, _, _, _ = main._dhw_boost_plan(cfg, 15, now, self._priced_rows(now, prices))
+        plan, _, _, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, self._priced_rows(now, prices), state={}
+        )
         self.assertEqual(len(plan), 1)
         self.assertTrue(plan[0]["horizon_bound"])
         self.assertEqual(plan[0]["end"], datetime.fromisoformat("2026-09-30T09:00:00+02:00"))
@@ -208,8 +253,11 @@ class MainDhwPlanTest(unittest.TestCase):
         now = datetime.fromisoformat("2026-09-30T06:00:00+02:00")
         cfg = {"mqtt": {"dhw_boost": {}}}
         prices = [0.05] * 12 + [0.30] * 12  # goedkoopste periode = de eerste 3 u
-        plan, _, _, _, _ = main._dhw_boost_plan(cfg, 15, now, self._priced_rows(now, prices))
+        plan, _, _, _, _, _, _ = main._dhw_boost_plan(
+            cfg, 15, now, self._priced_rows(now, prices), state={}
+        )
         self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["start"], now)
         self.assertFalse(plan[0]["horizon_bound"])
 
 
