@@ -129,8 +129,11 @@ def _dhw_boost_plan(
     het getoonde tijdstip ook daadwerkelijk wordt uitgevoerd.
 
     Geeft (plan, boosts_per_day, min_gap_hours, last_block_end_from,
-    last_block_end_to, afternoon_from, afternoon_to): plan is de lijst
-    gekozen blokken in oplopende volgorde.
+    last_block_end_to, afternoon_from, afternoon_to, dagvenster_gedekt):
+    plan is de lijst gekozen blokken in oplopende volgorde;
+    dagvenster_gedekt = True als er in dit 24-u-venster al een boost binnen
+    afternoon_from–afternoon_to zit (en er dus terecht geen dagblok in het
+    plan staat).
     """
     boost_cfg = (cfg.get("mqtt") or {}).get("dhw_boost") or {}
     # lazy import: dhw_boost importeert main, dus niet op module-niveau
@@ -142,6 +145,7 @@ def _dhw_boost_plan(
         AFTERNOON_FROM,
         AFTERNOON_TO,
         _count_boosts_last_24h,
+        _dagboost_in_venster,
         _next_boost_block,
         _oldest_recent_boost,
         _record_boost,
@@ -172,6 +176,15 @@ def _dhw_boost_plan(
         )
         state = _trim_state_to(state, step_now)
 
+    # Heeft dit rollende 24-u-venster al een boost die binnen het dagvenster
+    # (afternoon_from–afternoon_to) startte? Dan is de dagvenster-verplichting
+    # al gedekt en plant dit plan (terecht) géén dagblok meer. Dat in de
+    # uitvoer melden, zodat "waar is het blok om 12:00?" geen verrassing is.
+    dag_gedekt = (
+        _count_boosts_last_24h(state, step_now) >= 1
+        and _dagboost_in_venster(state, step_now, dag_from, dag_to)
+    )
+
     # Dezelfde beslisregels als de watcher, op een advies-dict dat alleen de
     # prijsrijen bevat (wat de planner nodig heeft).
     pseudo = {
@@ -199,7 +212,16 @@ def _dhw_boost_plan(
         _record_boost(state, block["start"])
         state["last_sent_end"] = block["end"].isoformat()
         step_now = block["end"]
-    return plan, per_day, gap_hours, end_from, end_to, dag_from, dag_to
+    return (
+        plan,
+        per_day,
+        gap_hours,
+        end_from,
+        end_to,
+        dag_from,
+        dag_to,
+        dag_gedekt,
+    )
 
 
 def _fetch_prices_with_fallback(
@@ -389,6 +411,7 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
     dhw_last_end_to: Optional[str] = None
     dhw_afternoon_from: Optional[str] = None
     dhw_afternoon_to: Optional[str] = None
+    dhw_dagvenster_gedekt = False
     if dhw_rows:
         (
             dhw_plan,
@@ -398,6 +421,7 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             dhw_last_end_to,
             dhw_afternoon_from,
             dhw_afternoon_to,
+            dhw_dagvenster_gedekt,
         ) = _dhw_boost_plan(
             cfg,
             pr["granularity_min"],
@@ -442,6 +466,7 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             "rows": dhw_rows,
             "blocks": dhw_blocks,
             "best": dhw_blocks[0] if dhw_blocks else None,
+            "block_hours": dhw_bh,
             "plan": dhw_plan,
             "boosts_per_day": dhw_boosts_per_day,
             "min_gap_hours": dhw_gap_hours,
@@ -449,6 +474,9 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             "last_block_end_to": dhw_last_end_to,
             "afternoon_from": dhw_afternoon_from,
             "afternoon_to": dhw_afternoon_to,
+            # True als een boost in dit 24-u-venster al binnen het dagvenster
+            # startte: dan plant het plan (terecht) geen dagblok meer.
+            "dagvenster_gedekt": dhw_dagvenster_gedekt,
         },
     }
 
@@ -513,7 +541,8 @@ def render_human(result: dict) -> str:
             # staan in het geplande boost-plan hieronder (de 'naast beste'
             # blokken liggen immers vaak vlak tegen het beste aan)
             dhw["blocks"][:1],
-            "BESTE BLOK VAN 3 UUR VOOR SWW (op gecorrigeerde prijs):",
+            f"BESTE BLOK VAN {dhw.get('block_hours') or 1:g} UUR VOOR SWW "
+            "(op gecorrigeerde prijs):",
         )
         plan = dhw.get("plan") or []
         if plan:
@@ -534,6 +563,15 @@ def render_human(result: dict) -> str:
                     f"  {i}. {fmt_dt(b['start'])} – {fmt_dt(b['end'])}  "
                     f"→ {nl(b['mean_corrected'], 4)} €/kWh warmte  "
                     f"(COP {nl(b['mean_cop'], 2)}){dag}"
+                )
+            if dhw.get("dagvenster_gedekt") and plan:
+                lines.append("")
+                lines.append(
+                    "  (er is in dit 24-u-venster al een boost binnen het dagvenster "
+                    f"{dhw.get('afternoon_from') or '12:00'}–"
+                    f"{dhw.get('afternoon_to') or '23:00'} verstuurd; daarom staat "
+                    "hier geen dagvenster-blok meer in — alleen nog het laatste "
+                    "blok van de daglimiet.)"
                 )
             if any(b.get("horizon_bound") for b in plan):
                 lines.append("")
