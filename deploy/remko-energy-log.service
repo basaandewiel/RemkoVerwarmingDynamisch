@@ -1,0 +1,16 @@
+[Unit]
+Description=REMKO WKF energie-logger (MQTT -> CSV tijdreeks voor echte COP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python3 energy_log.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

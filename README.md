@@ -17,6 +17,10 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
    opgewarmd tot een hogere temperatuur (standaard 53 °C), wat een veel lagere
    COP geeft — en dus een eigen (soms ander) goedkoopste blok.
    Dit wordt berekend met een aparte COP-curve, zie `heatpump.dhw` in de config.
+7. (optioneel) het **meten van de echte COP** per SWW-opwarmepisode via de
+   kWh-tellers van de gateway (`energy_log.py`): zo kun je de gekozen
+   setpoint/boost-strategie later op échte kosten bijstellen in plaats van op
+   een schatting.
 
 Het resultaat kan optioneel via **MQTT** worden gepubliceerd (de MQTT-
 integratie van jouw warmtepomp draait al; dit programma publiceert alleen
@@ -77,6 +81,13 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.dhw_boost.qos` | QoS-niveau voor de boost/reset-commando's (default `1`). Met QoS 1 moet de broker de ontvangst bevestigen (PUBACK) **voordat** `VERSTUURD` wordt getoond; bij QoS 0 is er geen garantie. |
 | `mqtt.dhw_boost.retain` | Retain-flag op het commando (default `false`). Zet op `true` als je het laatste commando in MQTT Explorer zichtbaar wilt houden (elke nieuwe boost/reset overschrijft dan de vorige). |
 | `mqtt.dhw_boost.payload` | Wordt **afgeleid**: boost-setting = `heatpump.dhw.temperature` × 10 als hex, reset = `mqtt.dhw_boost.default_temperature` × 10 als hex (53 °C → `"0212"`, 40 °C → `"0190"`), in het formaat dat de gateway accepteert incl. `FORCE_RESPONSE`. Niet handmatig instellen. |
+| `mqtt.data_topic` | Topic waarop de gateway de **status** publiceert. Wordt **afgeleid** uit `control_topic` (`…/CLIENT2HOST` → `…/HOST2CLIENT`, dus `V04P26/SMTID/HOST2CLIENT`). Alleen nodig als je gateway een afwijkend schema gebruikt. |
+| `mqtt.energy_log.enabled` | `true` (default): de energie-logger leest de tellers uit (zie **Energie-logger**). |
+| `mqtt.energy_log.interval_seconds` | Seconden tussen samples (default 60). 60 s is ruim genoeg: de tellers zijn cumulatief, dus ook een langzamer tempo meet de energie per opwarmepisode prima. |
+| `mqtt.energy_log.response_timeout_seconds` | Hoe lang op het antwoord van de gateway wordt gewacht (default 8). |
+| `mqtt.energy_log.csv_path` | Pad van de CSV-tijdreeks (default `~/.cache/remko-wkf70/dhw_energy.csv`). |
+| `mqtt.energy_log.include_handshake` | `false` (default; logger is dan read-only). Zet op `true` als de gateway **niet** antwoordt zonder de 3 handshake-registers (5074/5106/5109) mee te sturen — test eerst met `energy_log.py --once --handshake`. |
+| `mqtt.energy_log.registers` | Welke registers worden gelogd (default de energietellers 5105/5374/5376 + temperaturen/opmode). |
 
 ## COP-curve van de REMKO WKF 70 (NEO) compact
 
@@ -241,11 +252,12 @@ bash deploy/install.sh
 
 # vul hierna je eigen config aan (API-key, coördinaten, mqtt-host):
 nano config.json
-sudo systemctl restart remko-sww-boost
+sudo systemctl restart remko-sww-boost remko-energy-log
 
 # controle:
-systemctl status remko-sww-boost
+systemctl status remko-sww-boost remko-energy-log
 journalctl -u remko-sww-boost -f
+journalctl -u remko-energy-log -f
 ```
 
 Het script maakt `config.json` (uit `config.example.json`) aan als die
@@ -363,6 +375,93 @@ Wat het script per run doet:
   blok). Testen zonder te versturen:
   `python3 dhw_boost.py --now "2026-09-23T11:45:00+02:00" --dry-run`,
   of `--watch --now ... --dry-run` voor één watch-cyclus.
+
+## Energie-logger (`energy_log.py`) — echte COP meten
+
+De REMKO-gateway publiceert **kWh-tellers** over MQTT. Die kun je gebruiken om
+de COP van een SWW-opwarmepisode te *meten* in plaats van te schatten — en
+daarmee de setpoint-vraag (53 °C vs. 48 °C vs. 45 °C) op échte kosten te
+beslechten. `energy_log.py` draait als aparte service, leest periodiek de
+tellers uit en schrijft een **tijdreeks-CSV**.
+
+**Registermap** (bevestigd via de HA-integratie
+[`Altrec/remko_mqtt-ha`](https://github.com/Altrec/remko_mqtt-ha); de waarden
+komen overeen met de sensoren in Home Assistant):
+
+| Register | Sensor | Betekenis |
+|---|---|---|
+| **5105** | Electr. energy heatpump | elektrisch verbruik (kWh, noemer van de COP) |
+| **5374** | Energy heating | thermisch, ruimteverwarming (kWh) |
+| **5376** | Energy DHW heating | thermisch, sanitair warm water (kWh) |
+| 5600 | Environmental energy | warmte uit de buitenlucht (kWh) |
+| 5001 | — | opmodus (`4` = SWW laden) |
+| 5032 / 5039 | — | buitentemperatuur / boilertemperatuur |
+| 5085 / 5190 / 1082 | — | heating-water req./actual, SWW-setpoint |
+| 5822 | — | compressorstarts |
+
+Per opwarmepisode geldt dan
+`COP = Δ(Energy DHW heating) / Δ(Electr. energy heatpump)`.
+Tijdens SWW-laden staat de ruimteverwarming doorgaans stil, dus de
+elektrische delta is vrijwel volledig aan SWW toe te rekenen.
+
+```bash
+# verifieer eerst de verbinding en lees één sample (aanbevolen vóór de service):
+~/remkoverwarming/venv/bin/python3 energy_log.py --once
+
+# antwoordt de gateway niet? probeer dan de handshake-registers mee te sturen:
+~/remkoverwarming/venv/bin/python3 energy_log.py --once --handshake
+
+# twijfel je over topic/registers: 30 s alle MQTT-berichten onder de node tonen:
+~/remkoverwarming/venv/bin/python3 energy_log.py --dump
+
+# samenvatting per SWW-opwarmepisode (ΔDHW, ΔEl, COP, buitentemp):
+~/remkoverwarming/venv/bin/python3 energy_log.py --report
+```
+
+De CSV (`~/.cache/remko-wkf70/dhw_energy.csv`) heeft de vaste kolommen
+`timestamp, energy_electric_kwh, energy_heating_kwh, energy_dhw_kwh, …,
+opmode, out_temp_c, water_temp_c, …` en groeit met ~1 regel/minuut (~100 kB/dag).
+
+**Protocoldetails.** De logger *subscribet* op `<node>/SMTID/HOST2CLIENT` en
+stuurt elke `interval_seconds` een query naar `<node>/SMTID/CLIENT2HOST`:
+`{"FORCE_RESPONSE": true, "query_list": [5105, 5374, …]}`. Standaard worden
+géén registers geschreven (read-only); alleen met `include_handshake` /
+`--handshake` gaan de drie handshake-registers mee die de HA-integratie ook
+altijd meestuurt.
+
+> **Waarom niet per boost meten?** De 53-vs-45-afweging hangt juist af van de
+> **spontane herverwarmingen** tússen onze blokken (bij een lage setpoint zakt
+> de boiler vaker onder de drempel). Een continue tijdreeks vangt díe ook, een
+> meting alleen bij blokstart/-einde niet.
+
+Draait op de Pi automatisch mee: `deploy/install.sh` installeert naast
+`remko-sww-boost` ook de unit `remko-energy-log` (`energy_log.py`). Handmatig:
+
+```ini
+# /etc/systemd/system/remko-energy-log.service
+[Unit]
+Description=REMKO WKF energie-logger (MQTT -> CSV tijdreeks voor echte COP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/remkoverwarming
+ExecStart=/home/pi/remkoverwarming/venv/bin/python3 energy_log.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now remko-energy-log
+journalctl -u remko-energy-log -f
+```
 
 ## Output & MQTT-topics
 

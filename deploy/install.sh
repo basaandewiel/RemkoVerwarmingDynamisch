@@ -43,13 +43,15 @@ else
     echo ">> config.json bestaat al (onaangeroerd)"
 fi
 
-# 3) Systemd-unit installeren (sudo)
-UNIT_SRC="$SCRIPT_DIR/remko-sww-boost.service"
-UNIT_DST="/etc/systemd/system/remko-sww-boost.service"
-echo ">> systemd-unit installeren ($UNIT_DST)"
+# 3) Systemd-units installeren (sudo)
 sd_ke="${USER_NAME//\//}"
-sed -e "s|__USER__|$sd_ke|g" \
-    -e "s|__DIR__|$DIR|g" "$UNIT_SRC" | sudo tee "$UNIT_DST" >/dev/null
+for UNIT in remko-sww-boost remko-energy-log; do
+    UNIT_SRC="$SCRIPT_DIR/$UNIT.service"
+    UNIT_DST="/etc/systemd/system/$UNIT.service"
+    echo ">> systemd-unit installeren ($UNIT_DST)"
+    sed -e "s|__USER__|$sd_ke|g" \
+        -e "s|__DIR__|$DIR|g" "$UNIT_SRC" | sudo tee "$UNIT_DST" >/dev/null
+done
 sudo systemctl daemon-reload
 
 # 4) Snelle zelfcontrole (geen publicatie)
@@ -58,12 +60,14 @@ echo ">> zelfcontrole: adviesberekening (--dry-run)"
     echo "  (adviescrash? Maar de service staat al klaar; check config.json.)" >&2
 }
 
-# 5) Service starten
-echo ">> service starten en inschakelen bij boot"
+# 5) Services starten
+echo ">> services starten en inschakelen bij boot"
 sudo systemctl enable --now remko-sww-boost
+sudo systemctl enable --now remko-energy-log
 echo
 echo "Klaar. Controle:"
-echo "  systemctl status remko-sww-boost"
+echo "  systemctl status remko-sww-boost remko-energy-log"
 echo "  journalctl -u remko-sww-boost -f"
+echo "  journalctl -u remko-energy-log -f"
 echo
-echo "Vul eerst je ENTSO-E API-key in: nano $DIR/config.json  (daarna: sudo systemctl restart remko-sww-boost)"
+echo "Vul eerst je ENTSO-E API-key in: nano $DIR/config.json  (daarna: sudo systemctl restart remko-sww-boost remko-energy-log)"

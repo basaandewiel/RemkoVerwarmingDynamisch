@@ -56,6 +56,7 @@
     "topic_base": "remko/wkf70",
     "qos": 0,
     "control_topic": "remko/wkf70",
+    "data_topic": null,
     "dhw_boost": {
       "enabled": true,
       "trigger_minutes": 45,
@@ -69,6 +70,14 @@
       "afternoon_to": "23:00",
       "qos": 1,
       "retain": false
+    },
+    "energy_log": {
+      "enabled": true,
+      "interval_seconds": 60,
+      "response_timeout_seconds": 8,
+      "csv_path": "~/.cache/remko-wkf70/dhw_energy.csv",
+      "include_handshake": false,
+      "registers": [5105, 5374, 5376, 5600, 5001, 5032, 5039, 5085, 5190, 1082, 5822]
     }
   }
 }
