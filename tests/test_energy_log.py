@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import energy_log
@@ -102,6 +103,11 @@ class TestCsvColumns(unittest.TestCase):
         self.assertEqual(cols[1], "energy_electric_kwh")
         self.assertEqual(cols[2], "energy_dhw_kwh")
 
+    def test_price_column_appended_last(self):
+        cols = energy_log.csv_columns([5105], include_price=True)
+        self.assertEqual(cols[-1], energy_log.PRICE_FIELD)
+        self.assertNotIn(energy_log.PRICE_FIELD, energy_log.csv_columns([5105]))
+
 
 class TestCsvRoundTrip(unittest.TestCase):
     def test_append_and_read(self):
@@ -119,11 +125,62 @@ class TestCsvRoundTrip(unittest.TestCase):
             self.assertEqual(rows[0]["energy_dhw_kwh"], "100.0")
             self.assertEqual(rows[1]["timestamp"], "2026-10-11T12:30:00+02:00")
 
+    def test_header_change_rotates_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "e.csv")
+            c1 = energy_log.csv_columns([5105, 5376])
+            energy_log.append_row(path, c1, {"timestamp": "t0",
+                                             "energy_electric_kwh": 1.0,
+                                             "energy_dhw_kwh": 1.0})
+            # log_price aan: kolomset verandert -> oud bestand opzij (.bak)
+            c2 = energy_log.csv_columns([5105, 5376], include_price=True)
+            energy_log.append_row(path, c2, {"timestamp": "t1",
+                                             "energy_electric_kwh": 2.0,
+                                             "energy_dhw_kwh": 2.0,
+                                             energy_log.PRICE_FIELD: 0.1})
+            rows = energy_log.read_rows(path)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(list(rows[0].keys()), c2)
+            baks = [f for f in os.listdir(d) if f.endswith(".bak")]
+            self.assertEqual(len(baks), 1)
+
+
+class TestPriceBook(unittest.TestCase):
+    def _book(self):
+        tz = ZoneInfo("Europe/Amsterdam")
+        book = energy_log.PriceBook()
+        s0 = datetime(2026, 10, 11, 12, 0, tzinfo=tz)
+        s1 = datetime(2026, 10, 11, 13, 0, tzinfo=tz)
+        s2 = datetime(2026, 10, 11, 14, 0, tzinfo=tz)
+        book.set_slots([(s2, 0.30), (s0, 0.10), (s1, 0.20)], "test")
+        return book, s0, s1, s2
+
+    def test_price_at_picks_starting_slot(self):
+        book, s0, s1, s2 = self._book()
+        self.assertAlmostEqual(book.price_at(s0), 0.10)
+        self.assertAlmostEqual(book.price_at(s1 + timedelta(minutes=5)), 0.20)
+        # na het laatste slot blijft de laatste prijs gelden
+        self.assertAlmostEqual(book.price_at(s2 + timedelta(hours=2)), 0.30)
+
+    def test_price_at_before_window_is_none(self):
+        book, s0, _, _ = self._book()
+        self.assertIsNone(book.price_at(s0 - timedelta(minutes=1)))
+
+    def test_empty_book(self):
+        self.assertIsNone(energy_log.PriceBook().price_at(datetime.now()))
+
 
 def _row(ts, dhw, el, out=None):
     r = {"timestamp": ts, "energy_dhw_kwh": str(dhw), "energy_electric_kwh": str(el)}
     if out is not None:
         r["out_temp_c"] = str(out)
+    return r
+
+
+def _rowp(ts, dhw, el, price, setpoint):
+    r = _row(ts, dhw, el)
+    r["price_eur_per_kwh"] = str(price)
+    r["water_temp_req_c"] = str(setpoint)
     return r
 
 
@@ -182,6 +239,42 @@ class TestSummarizeEpisodes(unittest.TestCase):
         self.assertTrue(any("COP" in ln for ln in lines))
         self.assertTrue(any("Totaal" in ln for ln in lines))
 
+    def test_cost_from_price_column(self):
+        rows = [
+            _rowp("2026-10-11T12:00:00+02:00", 100.0, 200.0, 0.10, 53.0),
+            _rowp("2026-10-11T12:30:00+02:00", 101.0, 200.4, 0.20, 53.0),
+            _rowp("2026-10-11T13:00:00+02:00", 102.0, 200.8, 0.20, 53.0),
+        ]
+        eps = energy_log.summarize_episodes(rows)
+        self.assertEqual(len(eps), 1)
+        ep = eps[0]
+        self.assertAlmostEqual(ep["el_kwh"], 0.8)
+        # interval 12:00->12:30 tegen prijs 12:00 (0.10), 12:30->13:00 tegen 0.20
+        self.assertAlmostEqual(ep["cost_eur"], 0.4 * 0.10 + 0.4 * 0.20)
+        self.assertAlmostEqual(ep["price_mean"], ep["cost_eur"] / 0.8)
+        self.assertEqual(ep["setpoint"], 53.0)
+
+    def test_no_cost_when_no_price_column(self):
+        eps = energy_log.summarize_episodes(self._series())
+        self.assertTrue(all(e["cost_eur"] is None for e in eps))
+
+    def test_report_groups_by_setpoint(self):
+        rows = [
+            _rowp("t0", 100.0, 200.0, 0.10, 53.0),
+            _rowp("t1", 101.0, 200.5, 0.10, 53.0),
+            _rowp("t2", 101.0, 200.5, 0.10, 53.0),
+            _rowp("t3", 101.0, 200.5, 0.10, 53.0),
+            _rowp("t4", 101.0, 200.5, 0.10, 53.0),  # > max_gap vlak
+            _rowp("t5", 102.0, 201.0, 0.10, 45.0),
+            _rowp("t6", 103.0, 201.5, 0.10, 45.0),
+        ]
+        eps = energy_log.summarize_episodes(rows)
+        groups = dict(energy_log.group_by_setpoint(eps))
+        self.assertIn(53.0, groups)
+        self.assertIn(45.0, groups)
+        lines = energy_log.render_report(eps, rows)
+        self.assertTrue(any("Per setpoint" in ln for ln in lines))
+
 
 class _FakeClient:
     def __init__(self):
@@ -212,10 +305,13 @@ class TestEnergyLoggerSampling(unittest.TestCase):
             "response_timeout_seconds": 0.05,
             "csv_path": "/tmp/niet-gebruikt.csv",
             "include_handshake": False,
+            "log_price": False,
+            "price_refresh_seconds": 3600.0,
+            "price_days_ahead": 2,
             "registers": list(energy_log.ALL_REGISTERS),
         }
         return energy_log.EnergyLogger(
-            mqtt_cfg, ecfg, ZoneInfo("Europe/Amsterdam")
+            {}, mqtt_cfg, ecfg, ZoneInfo("Europe/Amsterdam")
         )
 
     def test_collect_returns_row_after_message(self):

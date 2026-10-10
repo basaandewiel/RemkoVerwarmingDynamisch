@@ -32,6 +32,7 @@ Gebruik:
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import json
 import os
@@ -68,6 +69,12 @@ FIELDS: List[Tuple[int, str, str]] = [
 ]
 REG_BY_ID: Dict[int, Tuple[str, str]] = {reg: (name, kind) for reg, name, kind in FIELDS}
 ALL_REGISTERS: List[int] = [reg for reg, _, _ in FIELDS]
+
+# Kolom met de op dat moment geldende, all-in variabele stroomprijs (€/kWh,
+# inclusief price_adjustments). De logger schrijft hem bij elke sample mee,
+# zodat het rapport de kosten kan uitrekenen zónder historische prijzen op te
+# hoeven halen (de dag-ahead-API's leveren alleen vanaf vandaag vooruit).
+PRICE_FIELD = "price_eur_per_kwh"
 
 # De HA-integratie stuurt deze drie registers bij elke keep-alive mee als
 # "handshake". Ze staan niet in de registermap; standaard schrijven we ze niet
@@ -168,19 +175,46 @@ def energy_cfg(cfg: dict) -> dict:
         ),
         "csv_path": os.path.expanduser(ec.get("csv_path") or default_csv_path()),
         "include_handshake": bool(ec.get("include_handshake", False)),
+        "log_price": bool(ec.get("log_price", True)),
+        "price_refresh_seconds": float(ec.get("price_refresh_seconds", 3600)),
+        "price_days_ahead": int(ec.get("price_days_ahead", 2)),
         "registers": regs,
     }
 
 
-def csv_columns(registers: List[int]) -> List[str]:
-    """CSV-kolommen voor de opgegeven registers (in vaste FIELDS-volgorde)."""
-    return ["timestamp"] + [
+def csv_columns(registers: List[int], include_price: bool = False) -> List[str]:
+    """CSV-kolommen voor de opgegeven registers (in vaste FIELDS-volgorde).
+
+    Met `include_price` komt de all-in stroomprijs als laatste kolom erbij.
+    """
+    cols = ["timestamp"] + [
         name for reg, name, _ in FIELDS if reg in set(registers)
     ]
+    if include_price:
+        cols.append(PRICE_FIELD)
+    return cols
+
+
+def _csv_header(path: str) -> List[str]:
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as fh:
+            first = fh.readline().rstrip("\r\n")
+        return next(csv.reader([first])) if first else []
+    except OSError:
+        return []
 
 
 def append_row(path: str, columns: List[str], row: dict) -> None:
-    """Voeg één regel toe; schrijf de kop alleen als het bestand nieuw is."""
+    """Voeg één regel toe; schrijf de kop alleen als het bestand nieuw is.
+
+    Verandert de kolomset (bv. doordat je `log_price` aan/uit zet), dan wordt
+    het oude bestand opzij gezet als `<path>.<tijdstempel>.bak` en met de nieuwe
+    kolommen opnieuw begonnen — anders zouden de regels scheef komen te staan.
+    """
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        if _csv_header(path) != list(columns):
+            bak = f"{path}.{datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
+            os.replace(path, bak)
     is_new = not os.path.exists(path) or os.path.getsize(path) == 0
     with open(path, "a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
@@ -203,12 +237,77 @@ def _f(value, default: float = 0.0) -> float:
         return default
 
 
+def _mean(values: List[float]) -> Optional[float]:
+    return (sum(values) / len(values)) if values else None
+
+
+def _mode(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return max(set(values), key=values.count)
+
+
+class PriceBook:
+    """All-in stroomprijzen per slot, om aan de samples te koppelen.
+
+    `price_at(dt)` geeft de prijs van het slot dat op of vóór `dt` begint
+    (een day-ahead-prijs geldt voor het interval dat erop volgt). Buiten het
+    venster: None. De correcties (`price_adjustments`) worden meteen
+    toegepast, zodat de gelogde prijs gelijk is aan wat het advies rekent.
+    """
+
+    def __init__(self) -> None:
+        self._slots: List[Tuple[datetime, float]] = []
+        self._dts: List[datetime] = []
+        self.source = ""
+        self.fetched_at: Optional[datetime] = None
+
+    def set_slots(self, slots, source: str = "") -> None:
+        self._slots = sorted((dt, float(p)) for dt, p in slots)
+        self._dts = [dt for dt, _ in self._slots]
+        self.source = source
+        self.fetched_at = datetime.now()
+
+    def refresh(self, cfg: dict, tz: ZoneInfo, days_ahead: int = 2) -> bool:
+        """Haal (gecachte) day-ahead prijzen op en pas de correcties toe."""
+        prices_cfg = cfg.get("prices") or {}
+        loc = cfg.get("location") or {}
+        if not prices_cfg:
+            return False
+        try:
+            pr, _used = app._fetch_prices_with_fallback(prices_cfg, loc, days_ahead)
+        except Exception:  # noqa: BLE001 — prijzen zijn optioneel voor de logger
+            return False
+        adj = prices_cfg.get("price_adjustments") or {}
+        vat = float(adj.get("vat_pct", 0.0))
+        tax = float(adj.get("fixed_tax_per_kwh", 0.0))
+        slots = [
+            (dt, price * (1.0 + vat / 100.0) + tax)
+            for dt, price in pr["slots"]
+        ]
+        self._slots = sorted(slots)
+        self._dts = [dt for dt, _ in self._slots]
+        self.source = pr.get("source", "")
+        self.fetched_at = datetime.now(tz)
+        return bool(self._slots)
+
+    def price_at(self, dt: datetime) -> Optional[float]:
+        if not self._slots:
+            return None
+        i = bisect.bisect_right(self._dts, dt) - 1
+        if i < 0:
+            return None
+        return self._slots[i][1]
+
+
 def summarize_episodes(rows: List[dict], max_gap: int = 2) -> List[dict]:
     """Detecteer SWW-opwarmepisodes uit de tijdreeks.
 
     Een sample is 'actief' als de DHW-teller sinds het vorige sample steeg.
     Korte onderbrekingen (max `max_gap` samples) worden overbrugd. Per episode
-    wordt de COP = ΔDHW / Δelektrisch berekend.
+    wordt de COP = ΔDHW / Δelektrisch berekend; is er een prijskolom, dan ook
+    de kosten (Δelektrisch × het tarief van het bijbehorende interval) en de
+    setpoint (`water_temp_req_c`, dus boost- vs. basistemperatuur).
     """
     episodes: List[dict] = []
     cur: Optional[dict] = None
@@ -219,7 +318,9 @@ def summarize_episodes(rows: List[dict], max_gap: int = 2) -> List[dict]:
         ts = r.get("timestamp")
         dhw = _f(r.get("energy_dhw_kwh"))
         el = _f(r.get("energy_electric_kwh"))
-        out = r.get("out_temp_c")
+        out = _f(r.get("out_temp_c"), default=float("nan"))
+        setp = _f(r.get("water_temp_req_c"), default=float("nan"))
+        price = _f(r.get("price_eur_per_kwh"), default=float("nan"))
 
         if prev is not None:
             d_dhw = dhw - prev["dhw"]
@@ -231,14 +332,23 @@ def summarize_episodes(rows: List[dict], max_gap: int = 2) -> List[dict]:
                         "end": ts,
                         "dhw_kwh": 0.0,
                         "el_kwh": 0.0,
+                        "cost_eur": 0.0,
+                        "price_seen": False,
                         "out": [],
+                        "setpoints": [],
                     }
                 cur["end"] = ts
                 cur["dhw_kwh"] += d_dhw
-                cur["el_kwh"] += max(d_el, 0.0)
-                o = _f(out, default=float("nan"))
-                if o == o:  # niet NaN
-                    cur["out"].append(o)
+                d_el_pos = max(d_el, 0.0)
+                cur["el_kwh"] += d_el_pos
+                p = prev["price"]
+                if p == p:  # geen NaN
+                    cur["cost_eur"] += d_el_pos * p
+                    cur["price_seen"] = True
+                if out == out:
+                    cur["out"].append(out)
+                if setp == setp:
+                    cur["setpoints"].append(setp)
                 gap = 0
             elif cur is not None:
                 gap += 1
@@ -246,7 +356,7 @@ def summarize_episodes(rows: List[dict], max_gap: int = 2) -> List[dict]:
                     episodes.append(cur)
                     cur = None
 
-        prev = {"ts": ts, "dhw": dhw, "el": el}
+        prev = {"ts": ts, "dhw": dhw, "el": el, "price": price}
 
     if cur is not None:
         episodes.append(cur)
@@ -254,8 +364,31 @@ def summarize_episodes(rows: List[dict], max_gap: int = 2) -> List[dict]:
     for ep in episodes:
         ep["cop"] = (ep["dhw_kwh"] / ep["el_kwh"]) if ep["el_kwh"] > 0 else None
         ep["minutes"] = _minutes_between(ep["start"], ep["end"])
-        ep["out_mean"] = (sum(ep["out"]) / len(ep["out"])) if ep["out"] else None
+        ep["out_mean"] = _mean(ep["out"])
+        ep["cost_eur"] = ep["cost_eur"] if ep["price_seen"] else None
+        ep["price_mean"] = (
+            ep["cost_eur"] / ep["el_kwh"]
+            if (ep["price_seen"] and ep["el_kwh"] > 0)
+            else None
+        )
+        sp = _mode(ep["setpoints"])
+        ep["setpoint"] = round(sp, 1) if sp is not None else None
+        ep.pop("price_seen", None)
+        ep.pop("out", None)
+        ep.pop("setpoints", None)
     return episodes
+
+
+def group_by_setpoint(episodes: List[dict]) -> List[Tuple[Optional[float], List[dict]]]:
+    groups: Dict[Optional[float], List[dict]] = {}
+    order: List[Optional[float]] = []
+    for e in episodes:
+        key = e.get("setpoint")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(e)
+    return [(k, groups[k]) for k in order]
 
 
 def _minutes_between(a, b) -> Optional[float]:
@@ -276,21 +409,59 @@ def render_report(episodes: List[dict], rows: List[dict]) -> List[str]:
     total_dhw = sum(e["dhw_kwh"] for e in episodes)
     total_el = sum(e["el_kwh"] for e in episodes)
     overall = (total_dhw / total_el) if total_el > 0 else None
+    has_cost = any(e["cost_eur"] is not None for e in episodes)
 
     for e in episodes:
         cop = f"{e['cop']:.2f}" if e["cop"] is not None else "?"
         out = f"{e['out_mean']:.1f} °C" if e["out_mean"] is not None else "?"
         mins = f"{e['minutes']:.0f} min" if e["minutes"] is not None else "?"
+        extra = ""
+        if e["cost_eur"] is not None:
+            extra += f"  kosten €{e['cost_eur']:.3f}"
+        if e["setpoint"] is not None:
+            extra += f"  setpoint {e['setpoint']:g} °C"
         lines.append(
             f"  {e['start']} -> {e['end']}  ({mins})  "
             f"ΔDHW {e['dhw_kwh']:.2f} kWh  ΔEl {e['el_kwh']:.2f} kWh  "
-            f"COP {cop}  buiten {out}"
+            f"COP {cop}  buiten {out}{extra}"
         )
+
     overall_txt = f"{overall:.2f}" if overall is not None else "?"
-    lines.append(
+    total_line = (
         f"  Totaal: ΔDHW {total_dhw:.1f} kWh  ΔEl {total_el:.1f} kWh  "
         f"gem. COP {overall_txt}"
     )
+    if has_cost:
+        total_cost = sum(e["cost_eur"] for e in episodes if e["cost_eur"] is not None)
+        eff = (total_cost / total_el) if total_el > 0 else None
+        eff_txt = f"{eff:.3f}" if eff is not None else "?"
+        total_line += f"  kosten €{total_cost:.2f} (gem. {eff_txt} €/kWh)"
+    lines.append(total_line)
+    if not has_cost:
+        lines.append(
+            "  (geen prijzen in de CSV — zet mqtt.energy_log.log_price op true "
+            "voor de kostanalyse)"
+        )
+        return lines
+
+    # Per setpoint: hiermee vergelijk je de strategieën (bv. 53 vs. 48 vs. 45 °C)
+    groups = group_by_setpoint(episodes)
+    if any(k is not None for k, _ in groups):
+        lines.append("  Per setpoint:")
+        for sp, eps in groups:
+            g_dhw = sum(e["dhw_kwh"] for e in eps)
+            g_el = sum(e["el_kwh"] for e in eps)
+            g_costs = [e["cost_eur"] for e in eps if e["cost_eur"] is not None]
+            g_cop = (g_dhw / g_el) if g_el > 0 else None
+            label = f"{sp:g} °C" if sp is not None else "onbekend"
+            cop_txt = f"{g_cop:.2f}" if g_cop is not None else "?"
+            part = (
+                f"    {label:>9}: {len(eps):>3} episodes  ΔDHW {g_dhw:6.1f} kWh  "
+                f"ΔEl {g_el:5.1f} kWh  COP {cop_txt}"
+            )
+            if g_costs:
+                part += f"  kosten €{sum(g_costs):.2f}"
+            lines.append(part)
     return lines
 
 
@@ -320,7 +491,9 @@ def _make_connected_client(mqtt, mqtt_cfg: dict):
 class EnergyLogger:
     """Draait als service: sample -> CSV-regel, met signaal-afhandeling."""
 
-    def __init__(self, mqtt_cfg: dict, ecfg: dict, tz: ZoneInfo, dry_run: bool = False):
+    def __init__(self, cfg: dict, mqtt_cfg: dict, ecfg: dict, tz: ZoneInfo,
+                 dry_run: bool = False):
+        self.cfg = cfg
         self.mqtt_cfg = mqtt_cfg
         self.ecfg = ecfg
         self.tz = tz
@@ -329,8 +502,10 @@ class EnergyLogger:
         self.data_topic = data_topic(mqtt_cfg)
         self.qos = int(mqtt_cfg.get("qos", 0) or 0)
         self.query = build_query(ecfg["registers"], ecfg["include_handshake"])
-        self.columns = csv_columns(ecfg["registers"])
+        self.columns = csv_columns(ecfg["registers"], include_price=ecfg["log_price"])
         self.path = ecfg["csv_path"]
+        self.pricebook = PriceBook() if ecfg["log_price"] else None
+        self._next_price_refresh = 0.0
 
         self._latest: Dict[int, float] = {}
         self._lock = threading.Lock()
@@ -338,6 +513,20 @@ class EnergyLogger:
         self._connected = threading.Event()
         self._stop = threading.Event()
         self._count = 0
+        self._count_fail = 0
+
+    def _refresh_prices(self, cfg: dict) -> None:
+        """Ververs de prijzen (met dezelfde bron/fallback als het advies)."""
+        if self.pricebook is None:
+            return
+        if self.pricebook.refresh(cfg, self.tz, self.ecfg["price_days_ahead"]):
+            self._next_price_refresh = time.time() + self.ecfg["price_refresh_seconds"]
+            _log(f"prijzen bijgewerkt ({self.pricebook.source})")
+        else:
+            # geen (volledige) prijzen: blijf het met het normale interval
+            # opnieuw proberen, maar spam het log niet vol
+            self._next_price_refresh = time.time() + self.ecfg["price_refresh_seconds"]
+            _log("geen prijzen beschikbaar — kolom blijft leeg (energie wordt wel gelogd)")
 
     # --- paho callbacks ---
     def on_connect(self, client, userdata, flags, rc, properties=None):
@@ -380,6 +569,10 @@ class EnergyLogger:
         for reg, name, _ in FIELDS:
             if reg in snapshot:
                 row[name] = snapshot[reg]
+        if self.pricebook is not None:
+            p = self.pricebook.price_at(datetime.now(self.tz))
+            if p is not None:
+                row[PRICE_FIELD] = round(p, 5)
         return row
 
     def stop(self, *_args) -> None:
@@ -420,8 +613,11 @@ class EnergyLogger:
             f"energie-logger gestart — elke {self.ecfg['interval_seconds']:g}s "
             f"-> {self.path}"
         )
+        self._refresh_prices(self.cfg)
         try:
             while not self._stop.is_set():
+                if self.pricebook is not None and time.time() >= self._next_price_refresh:
+                    self._refresh_prices(self.cfg)
                 t0 = time.time()
                 row = self._collect(client)
                 if row is not None:
@@ -549,6 +745,8 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--report", action="store_true", help="samenvatting van het CSV-bestand")
     ap.add_argument("--handshake", action="store_true",
                     help="de 3 handshake-registers meesturen in de query")
+    ap.add_argument("--no-price", action="store_true",
+                    help="geen stroomprijs-kolom loggen (alleen energietellers)")
     ap.add_argument("--dry-run", action="store_true", help="niet naar CSV schrijven")
     ap.add_argument("--json", action="store_true", help="JSON-uitvoer bij --once/--report")
     args = ap.parse_args(argv)
@@ -567,6 +765,8 @@ def main(argv: List[str] | None = None) -> int:
         ecfg["interval_seconds"] = args.interval
     if args.handshake:
         ecfg["include_handshake"] = True
+    if args.no_price:
+        ecfg["log_price"] = False
 
     tz = ZoneInfo((cfg.get("location") or {}).get("timezone", "Europe/Amsterdam"))
 
@@ -609,7 +809,7 @@ def main(argv: List[str] | None = None) -> int:
         if not ecfg["enabled"]:
             print("energie-logger staat uit (mqtt.energy_log.enabled = false)")
             return 0
-        return EnergyLogger(mqtt_cfg, ecfg, tz, dry_run=args.dry_run).run()
+        return EnergyLogger(cfg, mqtt_cfg, ecfg, tz, dry_run=args.dry_run).run()
     except Exception as exc:  # noqa: BLE001 — nette foutmelding vanuit systemd
         print(f"FOUT: {exc}", file=sys.stderr)
         return 1

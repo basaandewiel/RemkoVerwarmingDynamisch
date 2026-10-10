@@ -87,6 +87,9 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.energy_log.response_timeout_seconds` | Hoe lang op het antwoord van de gateway wordt gewacht (default 8). |
 | `mqtt.energy_log.csv_path` | Pad van de CSV-tijdreeks (default `~/.cache/remko-wkf70/dhw_energy.csv`). |
 | `mqtt.energy_log.include_handshake` | `false` (default; logger is dan read-only). Zet op `true` als de gateway **niet** antwoordt zonder de 3 handshake-registers (5074/5106/5109) mee te sturen — test eerst met `energy_log.py --once --handshake`. |
+| `mqtt.energy_log.log_price` | `true` (default): schrijf bij elke sample ook de **all-in stroomprijs** (`price_eur_per_kwh`, inclusief `prices.price_adjustments`) mee als kolom, zodat `--report` de kosten kan uitrekenen zonder historische prijzen op te hoeven halen. |
+| `mqtt.energy_log.price_refresh_seconds` | Hoe vaak (seconden) de dag-ahead prijzen worden opgehaald/bijgewerkt (default 3600). Gebruikt dezelfde bron + fallback als het advies. |
+| `mqtt.energy_log.price_days_ahead` | Hoeveel dagen vooruit prijzen worden opgehaald voor de logkolom (default 2). |
 | `mqtt.energy_log.registers` | Welke registers worden gelogd (default de energietellers 5105/5374/5376 + temperaturen/opmode). |
 
 ## COP-curve van de REMKO WKF 70 (NEO) compact
@@ -414,13 +417,43 @@ elektrische delta is vrijwel volledig aan SWW toe te rekenen.
 # twijfel je over topic/registers: 30 s alle MQTT-berichten onder de node tonen:
 ~/remkoverwarming/venv/bin/python3 energy_log.py --dump
 
-# samenvatting per SWW-opwarmepisode (ΔDHW, ΔEl, COP, buitentemp):
+# samenvatting per SWW-opwarmepisode (ΔDHW, ΔEl, COP, buitentemp, kosten, setpoint):
 ~/remkoverwarming/venv/bin/python3 energy_log.py --report
 ```
 
 De CSV (`~/.cache/remko-wkf70/dhw_energy.csv`) heeft de vaste kolommen
 `timestamp, energy_electric_kwh, energy_heating_kwh, energy_dhw_kwh, …,
-opmode, out_temp_c, water_temp_c, …` en groeit met ~1 regel/minuut (~100 kB/dag).
+opmode, out_temp_c, water_temp_c, …, price_eur_per_kwh` en groeit met
+~1 regel/minuut (~100 kB/dag). Verandert de kolomset (bv. `log_price` aan/uit),
+dan zet de logger het oude bestand opzij als `dhw_energy.csv.<tijd>.bak` en
+begint met de nieuwe kolommen — de regels blijven zo altijd uitgelijnd.
+
+### Kosten: 53 vs. 48 vs. 45 °C op échte cijfers
+
+Met `log_price` (default aan) schrijft de logger bij elke sample de **all-in
+stroomprijs** mee (dezelfde bron + `price_adjustments` als het advies). `--report`
+rekent dan per episode de kosten uit (`Δelektrisch × tarief` van het bijbehorende
+interval) én groepeert op **setpoint** (register 1082: de boost-temperatuur of de
+basis-stand). Zo zie je na een paar weken direct welke strategie het goedkoopst
+is:
+
+```
+  Totaal: ΔDHW 12.3 kWh  ΔEl 3.9 kWh  gem. COP 3.15  kosten €0.98 (gem. 0.251 €/kWh)
+  Per setpoint:
+        53 °C:   8 episodes  ΔDHW   12.3 kWh  ΔEl   3.9 kWh  COP 3.15  kosten €0.98
+        45 °C:   9 episodes  ΔDHW   13.1 kWh  ΔEl   3.4 kWh  COP 3.85  kosten €0.92
+```
+
+Let op: lagere setpoint = hogere COP, maar de boiler koelt ook sneller af →
+vaker spontaan herverwarmen. De **tijdreeks** (niet alleen de boosts) vangt die
+extra cycli mee; daarom is een continue meting nodig in plaats van meten bij
+blokstart/-einde. Zet `mqtt.energy_log.log_price` op `false` (of draai eenmalig
+met `--no-price`) als je alleen energie wilt loggen.
+
+> **Waarom niet per boost meten?** De 53-vs-45-afweging hangt juist af van de
+> **spontane herverwarmingen** tússen onze blokken (bij een lage setpoint zakt
+> de boiler vaker onder de drempel). Een continue tijdreeks vangt díe ook, een
+> meting alleen bij blokstart/-einde niet.
 
 **Protocoldetails.** De logger *subscribet* op `<node>/SMTID/HOST2CLIENT` en
 stuurt elke `interval_seconds` een query naar `<node>/SMTID/CLIENT2HOST`:
@@ -428,11 +461,6 @@ stuurt elke `interval_seconds` een query naar `<node>/SMTID/CLIENT2HOST`:
 géén registers geschreven (read-only); alleen met `include_handshake` /
 `--handshake` gaan de drie handshake-registers mee die de HA-integratie ook
 altijd meestuurt.
-
-> **Waarom niet per boost meten?** De 53-vs-45-afweging hangt juist af van de
-> **spontane herverwarmingen** tússen onze blokken (bij een lage setpoint zakt
-> de boiler vaker onder de drempel). Een continue tijdreeks vangt díe ook, een
-> meting alleen bij blokstart/-einde niet.
 
 Draait op de Pi automatisch mee: `deploy/install.sh` installeert naast
 `remko-sww-boost` ook de unit `remko-energy-log` (`energy_log.py`). Handmatig:
