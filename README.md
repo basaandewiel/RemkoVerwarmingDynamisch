@@ -56,11 +56,12 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `optimization.only_future` | `true`: alleen blokken die nu of later starten. |
 | `optimization.top_n` | Hoeveel beste blokken worden weergegeven. |
 | `prices.source` | `entsoe` (default) of `energyzero` als alternatief. |
+| `prices.fallback_source` | Reserve-prijsbron als de primaire faalt: `"auto"` (default → de andere bekende bron, entsoe ↔ energyzero), een vaste bronnaam, of `false` om de fallback uit te zetten. Een gebruikte fallback staat altijd zichtbaar in de output (bron + waarschuwing). |
 | `prices.days_ahead` | Hoeveel dagen vooruit plannen (day-ahead prijzen zijn meestal ~48 u bekend, default 3). Dag +1 +2 zijn pas net gepubliceerd als je tweede SWW-boost ná middernacht valt — met 2 kan het tweede blok zomaar op de laatste uren van de horizon klem komen te zitten (bijv. 21:00-00:00), terwijl de goedkopere vroege ochtend van de dag erop onzichtbaar blijft. |
 | `prices.entsoe.api_key` | **Jouw persoonlijke ENTSO-E API-key** (gratis account op https://transparency.entsoe.eu → My Account → API). |
 | `prices.entsoe.in_domain` / `out_domain` | Biedingszone; NL = `10YNL----------L`. |
 | `prices.entsoe.cache_ttl_seconds` | Houdt de opgehaalde day-ahead prijzen per dag op schijf (default 3600 s). Prijzen veranderen hooguit 1×/dag, dus een watcher hoeft niet bij elke wake de API te bevragen — scheelt aanzienlijk op een trage/overbelaste DNS-server. Bij een API-storing wordt deze cache (ook als hij ouder is dan de TTL) als terugvaloptie gebruikt. |
-| `prices.energyzero.*` | Alleen gebruikt als `source` = `energyzero` (gratis, zonder key, maar uurprijzen). |
+| `prices.energyzero.*` | Gebruikt als `source` of `fallback_source` `energyzero` is (gratis, zonder key, maar uurprijzen). |
 | `prices.price_adjustments.vat_pct` | Btw-percentage op de groothandelsprijs (bv. `21`). Constante factor, verandert de blokkeuze niet. |
 | `prices.price_adjustments.fixed_tax_per_kwh` | Vaste belasting per kWh (bv. energiebelasting €/kWh). **Verandert de blokkeuze wel** (want `(prijs + belasting)/COP`). Standaard 0,12 €/kWh in de config. |
 | `mqtt.*` | MQTT-publicatie (broker, topics). Zet `enabled` op `false` om uit te schakelen. |
@@ -408,6 +409,18 @@ belasting per kWh in:
 
 > Zet `prices.source` op `energyzero` als je liever de archivering van
 > EnergyZero gebruikt (gratis, zonder key, maar uurprijzen).
+
+### Automatische fallback tussen prijsbronnen
+
+Faalt de primaire prijsbron volledig (bv. ENTSO-E geeft op een ochtend nog
+geen day-ahead data terwijl EnergyZero die dag al wél serveert), dan probeert
+het advies automatisch de andere bron (`prices.fallback_source`, default
+`"auto"`). Zo blijft de watcher plannen zodra de ene bron uitvalt — let op:
+beide bronnen zijn dezelfde Nederlandse day-ahead-veiling, dus is de
+veilinguitkomst zélf (nog) nergens gepubliceerd, dan faalt ook de fallback.
+Een gebruikte fallback is altijd zichtbaar: de bronnaam in de output en een
+waarschuwing in de logs ("bron 'entsoe' faalde (...); verder met 'energyzero'").
+Zet `"fallback_source": false` om de fallback uit te zetten.
 
 ## API-toegang & -voorwaarden
 

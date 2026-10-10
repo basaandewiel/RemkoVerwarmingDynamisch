@@ -202,6 +202,75 @@ def _dhw_boost_plan(
     return plan, per_day, gap_hours, end_from, end_to, dag_from, dag_to
 
 
+def _fetch_prices_with_fallback(
+    prices_cfg: dict, loc: dict, days_ahead: int
+) -> Tuple[dict, str]:
+    """Haal stroomprijzen op; bij totale mislukking de fallback-bron proberen.
+
+    Primaire bron = `prices_cfg["source"]` ('entsoe' of 'energyzero').
+    `prices_cfg["fallback_source"]` kiest de reservebron:
+      - ontbrekend of "auto" -> de andere bekende bron (entsoe <-> energyzero);
+      - expliciet "entsoe"/"energyzero" -> alleen die; false/null -> uit.
+    Levert (pr, gebruikte_bron). Is er een fallback gebruikt, dan staat dat
+    in `pr["source"]` en als waarschuwing in `pr["warnings"]` (wordt in het
+    advies doorgegeven), zodat een vervangende bron nooit stilzwijgend
+    meedraait. Falen beide bronnen: de fout van de primaire bron.
+    """
+    def _fetch(source: str) -> dict:
+        if source == "entsoe":
+            ec = prices_cfg["entsoe"]
+            return entsoe.fetch_prices(
+                api_key=ec["api_key"],
+                tz=loc["timezone"],
+                days_ahead=days_ahead,
+                in_domain=ec.get("in_domain", "10YNL----------L"),
+                out_domain=ec.get("out_domain", "10YNL----------L"),
+                cache_ttl_seconds=int(ec.get("cache_ttl_seconds", entsoe.DEFAULT_CACHE_TTL)),
+            )
+        if source == "energyzero":
+            ez = prices_cfg["energyzero"]
+            return energyzero.fetch_prices(
+                tz=loc["timezone"],
+                days_ahead=days_ahead,
+                api_url=ez.get("api_url", energyzero.API_URL_DEFAULT),
+                usage_type=int(ez.get("usage_type", 1)),
+                incl_btw=bool(ez.get("incl_btw", True)),
+            )
+        raise ValueError(f"onbekende prijsbron: {source!r} (kies 'entsoe' of 'energyzero')")
+
+    source = prices_cfg.get("source", "entsoe")
+    fallback = prices_cfg.get("fallback_source")
+    candidates = [source]
+    if fallback is not False and source in ("entsoe", "energyzero"):
+        pinned = fallback if isinstance(fallback, str) and fallback in ("entsoe", "energyzero") else None
+        candidates.append(pinned or ("energyzero" if source == "entsoe" else "entsoe"))
+    candidates = list(dict.fromkeys(candidates))  # dubbelen eruit
+
+    pr: Optional[dict] = None
+    used: Optional[str] = None
+    primary_error: Optional[Exception] = None
+    for cand in candidates:
+        try:
+            pr = _fetch(cand)
+            used = cand
+            break
+        except Exception as exc:  # noqa: BLE001 — de fallback vangt elke bronfout
+            if primary_error is None:
+                primary_error = exc
+    if pr is None:
+        # beide bronnen faalden: de fout van de PRIMAIRE bron (bv. een
+        # entsoe.PricesNotAvailableError — de watcher stemt daar zijn
+        # herpoging op af)
+        raise primary_error  # type: ignore[misc]  # altijd gezet in de loop
+
+    if used != candidates[0]:
+        pr["warnings"] = list(pr.get("warnings") or []) + [
+            f"bron {candidates[0]!r} faalde ({primary_error}); verder met {used!r}"
+        ]
+        pr["source"] += f" (fallback: {used})"
+    return pr, used
+
+
 def build_advice(cfg: dict, args, now: datetime) -> dict:
     """Haal data op en bereken het advies. Geeft een dict resultaat."""
     loc = cfg["location"]
@@ -253,31 +322,10 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
     )
     temps_by_hour = metno.hourly_temperatures(forecast)
 
-    # 3) stroomprijzen (keuze uit config: entsoe | energyzero)
+    # 3) stroomprijzen (entsoe | energyzero, met automatische fallback)
     prices_cfg = cfg["prices"]
-    source = prices_cfg.get("source", "entsoe")
     days_ahead = int(prices_cfg.get("days_ahead", 3))
-    if source == "entsoe":
-        ec = prices_cfg["entsoe"]
-        pr = entsoe.fetch_prices(
-            api_key=ec["api_key"],
-            tz=loc["timezone"],
-            days_ahead=days_ahead,
-            in_domain=ec.get("in_domain", "10YNL----------L"),
-            out_domain=ec.get("out_domain", "10YNL----------L"),
-            cache_ttl_seconds=int(ec.get("cache_ttl_seconds", entsoe.DEFAULT_CACHE_TTL)),
-        )
-    elif source == "energyzero":
-        ez = prices_cfg["energyzero"]
-        pr = energyzero.fetch_prices(
-            tz=loc["timezone"],
-            days_ahead=days_ahead,
-            api_url=ez.get("api_url", energyzero.API_URL_DEFAULT),
-            usage_type=int(ez.get("usage_type", 1)),
-            incl_btw=bool(ez.get("incl_btw", True)),
-        )
-    else:
-        raise ValueError(f"onbekende prijsbron: {source!r} (kies 'entsoe' of 'energyzero')")
+    pr, used = _fetch_prices_with_fallback(prices_cfg, loc, days_ahead)
 
     # optionele correcties op de kWh-prijs (bv. btw en/of vaste belasting)
     adj = prices_cfg.get("price_adjustments") or {}
@@ -375,6 +423,9 @@ def build_advice(cfg: dict, args, now: datetime) -> dict:
             "granularity_min": pr["granularity_min"],
             "horizon_start": rows[0]["dt_local"],
             "horizon_end": rows[-1]["dt_local"],
+            # dagen die deze ronde níet opgehaald konden worden + een evt.
+            # fallback-noot; de SWW-watcher logt dit (price_warnings)
+            "warnings": pr.get("warnings") or [],
         },
         "rows": rows,
         "blocks": blocks,

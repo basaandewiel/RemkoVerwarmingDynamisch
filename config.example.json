@@ -30,6 +30,7 @@
   "prices": {
     "source": "entsoe",
     "days_ahead": 3,
+    "fallback_source": "auto",
     "entsoe": {
       "api_key": "PLAK_HIER_JE_ENTS-OE_API_KEY",
       "in_domain": "10YNL----------L",
