@@ -22,6 +22,11 @@ Twee manieren:
          zolang het geplande blok nog niet in de LEAD-nadering zit;
        * (alleen zolang er nog géén blok bekend is, bijv. vertraagde
          prijzen) elke --retry-interval (default 30 min).
+         Zijn de prijzen voor géén enkele dag beschikbaar (dag-ahead van
+         vandaag nog niet gepubliceerd), dan wordt de eerste volgende poging
+         afgestemd op het publicatiemoment (--price-refresh-time), met
+         aansluitend een hercheck (--price-recheck-min) — niet elke minuut
+         stampen.
      Herberekenen om de paar minuten is bewust niet nodig: het DHW-water
      wordt dagelijks bijverwarmd en het 3-uursblok is tussen deze momenten
      stabiel. Te starten via systemd (bijlage in README) of nohup.
@@ -74,6 +79,7 @@ from datetime import datetime, timedelta, time as dtime
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
+import entsoe
 import main as app
 import mqtt_out
 from optimizer import find_cheapest_blocks
@@ -637,6 +643,37 @@ def next_price_refresh(now: datetime, tz: ZoneInfo, hhmm: str) -> datetime:
     return candidate
 
 
+def _price_retry_sleep(
+    exc: BaseException,
+    now: datetime,
+    tz: ZoneInfo,
+    refresh_hhmm: str,
+    recheck_min: float,
+) -> float:
+    """Backoff ná een fout in de wake-loop (watcher).
+
+    Is de prijsbron voor *geen* enkele dag data (nog) niet gepubliceerd, dan
+    komt er maar één relevant moment per dag aan: het publicatiemoment
+    (`refresh_hhmm`). Elke minuut opnieuw vragen kost dan alleen API-requests
+    en log-lawaai — daarom wordt de volgende poging erop afgestemd:
+      - vóór het publicatiemoment vandaag: wakker worden vlak ná de refresh;
+      - kort ná de refresh (binnen LATE_PUBCHECK_WINDOW_H): hercheck om de
+        `recheck_min` minuten (late publicatie);
+      - anders (bijv. diep in de nacht): RETRY_INTERVAL_DEFAULT.
+    Overige fouten (config, code, ...) houden het oude defensieve ritme van
+    60 seconden.
+    """
+    if not isinstance(exc, entsoe.PricesNotAvailableError):
+        return 60.0
+    hh, mm = (int(x) for x in refresh_hhmm.split(":"))
+    today_refresh = datetime(now.year, now.month, now.day, hh, mm, tzinfo=tz)
+    if now < today_refresh:
+        return (today_refresh - now).total_seconds() + 60.0  # +1 min rust
+    if now < today_refresh + timedelta(hours=LATE_PUBCHECK_WINDOW_H):
+        return recheck_min * 60.0
+    return RETRY_INTERVAL_DEFAULT
+
+
 def next_wake_time(
     out: dict,
     now: datetime,
@@ -897,8 +934,16 @@ def watch(
             _log("gestopt")
             return 130
         except Exception as exc:  # noqa: BLE001 — de daemon moet blijven draaien
+            delay = _price_retry_sleep(exc, now, tz, refresh_hhmm, recheck_min)
             _log("FOUT (ga verder):", exc)
-            time.sleep(60)
+            if delay > 61:
+                wake = now + timedelta(seconds=delay)
+                _log(
+                    "prijzen (nog) niet gepubliceerd — volgende poging rond",
+                    wake.strftime("%a %d-%m %H:%M:%S"),
+                    f"(+{delay/3600:.0f}u)" if delay >= 3600 else f"(+{delay/60:.0f}min)",
+                )
+            time.sleep(delay)
 
 
 def render_human(out: dict) -> List[str]:

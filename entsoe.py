@@ -51,6 +51,15 @@ class _TransientDayError(RuntimeError):
     deugt dus om opnieuw te proberen of op een oudere cache te terugvallen."""
 
 
+class PricesNotAvailableError(RuntimeError):
+    """Voor *geen enkele* gevraagde dag was prijsdata beschikbaar.
+
+    Dit is normaal vóór het dagelijkse publicatiemoment van day-ahead-
+    prijzen (de dag staat dan nog niet in de API). De watcher kan dit type
+    apart herkennen en zijn herpoging afstemmen op dat publicatiemoment
+    (i.p.v. elke minuut opnieuw te vragen)."""
+
+
 def _is_transient_http(code: int) -> bool:
     """Is deze HTTP-status tijdelijk (dus waard om te herhalen)?
 
@@ -318,7 +327,7 @@ def fetch_prices(
     slots = [(dt.astimezone(local_tz), price) for dt, price in slots]
     if not slots:
         detail = f" — {warnings[-1]}" if warnings else ""
-        raise RuntimeError(
+        raise PricesNotAvailableError(
             "ENTSO-E leverde geen day-ahead prijzen voor het gevraagde venster "
             "(nog niet gepubliceerd? verkeerde biedingszone?)" + detail
         )

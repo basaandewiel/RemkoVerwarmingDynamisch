@@ -22,6 +22,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import dhw_boost
+import entsoe
 import main
 
 TZ = ZoneInfo("Europe/Amsterdam")
@@ -825,6 +826,53 @@ class DhwBoostResetTest(unittest.TestCase):
         # nét ná het blokeinde, exact het moment waarop await de boost zou
         # afvuren. Nu wint de wake voor de reset op het blokeinde.
         self.assertEqual(wake, datetime.fromisoformat("2026-09-25T15:15:00+02:00"))
+
+
+class DhwBoostPriceRetryTest(unittest.TestCase):
+    """Backoff ná een prijs-fout in de watcher (--watch): geen 60-seconden-
+    loop als de day-ahead-prijzen (nog) niet gepubliceerd zijn."""
+
+    REFRESH = "13:30"
+
+    def _sleep(self, exc, now_str, recheck_min=45.0):
+        return dhw_boost._price_retry_sleep(
+            exc, datetime.fromisoformat(now_str), TZ, self.REFRESH, recheck_min
+        )
+
+    def test_generic_error_keeps_60s(self):
+        """Onbekende fouten houden het oude defensieve ritme."""
+        self.assertEqual(self._sleep(RuntimeError("iets anders"), "2026-10-10T09:47:00+02:00"), 60.0)
+
+    def test_before_publish_wakes_just_after_refresh(self):
+        """Vandaag nog niet gepubliceerd: wachten tot vlak ná 13:30."""
+        self.assertEqual(
+            self._sleep(
+                entsoe.PricesNotAvailableError("geen prijzen"),
+                "2026-10-10T09:47:00+02:00",
+            ),
+            3 * 3600 + 43 * 60 + 60.0,  # 09:47 -> 13:30 = 3u43m + 1 min rust
+        )
+
+    def test_shortly_after_refresh_rechecks(self):
+        """Kort ná 13:30 (binnen het late-publicatievenster): hercheck na 45 min."""
+        self.assertEqual(
+            self._sleep(
+                entsoe.PricesNotAvailableError("geen prijzen"),
+                "2026-10-10T13:45:00+02:00",
+                recheck_min=45.0,
+            ),
+            45.0 * 60.0,
+        )
+
+    def test_night_falls_back_to_retry_interval(self):
+        """Ver na de refresh (nacht): gewone retry-interval, geen kort ritme."""
+        self.assertEqual(
+            self._sleep(
+                entsoe.PricesNotAvailableError("geen prijzen"),
+                "2026-10-10T23:00:00+02:00",
+            ),
+            dhw_boost.RETRY_INTERVAL_DEFAULT,
+        )
 
 
 if __name__ == "__main__":

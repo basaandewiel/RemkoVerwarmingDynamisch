@@ -205,9 +205,22 @@ class EntsoeFetchPricesToleranceTest(unittest.TestCase):
                 entsoe, "_fetch_day_once",
                 side_effect=entsoe._TransientDayError("HTTP 599"),
             ):
-                with self.assertRaises(RuntimeError) as ctx:
+                with self.assertRaises(entsoe.PricesNotAvailableError) as ctx:
                     self._fetch()
         self.assertIn("599", str(ctx.exception))
+
+    def test_no_day_published_raises_prices_not_available(self):
+        """Dagen geven lege ACK's ('nog niet gepubliceerd'): een herkenbare
+        eigen foutklasse, zodat de watcher de retry op het publicatiemoment
+        kan afstemmen in plaats van elke minuut te stampen."""
+        with patch.object(entsoe, "_request_day", return_value=[]):
+            with self.assertRaises(entsoe.PricesNotAvailableError) as ctx:
+                self._fetch()
+        self.assertIn("leverde geen day-ahead prijzen", str(ctx.exception))
+
+    def test_prices_not_available_is_runtime_error(self):
+        """Blijft een RuntimeError: bestaande afvangers blijven werken."""
+        self.assertTrue(issubclass(entsoe.PricesNotAvailableError, RuntimeError))
 
 
 if __name__ == "__main__":
