@@ -112,13 +112,13 @@ def _dhw_boost_plan(
     now: datetime,
     dhw_rows: list,
     state: Optional[dict] = None,
-) -> Tuple[list, int, float, str, str, str, str]:
+) -> Tuple[list, int, float, str, str, str, str, bool]:
     """De SWW-boost-momenten die dhw_boost --watch gaat uitsturen.
 
     Het plan volgt dezelfde beslisregels als de watcher (_next_boost_block):
     het resterende aantal boosts binnen het rollend 24-uursvenster (niet
     opnieuw vanaf nul!), telkens pas ná `min_gap_hours` uur ná het einde van
-    het vorige blok, één blok per cyclus verplicht binnen
+    het vorige blok, per kalenderdag één boost verplicht binnen
     `afternoon_from`–`afternoon_to` (default 12:00–23:00), het laatste blok
     dat bovendien eindigt tussen `last_block_end_from` en
     `last_block_end_to` (default 19:00–08:00), en élk blok startend vóór
@@ -131,9 +131,9 @@ def _dhw_boost_plan(
     Geeft (plan, boosts_per_day, min_gap_hours, last_block_end_from,
     last_block_end_to, afternoon_from, afternoon_to, dagvenster_gedekt):
     plan is de lijst gekozen blokken in oplopende volgorde;
-    dagvenster_gedekt = True als er in dit 24-u-venster al een boost binnen
-    afternoon_from–afternoon_to zit (en er dus terecht geen dagblok in het
-    plan staat).
+    dagvenster_gedekt = True als er op de dag van de eerste keuze al een boost
+    binnen afternoon_from–afternoon_to zit (en er dus terecht geen dagblok in
+    het plan staat).
     """
     boost_cfg = (cfg.get("mqtt") or {}).get("dhw_boost") or {}
     # lazy import: dhw_boost importeert main, dus niet op module-niveau
@@ -176,10 +176,11 @@ def _dhw_boost_plan(
         )
         state = _trim_state_to(state, step_now)
 
-    # Heeft dit rollende 24-u-venster al een boost die binnen het dagvenster
-    # (afternoon_from–afternoon_to) startte? Dan is de dagvenster-verplichting
-    # al gedekt en plant dit plan (terecht) géén dagblok meer. Dat in de
-    # uitvoer melden, zodat "waar is het blok om 12:00?" geen verrassing is.
+    # Startte er op de KALENDERDAG van step_now al een boost binnen het
+    # dagvenster (afternoon_from–afternoon_to)? Dan is de dagvenster-
+    # verplichting van díe dag gedekt en plant dit plan (terecht) géén dagblok
+    # meer. Dat in de uitvoer melden, zodat "waar is het blok om 12:00?" geen
+    # verrassing is.
     dag_gedekt = (
         _count_boosts_last_24h(state, step_now) >= 1
         and _dagboost_in_venster(state, step_now, dag_from, dag_to)
@@ -567,7 +568,7 @@ def render_human(result: dict) -> str:
             if dhw.get("dagvenster_gedekt") and plan:
                 lines.append("")
                 lines.append(
-                    "  (er is in dit 24-u-venster al een boost binnen het dagvenster "
+                    "  (er is vandaag al een boost binnen het dagvenster "
                     f"{dhw.get('afternoon_from') or '12:00'}–"
                     f"{dhw.get('afternoon_to') or '23:00'} verstuurd; daarom staat "
                     "hier geen dagvenster-blok meer in — alleen nog het laatste "

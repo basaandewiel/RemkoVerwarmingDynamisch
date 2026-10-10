@@ -3,10 +3,10 @@
 
 Het plan volgt de échte staat van de watcher (de nog resterende boosts binnen
 het rollend 24-uursvenster, niet opnieuw vanaf nul), en gebruikt dezelfde
-beslisregels: min. min_gap_hours ná het einde van de vorige boost, één blok
-per cyclus (het verplichte dagblok) binnen afternoon_from–afternoon_to
-(default 12:00–23:00) zodra er al een boost in het venster zit zonder
-dagblok, het LAATSTE blok dat eindigt tussen last_block_end_from en
+beslisregels: min. min_gap_hours ná het einde van de vorige boost, per
+kalenderdag één boost (het verplichte dagblok) binnen
+afternoon_from–afternoon_to (default 12:00–23:00) zodra er op díe dag nog
+geen startte, het LAATSTE blok dat eindigt tussen last_block_end_from en
 last_block_end_to (default 19:00–08:00), en élk blok dat start vóór het
 ochtend-`last_block_end_to`.
 
@@ -119,11 +119,12 @@ class MainDhwPlanTest(unittest.TestCase):
         for a, b in zip(plan, plan[1:]):
             self.assertGreaterEqual(b["start"], a["end"] + timedelta(hours=6))
 
-    def test_plan_last_block_ends_between_1900_and_0800(self):
-        """Het LAATSTE (hier: resterende) blok eindigt tussen 19:00 en 08:00.
-        Met al een dagboost (20:00 gisteravond) is het niet aan het dagvenster
-        gebonden: het goedkoopste blok ná de gap dat in het avond/nacht-venster
-        eindigt is 18:00-19:00 — niet midden op de dag."""
+    def test_plan_yesterday_window_boost_does_not_cover_today(self):
+        """Dagvenster-dekking is per kalenderdag: de boost van gisteren 20:00
+        telt niet meer voor vandaag. Vandaag staat er dus nog een boost, en
+        dat is het verplichte dagvenster-blok: het goedkoopste uur in het
+        venster vandaag (18:00-19:00). De remaining boost-count blijft op 1
+        (recent=1): er komt geen extra derde boost van."""
         now = datetime.fromisoformat("2026-09-30T10:00:00+02:00")
         cfg = {"mqtt": {"dhw_boost": {}}}
         state = {
@@ -139,7 +140,7 @@ class MainDhwPlanTest(unittest.TestCase):
         self.assertEqual(end_from, "19:00")
         self.assertEqual(end_to, "08:00")
         self.assertEqual(len(plan), 1, "recent=1 -> nog één resterende boost")
-        self.assertFalse(plan[0]["dagblok"], "dagboost is al gedekt")
+        self.assertTrue(plan[0]["dagblok"], "vandaag mist nog een dagvenster-boost")
         start, end = plan[0]["start"], plan[0]["end"]
         self.assertEqual(start, datetime.fromisoformat("2026-09-30T18:00:00+02:00"))
         self.assertGreaterEqual(end, datetime.fromisoformat("2026-09-30T19:00:00+02:00"))
@@ -147,20 +148,20 @@ class MainDhwPlanTest(unittest.TestCase):
         self.assertLess(start, datetime.fromisoformat("2026-10-01T08:00:00+02:00"))
 
     def test_plan_reports_dagvenster_gedekt(self):
-        """De 8e return: staat er al een boost in dit 24-u-venster die binnen
-        het dagvenster startte, dan is de dagvenster-verplichting gedekt
-        (flag True) en staat er terecht geen dagblok meer in het plan."""
-        now = datetime.fromisoformat("2026-09-30T10:00:00+02:00")
+        """De 8e return: startte er VANDAAG al een boost binnen het dagvenster,
+        dan is de dagvenster-verplichting van vandaag gedekt (flag True) en
+        staat er terecht geen dagblok meer in het plan."""
+        now = datetime.fromisoformat("2026-09-30T20:00:00+02:00")
         cfg = {"mqtt": {"dhw_boost": {}}}
         state = {
-            "last_sent_start": "2026-09-29T20:00:00+02:00",
-            "last_sent_end": "2026-09-29T21:00:00+02:00",
-            "daily_boosts": {"2026-09-29": ["2026-09-29T20:00:00+02:00"]},
+            "last_sent_start": "2026-09-30T18:00:00+02:00",
+            "last_sent_end": "2026-09-30T19:00:00+02:00",
+            "daily_boosts": {"2026-09-30": ["2026-09-30T18:00:00+02:00"]},
         }
         plan, _, _, _, _, _, _, dag_gedekt = main._dhw_boost_plan(
             cfg, 15, now, _rows(now), state=state
         )
-        self.assertTrue(dag_gedekt, "boost gisteren 20:00 ligt binnen 12:00-23:00")
+        self.assertTrue(dag_gedekt, "boost vandaag 18:00 ligt binnen 12:00-23:00")
         self.assertTrue(plan)
         self.assertFalse(any(b.get("dagblok") for b in plan))
 
@@ -179,6 +180,27 @@ class MainDhwPlanTest(unittest.TestCase):
         )
         self.assertFalse(dag_gedekt, "nachtboost 02:00 ligt buiten 12:00-23:00")
         self.assertTrue(any(b.get("dagblok") for b in plan), "dagblok wél verplicht")
+
+    def test_plan_yesterday_window_boost_still_forces_today(self):
+        """Dekking is per kalenderdag: een boost van gisteren 14:00 (binnen
+        het venster) telt niet meer voor vandaag. Het plan plant vandaag dus
+        wél het verplichte dagblok (12:00), én niet ook nog een derde blok."""
+        now = datetime.fromisoformat("2026-09-30T11:00:00+02:00")
+        cfg = {"mqtt": {"dhw_boost": {}}}
+        state = {
+            "last_sent_start": "2026-09-29T14:00:00+02:00",
+            "last_sent_end": "2026-09-29T15:00:00+02:00",
+            "daily_boosts": {"2026-09-29": ["2026-09-29T14:00:00+02:00"]},
+        }
+        plan, _, _, _, _, _, _, dag_gedekt = main._dhw_boost_plan(
+            cfg, 15, now, _rows(now), state=state
+        )
+        self.assertFalse(dag_gedekt, "boost van gisteren dekt vandaag niet")
+        self.assertEqual(len(plan), 1, "recent=1 -> één resterende boost")
+        self.assertTrue(plan[0]["dagblok"])
+        self.assertEqual(
+            plan[0]["start"], datetime.fromisoformat("2026-09-30T12:00:00+02:00")
+        )
 
     def test_plan_last_block_starts_before_next_morning(self):
         """Het resterende blok na een eerdere dagboost blijft in de eerstvolgende

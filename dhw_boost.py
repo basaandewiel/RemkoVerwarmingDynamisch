@@ -366,26 +366,27 @@ def _dagvenster(anker: datetime, van_hhmm: str, tot_hhmm: str):
 
 
 def _dagboost_in_venster(
-    state: dict, now: datetime, van_hhmm: str, tot_hhmm: str
+    state: dict, anker: datetime, van_hhmm: str, tot_hhmm: str
 ) -> bool:
-    """Zit er binnen het rollende 24-uursvenster al een boost die binnen het
-    dagvenster [van, tot] (beide grenzen inbegrepen) startte? Dan is het
-    verplichte dagblok van deze cyclus al gedekt en wordt er niet opnieuw
-    één gepland. Bij een onbruikbaar venster: altijd 'gedekt' (nooit forceren)."""
+    """Is er al een boost die óp DE KALENDERDAG van `anker` binnen het
+    dagvenster [van, tot) startte? Dan is de dagvenster-verplichting van díe
+    dag al gedekt en wordt er niet nóg één gepland. Per kalenderdag dus: een
+    boost van gisteren dekt vandaag niet. Bij een onbruikbaar venster:
+    altijd 'gedekt' (nooit forceren)."""
     try:
         van_min = _hhmm_minuten(van_hhmm)
         tot_min = _hhmm_minuten(tot_hhmm)
     except (TypeError, ValueError):
         return True
-    cutoff = now - timedelta(hours=ROLLING_WINDOW_HOURS)
+    dag = anker.date()
     for s in _boost_starts(state):
-        if s < cutoff:
+        if s.date() != dag:
             continue
         minuten = s.hour * 60 + s.minute
         if van_min <= tot_min:
-            in_venster = van_min <= minuten <= tot_min
+            in_venster = van_min <= minuten < tot_min
         else:  # rond middernacht, bijv. 22:00-02:00
-            in_venster = minuten >= van_min or minuten <= tot_min
+            in_venster = minuten >= van_min or minuten < tot_min
         if in_venster:
             return True
     return False
@@ -445,12 +446,13 @@ def _next_boost_block(
     08:00 de volgende ochtend): de laatste opwarmperiode eindigt dan nooit
     midden op de dag.
 
-    Tenzij dit het verplichte DAGBLOK is: zit er al een boost in het
-    24-uursvenster maar géén daarvan binnen `afternoon_from`–`afternoon_to`
-    (default 12:00–23:00), dan wordt juist dáár gepland — één van de twee
-    opwarmmomenten per dag hoort in de middag/avond. Het eind-venster en de
-    start-grens hieronder gelden daar niet (dat venster begrenst het blok
-    immers al tot dezelfde dag).
+    Tenzij dit het verplichte DAGBLOK is: er is al een boost in het
+    24-uursvenster, maar op de kalenderdag van `earliest_start` startte nog
+    géén boost binnen `afternoon_from`–`afternoon_to` (default 12:00–23:00).
+    Dan wordt juist dáár gepland — elke dag hoort één van de twee
+    opwarmmomenten in de middag/avond. Het eind-venster en de start-grens
+    hieronder gelden daar niet (dat venster begrenst het blok immers al tot
+    dezelfde dag).
 
     Elke boost start bovendien vóór het ochtend-`last_block_end_to` (ook het
     vrij gekozen eerste blok). Zonder die grens glijdt het blok door naar het
@@ -497,17 +499,20 @@ def _next_boost_block(
     start_before = next_deadline(earliest_start, end_to)
 
     # Verplicht dagblok (afternoon_from–afternoon_to, default 12:00–23:00):
-    # er zit wél al een boost in het venster, maar géén binnen dat dagvenster.
-    # Dan wordt dit blok dáár gepland — pas ná een eerste boost, zodat het
-    # allereerste blok van een cyclus (en boosts_per_day=1) vrij blijft, en
-    # alleen als het venster op de dag van `earliest_start` nog past (aan het
-    # eind van de avond schuift de verplichting gewoon door naar morgen).
-    # Geen eind-venster en géén ochtend-start-grens: het dagvenster is zelf
-    # al de grens (het loopt immers nooit verder dan dezelfde dag).
+    # op de kalenderdag van `earliest_start` startte nog géén boost binnen dat
+    # dagvenster. Daarom wordt dit blok díe dag dáár gepland — pas ná een
+    # eerste boost, zodat het allereerste blok van een cyclus (en
+    # boosts_per_day=1) vrij blijft, en alleen als het venster op de dag van
+    # `earliest_start` nog past (aan het eind van de avond schuift de
+    # verplichting gewoon door naar morgen). Geen eind-venster en géén
+    # ochtend-start-grens: het dagvenster is zelf al de grens (het loopt
+    # immers nooit verder dan dezelfde dag).
     if (
         boosts_per_day >= 2
         and recent >= 1
-        and not _dagboost_in_venster(state, now, afternoon_from, afternoon_to)
+        and not _dagboost_in_venster(
+            state, earliest_start, afternoon_from, afternoon_to
+        )
     ):
         van, tot = _dagvenster(earliest_start, afternoon_from, afternoon_to)
         if van is not None:

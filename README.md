@@ -73,7 +73,7 @@ zonder API-key; `config.json` staat in `.gitignore`):
 | `mqtt.dhw_boost.min_gap_hours` | Minimum uren tussen het **einde van de vorige boost** en de **start van de volgende** (default 4). Zorgt dat een tweede opwarmperiode niet vlak na de eerste ligt. |
 | `mqtt.dhw_boost.block_hours` | Lengte van één SWW-boost-blok (default **1**, los van `optimization.block_hours` voor de ruimteverwarming). Een korte boost volstaat voor SWW: het water hoeft niet 3 uur na te verwarmen, en blokken passen zo makkelijker in het goedkope avond/nacht-venster. |
 | `mqtt.dhw_boost.last_block_end_from` / `last_block_end_to` | Het **laatste** boost-blok van het 24-uursvenster eindigt tussen deze tijden (default `"19:00"` en `"08:00"`, de volgende ochtend). Zonder deze eis glijdt de laatste opwarmperiode met het goedkoopste-blok-advies naar de volgende middag en is de boiler overdag 'leeg' in plaats van 's avonds/nachts vol. Daarnaast **start élk** boost-blok vóór `last_block_end_to`: het blok hoort in de eerstvolgende nacht te liggen en schuift niet door naar een goedkopere dag verderop. |
-| `mqtt.dhw_boost.afternoon_from` / `afternoon_to` | **Verplicht dagvenster-blok** (default `"12:00"` en `"23:00"`): één van de boosts per 24-uursvenster start binnen dit venster (beide grenzen inbegrepen) zodra er al een boost in het venster zit maar géén daarvan in dit tijdsvenster startte. Zo komt er altijd midden op de dag/avond warm water — als het buiten warm is (weinig verlies) en vaak als de dagprijzen door zonneschijn het laagst zijn. Het eerste blok van een cyclus en het enkele blok bij `boosts_per_day=1` blijven vrij; het eind-venster en de ochtend-start-grens gelden voor het dagvenster-blok niet. Aan het einde van de avond (ná `afternoon_to`) schuift de verplichting door naar de volgende dag. |
+| `mqtt.dhw_boost.afternoon_from` / `afternoon_to` | **Verplicht dagvenster-blok** (default `"12:00"` en `"23:00"`): **per kalenderdag** start één van de boosts binnen dit venster zodra er al een boost in het 24-u-venster zit én er op díe dag nog geen binnen dit tijdsvenster startte (een boost van gisteren telt niet meer; het startuur `afternoon_to` zelf telt ook niet — om 23:00 start is het avond/nacht-blok). Zo komt er altijd midden op de dag/avond warm water — als het buiten warm is (weinig verlies) en vaak als de dagprijzen door zonneschijn het laagst zijn. Het eerste blok van een cyclus en het enkele blok bij `boosts_per_day=1` blijven vrij; het eind-venster en de ochtend-start-grens gelden voor het dagvenster-blok niet. Aan het einde van de avond (ná `afternoon_to`) schuift de verplichting door naar de volgende dag. |
 | `mqtt.dhw_boost.qos` | QoS-niveau voor de boost/reset-commando's (default `1`). Met QoS 1 moet de broker de ontvangst bevestigen (PUBACK) **voordat** `VERSTUURD` wordt getoond; bij QoS 0 is er geen garantie. |
 | `mqtt.dhw_boost.retain` | Retain-flag op het commando (default `false`). Zet op `true` als je het laatste commando in MQTT Explorer zichtbaar wilt houden (elke nieuwe boost/reset overschrijft dan de vorige). |
 | `mqtt.dhw_boost.payload` | Wordt **afgeleid**: boost-setting = `heatpump.dhw.temperature` × 10 als hex, reset = `mqtt.dhw_boost.default_temperature` × 10 als hex (53 °C → `"0212"`, 40 °C → `"0190"`), in het formaat dat de gateway accepteert incl. `FORCE_RESPONSE`. Niet handmatig instellen. |
@@ -182,19 +182,23 @@ wacht de watcher tot het oudste blok er weer uit valt; een derde boost kan
 dus nooit binnen 24 uur na de eerste twee starten. Wordt een boost gemist,
 dan mag de eerstvolgende alsnog gaan.
 
-Zit er al een boost in het venster, maar **géén daarvan in het dagvenster
-`afternoon_from`–`afternoon_to`** (default 12:00–23:00), dan wordt het
-volgende blok daar verplicht gepland: één van de ~twee opwarmmomenten per dag
-valt zo altijd in de middag/avond. Het dagvenster-blok is het goedkoopste
-blok *binnen dat venster* (niet het hele-verkenning-optimum), zodat er altijd
-warm water klaar is voor de avond — ook op windstille uren — en de zonne-dip
-van de dagprijzen wordt meegepakt. Het geldt pas ná een eerste boost (het
-allereerste blok van een cyclus en het enkele blok bij `boosts_per_day=1`
-blijven vrij), en alleen als het venster op de dag van de eerstvolgende boost
-nog haalbaar is: om 23:30 is de verplichting voor vandaag voorbij en telt
-morgen opnieuw. Het eind-venster en de ochtend-start-grens hierboven gelden
-voor dit dagvenster-blok niet — het dagvenster begrenst het blok immers al
-tot dezelfde dag.
+Er is daarnaast een verplichting **per kalenderdag**: één van de
+opwarmmomenten start binnen het dagvenster `afternoon_from`–`afternoon_to`
+(default 12:00–23:00). Heeft de dag waarop de volgende boost gepland wordt
+nog géén boost binnen dat venster (een boost van gisteren telt dus niet
+meer), dan wordt dat blok daar verplicht gepland: elke dag valt zo één
+opwarmmoment in de middag/avond. Het dagvenster-blok is het goedkoopste
+blok *binnen dat venster* (niet het hele-verkenning-optimum), zodat er
+altijd warm water klaar is voor de avond — ook op windstille uren — en de
+zonne-dip van de dagprijzen wordt meegepakt. Een boost die om precies
+`afternoon_to` (23:00) start telt niet als dagvenster-blok: dat is het
+avond/nacht-blok. De regel geldt pas ná een eerste boost (het allereerste
+blok van een cyclus en het enkele blok bij `boosts_per_day=1` blijven vrij),
+en alleen als het venster op de dag van de eerstvolgende boost nog haalbaar
+is: om 23:30 is de verplichting voor vandaag voorbij en telt morgen opnieuw.
+Het eind-venster en de ochtend-start-grens hierboven gelden voor dit
+dagvenster-blok niet — het dagvenster begrenst het blok immers al tot
+dezelfde dag.
 
 De prijzen zijn pas een dag vooruit bekend, dus het goedkoopste blok van
 morgen kan goedkoper zijn dan dat van vanavond. Zonder meer zou de planner
@@ -369,7 +373,7 @@ Is `heatpump.dhw.enabled` aan, dan komt daar een aparte sectie
 beste 3-uursblok voor het opwarmen tot 53 °C (op basis van de SWW-COP)
 én de **geplande SWW-boosts**: de (resterende) opwarmmomenten die
 `dhw_boost` gaat uitsturen, telkens min. `min_gap_hours` uur na het
-einde van de vorige, één blok per cyclus verplicht binnen het dagvenster
+einde van de vorige, per kalenderdag één boost verplicht binnen het dagvenster
 `afternoon_from`–`afternoon_to` (het blok wordt dan gemarkeerd met
 `[dagvenster]`), met het laatste blok dat eindigt tussen
 `last_block_end_from` en `last_block_end_to` terwijl élk blok start vóór
