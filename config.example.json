@@ -71,6 +71,28 @@
       "qos": 1,
       "retain": false
     },
+    "dhw_comfort": {
+      "enabled": false,
+      "window_from": "07:00",
+      "window_to": "22:00",
+      "min_temp": 42,
+      "buffer_temp": 47,
+      "charge_temp": 52,
+      "off_temp": 35,
+      "tank_liters": 300,
+      "cooling_c_per_hour": 0.3,
+      "shower_drop_c": 5.0,
+      "shower_detect_c": 2.0,
+      "charge_block_hours": 1.0,
+      "lead_hours": 4.0,
+      "allow_outside_window": true,
+      "interval_minutes": 5,
+      "response_timeout_seconds": 8,
+      "rows_refresh_seconds": 1800,
+      "price_days_ahead": 3,
+      "qos": 1,
+      "retain": false
+    },
     "energy_log": {
       "enabled": true,
       "interval_seconds": 60,

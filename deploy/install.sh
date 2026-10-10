@@ -45,7 +45,7 @@ fi
 
 # 3) Systemd-units installeren (sudo)
 sd_ke="${USER_NAME//\//}"
-for UNIT in remko-sww-boost remko-energy-log; do
+for UNIT in remko-sww-boost remko-energy-log remko-dhw-comfort; do
     UNIT_SRC="$SCRIPT_DIR/$UNIT.service"
     UNIT_DST="/etc/systemd/system/$UNIT.service"
     echo ">> systemd-unit installeren ($UNIT_DST)"
@@ -59,8 +59,14 @@ echo ">> zelfcontrole: adviesberekening (--dry-run)"
 "$DIR/venv/bin/python3" "$DIR/dhw_boost.py" --dry-run || {
     echo "  (adviescrash? Maar de service staat al klaar; check config.json.)" >&2
 }
+"$DIR/venv/bin/python3" "$DIR/dhw_comfort.py" --dry-run --temp 45 || {
+    echo "  (comfortregeling kon niet rekenen; check config.json.)" >&2
+}
 
 # 5) Services starten
+#    remko-dhw-comfort wordt alleen GEINSTALLEERD, niet gestart: het stuurt
+#    hetzelfde register (1082) aan als remko-sww-boost, dus ze mogen niet
+#    tegelijk draaien. Kies er één (zie de hint onderaan).
 echo ">> services starten en inschakelen bij boot"
 sudo systemctl enable --now remko-sww-boost
 sudo systemctl enable --now remko-energy-log
@@ -69,5 +75,11 @@ echo "Klaar. Controle:"
 echo "  systemctl status remko-sww-boost remko-energy-log"
 echo "  journalctl -u remko-sww-boost -f"
 echo "  journalctl -u remko-energy-log -f"
+echo
+echo "-> Liever de SWW-comfortregeling dan de vaste boost? Zet in config.json"
+echo "   mqtt.dhw_boost.enabled op false en mqtt.dhw_comfort.enabled op true, en:"
+echo "     sudo systemctl disable --now remko-sww-boost"
+echo "     sudo systemctl enable --now remko-dhw-comfort"
+echo "     journalctl -u remko-dhw-comfort -f"
 echo
 echo "Vul eerst je ENTSO-E API-key in: nano $DIR/config.json  (daarna: sudo systemctl restart remko-sww-boost remko-energy-log)"

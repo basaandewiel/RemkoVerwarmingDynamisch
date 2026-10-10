@@ -1,0 +1,16 @@
+[Unit]
+Description=REMKO WKF SWW-comfortregeling (vat op peil 07:00-22:00 via MQTT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python3 dhw_comfort.py --watch
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

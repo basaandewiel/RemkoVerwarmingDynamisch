@@ -21,6 +21,11 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
    kWh-tellers van de gateway (`energy_log.py`): zo kun je de gekozen
    setpoint/boost-strategie later op échte kosten bijstellen in plaats van op
    een schatting.
+8. (optioneel, alternatief voor de boost) de **SWW-comfortregeling**
+   (`dhw_comfort.py`): houdt het boilervat tussen 07:00 en 22:00 op peil
+   (minimaal 42 °C, met een buffer van ~47 °C zodat er ná een douche nog
+   42 °C over is) en plant de opwarmmomenten op basis van de échte
+   vattemperatuur, de uurvoorspelling, de COP en de kwartierprijzen.
 
 Het resultaat kan optioneel via **MQTT** worden gepubliceerd (de MQTT-
 integratie van jouw warmtepomp draait al; dit programma publiceert alleen
@@ -378,6 +383,131 @@ Wat het script per run doet:
   blok). Testen zonder te versturen:
   `python3 dhw_boost.py --now "2026-09-23T11:45:00+02:00" --dry-run`,
   of `--watch --now ... --dry-run` voor één watch-cyclus.
+
+## SWW-comfortregeling (`dhw_comfort.py`) — vat op peil tussen de douchetijden
+
+Een **eenvoudiger alternatief** voor de vaste boost-planner hierboven. In
+plaats van "twee keer per dag een uur naar 53 °C" regelt dit programma op de
+**échte** vattemperatuur:
+
+- tussen `window_from` en `window_to` (default **07:00–22:00**) is het de
+  bedoeling dat er altijd genoeg warm water is om te douchen; in de praktijk
+  moet het vat **vóór de douche minimaal `min_temp` (default 42 °C)** zijn;
+- buiten dat venster mag het kouder zijn;
+- de opwarmmomenten worden gepland met de **uurvoorspelling
+  (buitentemperatuur)**, de **COP van de Remko** en de **kwartierprijzen**.
+
+**Waarom een buffer van 47 °C?** Een douchebeurt verlaagt het vat met ongeveer
+`shower_drop_c` (default 5 °C). Pas als het vat vóór de douche ≥ 47 °C is,
+blijft er ná de douche nog ≥ 42 °C over. De regeling mikt daarom in het venster
+op `buffer_temp` (default **47 °C**). Douchebeurten zijn onvoorspelbaar; de
+regeling leest continu de echte temperatuur, dus een onverwachte daling wordt
+meteen gezien en de volgende meting bijgeregeld — je hoeft **geen
+doucheschema** op te geven.
+
+**Zo werkt het** (elke `interval_minutes`, default 5 min):
+
+1. lees de SWW-temperatuur (register 5039) via MQTT;
+2. voorspel de temperatuur vooruit met de gemiddelde afkoeling
+   (`cooling_c_per_hour`, default 0,3 °C/h);
+3. zoek de eerstvolgende **deadline**: het moment binnen het venster waarop
+   het vat zonder bijwarmen onder de buffer zou zakken;
+4. valt die deadline binnen `lead_hours` (default 4 u), dan zoekt de regeling
+   in `[nu, deadline]` het **goedkoopste opwarmblok** op basis van
+   `prijs / COP(buitentemp.)` en zet op dat moment register **1082** naar
+   `charge_temp` (default 52 °C);
+5. buiten zo'n blok staat het setpoint op de ondergrens: `buffer_temp`
+   (47 °C) **binnen** het venster — de warmtepomp houdt het vat dan zelf op
+   peil — en `off_temp` (default 35 °C) daarbuiten, zodat het vat rustig
+   uitzakt;
+6. is het vat `charge_temp` of warmer, dan gaat het setpoint terug naar de
+   ondergrens (geen onnodig lang op 52 °C blijven hangen).
+
+Met `allow_outside_window: true` (default) mag er ook **buiten** 07:00–22:00
+worden opgewarmd: 's nachts is de stroom vaak goedkoper, en zo is het vat om
+07:00 al op temperatuur. De regeling begint pas met een blok als de deadline in
+de lead-horizon valt — anders zou ze direct ná een opwarming meteen weer het
+goedkoopste blok "nu" kiezen en het vat onnodig warm houden.
+
+**Config** (`mqtt.dhw_comfort`, zie `config.example.json`):
+
+| Sleutel | Default | Betekenis |
+|---|---|---|
+| `window_from` / `window_to` | `07:00` / `22:00` | comfortvenster (halve-open: het einduur telt niet mee) |
+| `min_temp` | `42` | harde ondergrens (°C) |
+| `buffer_temp` | `47` | streefwaarde in het venster (na één douche nog ≥ 42 °C) |
+| `charge_temp` | `52` | setpoint tijdens een opwarmblok |
+| `off_temp` | `35` | setpoint buiten het venster (geen actieve verwarming) |
+| `tank_liters` | `300` | boilerinhoud (alleen voor rapportage) |
+| `cooling_c_per_hour` | `0.3` | gemiddelde afkoeling per uur |
+| `shower_drop_c` | `5.0` | temperatuurdaling per douchebeurt |
+| `shower_detect_c` | `2.0` | extra daling t.o.v. de verwachte afkoeling = douche (alleen voor het log) |
+| `charge_block_hours` | `1.0` | lengte van een opwarmblok |
+| `lead_hours` | `4.0` | hoeveel uur vóór de deadline er mag worden opgewarmd |
+| `allow_outside_window` | `true` | mag er ook buiten 07:00–22:00 worden opgewarmd? |
+| `interval_minutes` | `5` | tijd tussen metingen/beslissingen |
+| `response_timeout_seconds` | `8` | wachten op het antwoord van de gateway |
+| `rows_refresh_seconds` | `1800` | hoe vaak prijzen/voorspelling worden opgehaald |
+| `price_days_ahead` | `3` | prijshorizon |
+| `qos` / `retain` | `1` / `false` | MQTT-optieken voor het setpoint-commando |
+
+Gebruik:
+
+```bash
+# één beslissing, en publiceren (echte vattemperatuur via MQTT):
+~/remkoverwarming/venv/bin/python3 dhw_comfort.py
+
+# niets publiceren, alleen tonen:
+~/remkoverwarming/venv/bin/python3 dhw_comfort.py --dry-run
+
+# testen met een vaste temperatuur en een vast tijdstip:
+~/remkoverwarming/venv/bin/python3 dhw_comfort.py \
+    --temp 45 --now 2026-10-11T08:00:00+02:00 --dry-run
+
+# als continue service:
+~/remkoverwarming/venv/bin/python3 dhw_comfort.py --watch
+```
+
+Het commando op register 1082 heeft hetzelfde wire-formaat als de boost
+(`{"FORCE_RESPONSE": true, "values": {"1082": "0208"}}` = 52 °C). Er wordt
+alleen gepubliceerd als het setpoint **verandert**; de statusfile
+`~/.cache/remko-wkf70/dhw_comfort_state.json` onthoudt het laatst gezette
+setpoint én of er een opwarmblok loopt (ook na een herstart).
+
+> **Belangrijk — niet tegelijk met `dhw_boost.py`.** Beide regelen register
+> 1082, dus ze mogen **niet naast elkaar** draaien. Wil je de comfortregeling
+> in plaats van de vaste boost, zet dan in `config.json`
+> `mqtt.dhw_boost.enabled` op `false` en `mqtt.dhw_comfort.enabled` op `true`,
+> en:
+>
+> ```bash
+> sudo systemctl disable --now remko-sww-boost
+> sudo systemctl enable --now remko-dhw-comfort
+> journalctl -u remko-dhw-comfort -f
+> ```
+
+`deploy/install.sh` installeert de unit `remko-dhw-comfort` al mee, maar start
+hem bewust **niet** automatisch (vanwege dat conflict). Handmatig:
+
+```ini
+# /etc/systemd/system/remko-dhw-comfort.service
+[Unit]
+Description=REMKO WKF SWW-comfortregeling (vat op peil 07:00-22:00 via MQTT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/remkoverwarming
+ExecStart=/home/pi/remkoverwarming/venv/bin/python3 dhw_comfort.py --watch
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Energie-logger (`energy_log.py`) — echte COP meten
 
