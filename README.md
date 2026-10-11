@@ -405,6 +405,30 @@ regeling leest continu de echte temperatuur, dus een onverwachte daling wordt
 meteen gezien en de volgende meting bijgeregeld — je hoeft **geen
 doucheschema** op te geven.
 
+> **Let op — de Remko heeft een dode zone (~4 °C).** De warmtepomp begint pas
+> met verwarmen als het verschil tussen de **gewenste** en de **gemeten**
+> temperatuur groot genoeg is (ervaring: ~4 °C). Het setpoint van 52 °C **komt
+> dus wél aan** (je ziet het in de Remko-webinterface), maar zit het vat maar
+> ~4-5 °C onder dat setpoint, dan onderneemt de Remko nog niets. Twee gevolgen
+> voor de config:
+>
+> 1. **`charge_temp` moet duidelijk boven het vat liggen** als een blok start,
+>    anders loopt het blok zonder effect. Vanaf de vloer is het gat
+>    `charge_temp − buffer_temp`: met de defaults 52 − 47 = 5 °C (net genoeg),
+>    met een lagere `buffer_temp` (bijv. 45) is het 7 °C en grijpt de Remko
+>    zeker aan. Meer zekerheid? Verhoog `charge_temp` (bijv. 55) — ten koste
+>    van de COP.
+> 2. **De vloer is geen harde ondergrens.** Tussen twee bijwarmingen zakt het
+>    vat tot ongeveer de dode zone **onder** de vloer voordat de Remko
+>    bijspringt. Houd `buffer_temp` daarom hoog genoeg: met `min_temp` 42 en
+>    `shower_drop_c` 5 is 47 °C de veilige keuze. Met `buffer_temp` 45 kan het
+>    vat richting ~41 °C zakken en na een douche zelfs ~40 °C — ónder de harde
+>    grens van 42 °C.
+>
+> Omdat de Remko pas bij een groot genoeg gat warmt, haalt het vat het
+> `charge_temp` soms niet binnen het blok. Dat is geen fout: het blok eindigt
+> gewoon op `charge_end` en de regeling laat het vat daarna weer uitzakken.
+
 **Zo werkt het** (elke `interval_minutes`, default 5 min):
 
 1. lees de SWW-temperatuur (register 5039) via MQTT;
@@ -435,8 +459,8 @@ goedkoopste blok "nu" kiezen en het vat onnodig warm houden.
 |---|---|---|
 | `window_from` / `window_to` | `07:00` / `22:00` | comfortvenster (halve-open: het einduur telt niet mee) |
 | `min_temp` | `42` | harde ondergrens (°C) |
-| `buffer_temp` | `47` | streefwaarde in het venster (na één douche nog ≥ 42 °C) |
-| `charge_temp` | `52` | setpoint tijdens een opwarmblok |
+| `buffer_temp` | `47` | streefwaarde in het venster (na één douche nog ≥ 42 °C; houd rekening met de Remko-dode zone ~4 °C) |
+| `charge_temp` | `52` | setpoint tijdens een opwarmblok; moet > ~4 °C (`deadband`) boven het vat liggen om de Remko te laten starten |
 | `off_temp` | `35` | setpoint buiten het venster (geen actieve verwarming) |
 | `tank_liters` | `300` | boilerinhoud (alleen voor rapportage) |
 | `cooling_c_per_hour` | `0.3` | gemiddelde afkoeling per uur |
