@@ -58,6 +58,7 @@ class TestComfortCfg(unittest.TestCase):
         self.assertEqual(c["cooling_c_per_hour"], 0.3)
         self.assertEqual(c["shower_drop_c"], 5.0)
         self.assertTrue(c["allow_outside_window"])
+        self.assertTrue(c["energy_aware_blocks"])
 
     def test_overrides(self):
         c = _cfg(buffer_temp=48, charge_temp=55, allow_outside_window=False)
@@ -183,6 +184,56 @@ class TestCheapestChargeBlock(unittest.TestCase):
         rows = _mk_rows(now, 12, price=0.20)
         b = dhw_comfort.cheapest_charge_block(rows, 15, self.c, now, _dt(1, 0, day=12))
         self.assertEqual(b["start"], now)
+
+
+class TestEnergyAwareBlocks(unittest.TestCase):
+    def setUp(self):
+        self.c = _cfg()
+        self.now = _dt(8, 0)
+        # 0,12 €/kWh (COP 3) tot 10:00, daarna 0,11 — het late blok is per
+        # eenheid goedkoper, maar moet een verder afgekoeld vat opwarmen.
+        self.rows = _mk_rows(
+            self.now, 24, price_fn=lambda d: 0.12 if d.hour < 10 else 0.11
+        )
+
+    def test_tank_kwh_per_c(self):
+        self.assertAlmostEqual(dhw_comfort.tank_kwh_per_c(300), 0.3488, places=4)
+
+    def test_block_total_cost_later_is_higher(self):
+        early = {"start": self.now, "mean_corrected": 0.12 / 3.0}
+        late = {"start": _dt(10, 0), "mean_corrected": 0.11 / 3.0}
+        c_early = dhw_comfort.block_total_cost(early, 48.0, self.now, self.c)
+        c_late = dhw_comfort.block_total_cost(late, 48.0, self.now, self.c)
+        # het late blok is per kWh goedkoper, maar in totaal duurder
+        self.assertLess(c_early, c_late)
+
+    def test_unit_price_picks_later(self):
+        # zonder T_now: terugval op de oude (eenheidsprijs-)rangschikking
+        b = dhw_comfort.cheapest_charge_block(
+            self.rows, 15, self.c, self.now, _dt(12, 0)
+        )
+        self.assertEqual(b["start"], _dt(10, 0))
+
+    def test_energy_aware_picks_earlier(self):
+        b = dhw_comfort.cheapest_charge_block(
+            self.rows, 15, self.c, self.now, _dt(12, 0), T_now=48.0
+        )
+        # eerder blok: eenheidsprijs iets hoger, maar totale kosten lager
+        self.assertEqual(b["start"], self.now)
+
+    def test_energy_aware_can_be_disabled(self):
+        c = _cfg(energy_aware_blocks=False)
+        b = dhw_comfort.cheapest_charge_block(
+            self.rows, 15, c, self.now, _dt(12, 0), T_now=48.0
+        )
+        self.assertEqual(b["start"], _dt(10, 0))
+
+    def test_block_total_cost_missing_price_is_infinite(self):
+        block = {"start": self.now, "mean_corrected": None}
+        self.assertEqual(
+            dhw_comfort.block_total_cost(block, 48.0, self.now, self.c),
+            float("inf"),
+        )
 
 
 class TestDetectShower(unittest.TestCase):

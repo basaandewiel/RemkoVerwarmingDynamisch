@@ -19,8 +19,10 @@ Hoe het werkt:
      buffer zou zakken (de "deadline");
   4. is die deadline dichtbij (`lead_hours`, default 4 u), dan wordt in het
      venster [nu, deadline] het **goedkoopste opwarmblok** gezocht op basis
-     van `prijs / COP(buitentemp.)` en gaat op dat moment het setpoint
-     (register 1082) naar `charge_temp` (default 52 °C);
+     van `prijs / COP(buitentemp.)` én de geschatte **totale** kosten
+     (eenheidsprijs × de benodigde warmte om het vat vanaf de voorspelde
+     starttemperatuur naar `charge_temp` te brengen); gaat op dat moment het
+     setpoint (register 1082) naar `charge_temp` (default 52 °C);
   5. buiten zo'n blok staat het setpoint op de ondergrens: `buffer_temp`
      (default 47 °C) binnen het venster — de warmtepomp houdt het vat dan
      zelf op peil — en `off_temp` (default 35 °C) daarbuiten.
@@ -109,6 +111,7 @@ def comfort_cfg(cfg: dict) -> dict:
         "cooling_c_per_hour": float(
             cc.get("cooling_c_per_hour", DEFAULT_COOLING_C_PER_HOUR)
         ),
+        "energy_aware_blocks": bool(cc.get("energy_aware_blocks", True)),
         "shower_drop_c": float(cc.get("shower_drop_c", DEFAULT_SHOWER_DROP_C)),
         "shower_detect_c": float(
             cc.get("shower_detect_c", DEFAULT_SHOWER_DETECT_C)
@@ -241,7 +244,56 @@ def _block_out(block: Optional[dict]) -> Optional[dict]:
         "mean_corrected": block.get("mean_corrected"),
         "mean_cop": block.get("mean_cop"),
         "mean_temp": block.get("mean_temp"),
+        "est_energy_kwh": block.get("est_energy_kwh"),
+        "est_total_eur": block.get("est_total_eur"),
     }
+
+
+def tank_kwh_per_c(tank_liters: float) -> float:
+    """Warmtecapaciteit van het vat in kWh per °C.
+
+    Water: c = 4,186 kJ/(kg·K); 1 L ≈ 1 kg; 1 kWh = 3600 kJ.
+    300 L -> 0,349 kWh/°C.
+    """
+    return tank_liters * 4.186 / 3600.0
+
+
+def block_energy_kwh(
+    block: dict,
+    T_now: float,
+    now: datetime,
+    ccfg: dict,
+) -> float:
+    """Geschatte warmte (kWh) om het vat bij de start van het blok naar
+    `charge_temp` te brengen, op basis van de voorspelde vat-temperatuur:
+
+        E(start) = tank_liters × 4,186/3600 × (charge_temp − T_voorspeld(start))
+        T_voorspeld(start) = T_nu − cooling × (start − nu)
+    """
+    hours = max(0.0, (block["start"] - now).total_seconds() / 3600.0)
+    t_start = T_now - ccfg["cooling_c_per_hour"] * hours
+    return tank_kwh_per_c(ccfg["tank_liters"]) * max(
+        0.0, ccfg["charge_temp"] - t_start
+    )
+
+
+def block_total_cost(
+    block: dict,
+    T_now: float,
+    now: datetime,
+    ccfg: dict,
+) -> float:
+    """Geschatte **totale** kosten van een opwarmblok (€).
+
+    = eenheidsprijs (€/kWh warmte) × de benodigde warmte (`block_energy_kwh`).
+    Zo weegt de afkoeling vóór het blok mee: een blok dat later begint moet een
+    verder afgekoeld vat opwarmen (meer kWh) en kan dus duurder uitvallen dan
+    een iets duurder maar eerder blok. Puur informatief/ordenend.
+    """
+    corrected = block.get("mean_corrected")
+    if corrected is None:
+        return float("inf")
+    return corrected * block_energy_kwh(block, T_now, now, ccfg)
 
 
 def cheapest_charge_block(
@@ -250,9 +302,16 @@ def cheapest_charge_block(
     ccfg: dict,
     now: datetime,
     deadline: datetime,
+    T_now: Optional[float] = None,
 ) -> Optional[dict]:
-    """Het goedkoopste opwarmblok (op `prijs / COP`) dat vóór `deadline`
-    eindigt en niet vóór `now` begint.
+    """Het goedkoopste opwarmblok dat vóór `deadline` eindigt en niet vóór
+    `now` begint.
+
+    Standaard op `prijs / COP` (€/kWh warmte). Met `energy_aware_blocks` (en een
+    bekende `T_now`) wordt elk kandidaat-blok daarnaast gewogen met de geschatte
+    **totale** kosten (`block_total_cost`): een later blok moet een verder
+    afgekoeld vat opwarmen en weegt dan zwaarder mee. Zo kan een iets duurder
+    maar eerder blok winnen als het per saldo goedkoper is.
 
     Past er geen volledig blok meer vóór de deadline, dan begint het blok
     meteen (beter een fractie te laat dan de buffer missen). Zonder
@@ -276,11 +335,26 @@ def cheapest_charge_block(
             earliest_start=now,
             start_before=start_before,
         )
-        for b in blocks:
-            if not ccfg["allow_outside_window"] and not in_window(b["start"], ccfg):
-                continue
-            return b
-        return None
+        eligible = [
+            b
+            for b in blocks
+            if ccfg["allow_outside_window"] or in_window(b["start"], ccfg)
+        ]
+        if not eligible:
+            return None
+        energy_ok = (
+            ccfg.get("energy_aware_blocks", True)
+            and T_now is not None
+            and ccfg["cooling_c_per_hour"] > 0
+        )
+        if energy_ok:
+            eligible.sort(key=lambda b: block_total_cost(b, T_now, now, ccfg))
+        chosen = eligible[0]
+        if T_now is not None and ccfg["cooling_c_per_hour"] > 0:
+            chosen = dict(chosen)
+            chosen["est_energy_kwh"] = block_energy_kwh(chosen, T_now, now, ccfg)
+            chosen["est_total_eur"] = block_total_cost(chosen, T_now, now, ccfg)
+        return chosen
     # deadline te dichtbij voor een volledig blok: meteen beginnen
     return _immediate_block(now, block_hours)
 
@@ -428,7 +502,7 @@ def decide(
         out["charge_end"] = None
         return out
 
-    block = cheapest_charge_block(rows, granularity_min, ccfg, now, deadline)
+    block = cheapest_charge_block(rows, granularity_min, ccfg, now, deadline, T_now)
     out["block"] = _block_out(block)
     if block is None:
         out["status"] = "idle"
@@ -700,13 +774,14 @@ def _status_log(out: dict, shower: Optional[float]) -> str:
         parts.append(f"warm genoeg -> setpoint {out['setpoint_temp']:g} °C")
     elif status == "schedule" and out.get("block"):
         b = out["block"]
+        detail = ""
+        if b.get("mean_corrected") is not None:
+            detail = f" ({b['mean_corrected']:.4f} €/kWh warmte, COP {b['mean_cop']:.2f}"
+            if b.get("est_total_eur") is not None:
+                detail += f", ~{b['est_energy_kwh']:.2f} kWh ≈ €{b['est_total_eur']:.2f}"
+            detail += ")"
         parts.append(
-            f"opwarmblok gepland {_fmt_iso(b['start'])}-{_fmt_iso(b['end'])}"
-            + (
-                f" ({b['mean_corrected']:.4f} €/kWh warmte, COP {b['mean_cop']:.2f})"
-                if b.get("mean_corrected") is not None
-                else ""
-            )
+            f"opwarmblok gepland {_fmt_iso(b['start'])}-{_fmt_iso(b['end'])}" + detail
         )
     elif status == "wait":
         parts.append(f"wacht; deadline {_fmt_iso(out.get('deadline'))}")
@@ -781,10 +856,16 @@ def render_human(out: dict) -> List[str]:
         start_txt = app.fmt_dt(datetime.fromisoformat(b["start"]))
         end_txt = app.fmt_dt(datetime.fromisoformat(b["end"]))
         if b.get("mean_corrected") is not None:
+            est = ""
+            if b.get("est_energy_kwh") is not None and b.get("est_total_eur") is not None:
+                est = (
+                    f", ~{app.nl(b['est_energy_kwh'], 2)} kWh "
+                    f"≈ €{app.nl(b['est_total_eur'], 2)}"
+                )
             lines.append(
                 f"Opwarmblok: {start_txt} – {end_txt} "
                 f"(COP {app.nl(b['mean_cop'], 2)}, "
-                f"{app.nl(b['mean_corrected'], 4)} €/kWh warmte)"
+                f"{app.nl(b['mean_corrected'], 4)} €/kWh warmte{est})"
             )
         else:
             lines.append(f"Opwarmblok: {start_txt} – {end_txt}")

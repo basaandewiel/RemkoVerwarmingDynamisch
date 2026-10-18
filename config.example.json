@@ -81,6 +81,7 @@
       "off_temp": 35,
       "tank_liters": 300,
       "cooling_c_per_hour": 0.3,
+      "energy_aware_blocks": true,
       "shower_drop_c": 5.0,
       "shower_detect_c": 2.0,
       "charge_block_hours": 1.0,

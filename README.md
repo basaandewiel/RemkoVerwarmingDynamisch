@@ -438,8 +438,8 @@ doucheschema** op te geven.
    het vat zonder bijwarmen onder de buffer zou zakken;
 4. valt die deadline binnen `lead_hours` (default 4 u), dan zoekt de regeling
    in `[nu, deadline]` het **goedkoopste opwarmblok** op basis van
-   `prijs / COP(buitentemp.)` en zet op dat moment register **1082** naar
-   `charge_temp` (default 52 °C);
+   `prijs / COP(buitentemp.)` **én de geschatte totale kosten** (zie hieronder)
+   en zet op dat moment register **1082** naar `charge_temp` (default 52 °C);
 5. buiten zo'n blok staat het setpoint op de ondergrens: `buffer_temp`
    (47 °C) **binnen** het venster — de warmtepomp houdt het vat dan zelf op
    peil — en `off_temp` (default 35 °C) daarbuiten, zodat het vat rustig
@@ -453,6 +453,24 @@ worden opgewarmd: 's nachts is de stroom vaak goedkoper, en zo is het vat om
 de lead-horizon valt — anders zou ze direct ná een opwarming meteen weer het
 goedkoopste blok "nu" kiezen en het vat onnodig warm houden.
 
+**Energie-gewogen blokkeuze** (`energy_aware_blocks`, default `true`). Een blok
+kiezen op alleen `prijs / COP` negeert dat een **later** blok vanaf een verder
+afgekoeld vat moet opwarmen, dus méér kWh nodig heeft. De regeling weegt daarom
+elk kandidaat-blok met de **geschatte totale kosten**:
+
+```
+E(start)      = tank_liters × 4,186/3600 × (charge_temp − T_voorspeld(start))
+T_voorspeld   = T_nu − cooling_c_per_hour × (start − nu)
+totale kosten = (prijs / COP) × E(start)
+```
+
+Hierdoor kan een blok dat een uur **eerder** begint (iets hogere eenheidsprijs,
+maar veel minder bijwarmte) per saldo goedkoper zijn dan een later, per kWh
+goedkoper blok — en wordt dus gekozen. Zet `energy_aware_blocks` op `false` voor
+de oude, puur op eenheidsprijs gebaseerde keuze. (Dit gebruikt `tank_liters`;
+zonder bekende vattemperatuur valt de regeling automatisch terug op de
+eenheidsprijs.)
+
 **Config** (`mqtt.dhw_comfort`, zie `config.example.json`):
 
 | Sleutel | Default | Betekenis |
@@ -462,8 +480,9 @@ goedkoopste blok "nu" kiezen en het vat onnodig warm houden.
 | `buffer_temp` | `47` | streefwaarde in het venster (na één douche nog ≥ 42 °C; houd rekening met de Remko-dode zone ~4 °C) |
 | `charge_temp` | `52` | setpoint tijdens een opwarmblok; moet > ~4 °C (`deadband`) boven het vat liggen om de Remko te laten starten |
 | `off_temp` | `35` | setpoint buiten het venster (geen actieve verwarming) |
-| `tank_liters` | `300` | boilerinhoud (alleen voor rapportage) |
-| `cooling_c_per_hour` | `0.3` | gemiddelde afkoeling per uur |
+| `tank_liters` | `300` | boilerinhoud — gebruikt voor de energie-gewogen blokkeuze |
+| `cooling_c_per_hour` | `0.3` | gemiddelde afkoeling per uur (deadline + energie-weging) |
+| `energy_aware_blocks` | `true` | weeg blokken op totale kosten (eenheidsprijs × benodigde kWh incl. afkoeling) i.p.v. alleen `prijs/COP` |
 | `shower_drop_c` | `5.0` | temperatuurdaling per douchebeurt |
 | `shower_detect_c` | `2.0` | extra daling t.o.v. de verwachte afkoeling = douche (alleen voor het log) |
 | `charge_block_hours` | `1.0` | lengte van een opwarmblok |
