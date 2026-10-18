@@ -17,7 +17,7 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
    opgewarmd tot een hogere temperatuur (standaard 53 °C), wat een veel lagere
    COP geeft — en dus een eigen (soms ander) goedkoopste blok.
    Dit wordt berekend met een aparte COP-curve, zie `heatpump.dhw` in de config.
-7. (optioneel) het **meten van de echte COP** per SWW-opwarmepisode via de
+7. (optioneel) het **meten van de echte COP** per dag en setpoint via de
    kWh-tellers van de gateway (`energy_log.py`): zo kun je de gekozen
    setpoint/boost-strategie later op échte kosten bijstellen in plaats van op
    een schatting.
@@ -571,8 +571,11 @@ elektrische delta is vrijwel volledig aan SWW toe te rekenen.
 # twijfel je over topic/registers: 30 s alle MQTT-berichten onder de node tonen:
 ~/remkoverwarming/venv/bin/python3 energy_log.py --dump
 
-# samenvatting per SWW-opwarmepisode (ΔDHW, ΔEl, COP, buitentemp, kosten, setpoint):
+# samenvatting per dag en per setpoint (ΔDHW, ΔEl, COP, kosten):
 ~/remkoverwarming/venv/bin/python3 energy_log.py --report
+
+# idem, maar met elke losse tellertik als detailregel erbij:
+~/remkoverwarming/venv/bin/python3 energy_log.py --report --episodes
 ```
 
 De CSV (`~/.cache/remko-wkf70/dhw_energy.csv`) heeft de vaste kolommen
@@ -586,17 +589,32 @@ begint met de nieuwe kolommen — de regels blijven zo altijd uitgelijnd.
 
 Met `log_price` (default aan) schrijft de logger bij elke sample de **all-in
 stroomprijs** mee (dezelfde bron + `price_adjustments` als het advies). `--report`
-rekent dan per episode de kosten uit (`Δelektrisch × tarief` van het bijbehorende
-interval) én groepeert op **setpoint** (register 1082: de boost-temperatuur of de
-basis-stand). Zo zie je na een paar weken direct welke strategie het goedkoopst
-is:
+rekent dan de kosten uit (`Δelektrisch × tarief` van het bijbehorende interval) en
+groepeert de resultaten **per dag én per setpoint** (register 1082: de
+comfort-/boost-temperatuur of de basis-stand). Zo zie je na een paar weken direct
+welke strategie het goedkoopst is:
 
 ```
-  Totaal: ΔDHW 12.3 kWh  ΔEl 3.9 kWh  gem. COP 3.15  kosten €0.98 (gem. 0.251 €/kWh)
-  Per setpoint:
-        53 °C:   8 episodes  ΔDHW   12.3 kWh  ΔEl   3.9 kWh  COP 3.15  kosten €0.98
-        45 °C:   9 episodes  ΔDHW   13.1 kWh  ΔEl   3.4 kWh  COP 3.85  kosten €0.92
+  Totaal: ΔDHW 68.0 kWh  ΔEl 20.1 kWh  gem. COP 3.38  kosten €5.05 (gem. 0.251 €/kWh)
+  Per dag:
+    za 11-10  (  8 episodes)  ΔDHW   25.4 kWh  ΔEl   7.5 kWh  COP 3.39  kosten €1.88
+            52 °C:   6 episodes  ΔDHW   18.4 kWh  ΔEl   5.5 kWh  COP 3.35  kosten €1.40
+            45 °C:   2 episodes  ΔDHW    7.0 kWh  ΔEl   2.0 kWh  COP 3.50  kosten €0.48
+    zo 12-10  (  9 episodes)  ΔDHW   29.5 kWh  ΔEl   8.7 kWh  COP 3.39  kosten €2.18
+            50 °C:   9 episodes  ΔDHW   29.5 kWh  ΔEl   8.7 kWh  COP 3.39  kosten €2.18
+  Per setpoint (totaal):
+        52 °C:   6 episodes  ΔDHW   18.4 kWh  ΔEl   5.5 kWh  COP 3.35  kosten €1.40
+        50 °C:   9 episodes  ΔDHW   29.5 kWh  ΔEl   8.7 kWh  COP 3.39  kosten €2.18
+        45 °C:   2 episodes  ΔDHW    7.0 kWh  ΔEl   2.0 kWh  COP 3.50  kosten €0.48
 ```
+
+> **Let op — resolutie van de tellers.** De kWh-tellers van de gateway stappen in
+> **hele kWh**. Een losse tellertik heeft dus ΔDHW = 1 kWh en ΔEl = 0 of 1 kWh →
+> een schijn-COP van `?` of 20+. Daarom toont `--report` standaard de **dag- en
+> setpoint-totalen** (daar is ΔEl groot genoeg); de losse tikken zijn er alleen met
+> `--episodes`. Blijft de totale COP onrealistisch hoog (bijv. >10), controleer dan
+> met `energy_log.py --once` of register **5105** wel echt het compressorverbruik
+> meet — anders klopt de noemer niet en is de COP niet bruikbaar.
 
 Let op: lagere setpoint = hogere COP, maar de boiler koelt ook sneller af →
 vaker spontaan herverwarmen. De **tijdreeks** (niet alleen de boosts) vangt die

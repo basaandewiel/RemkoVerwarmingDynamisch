@@ -26,7 +26,7 @@ Gebruik:
   python3 energy_log.py --once            # één sample lezen en tonen (verifiëren)
   python3 energy_log.py --dump            # 30 s alle MQTT-berichten tonen
   python3 energy_log.py                   # als service: elke 60 s een CSV-regel
-  python3 energy_log.py --report          # samenvatting per SWW-opwarmepisode
+  python3 energy_log.py --report          # samenvatting per dag/setpoint (+ --episodes)
 """
 
 from __future__ import annotations
@@ -391,6 +391,90 @@ def group_by_setpoint(episodes: List[dict]) -> List[Tuple[Optional[float], List[
     return [(k, groups[k]) for k in order]
 
 
+def _day_of(timestamp) -> Optional[datetime]:
+    """De kalenderdag (lokaal) van een ISO-timestamp, of None."""
+    try:
+        return datetime.fromisoformat(str(timestamp))
+    except (ValueError, TypeError):
+        return None
+
+
+def _sp_sort_key(setpoint: Optional[float]):
+    return (setpoint is None, setpoint if setpoint is not None else 0.0)
+
+
+def aggregate_by_day(episodes: List[dict]) -> List[dict]:
+    """Groepeer episodes per **kalenderdag** en per **setpoint**.
+
+    De energietellers (register 5105/5376) stappen in hele kWh, dus elke losse
+    tellertik was een 'episode' met ΔDHW van 1 kWh en een COP van 0/oneindig.
+    Door te sommeren per dag (en per setpoint binnen die dag) worden ΔDHW en
+    ΔEl groot genoeg voor een zinvolle COP = ΔDHW / ΔEl en de kosten.
+
+    Geeft per dag een dict met de totalen en een `by_setpoint`-uitsplitsing.
+    """
+    days: Dict[Optional[str], dict] = {}
+    order: List[Optional[str]] = []
+    for e in episodes:
+        ts = _day_of(e.get("start"))
+        key = ts.date().isoformat() if ts is not None else None
+        if key not in days:
+            days[key] = {
+                "date": key,
+                "label": f"{app.DUTCH_DAYS[ts.weekday()][:2]} {ts:%d-%m}" if ts else "onbekend",
+                "episodes": 0,
+                "dhw_kwh": 0.0,
+                "el_kwh": 0.0,
+                "cost_eur": 0.0,
+                "cost_seen": False,
+                "by_setpoint": {},
+            }
+            order.append(key)
+        d = days[key]
+        d["episodes"] += 1
+        d["dhw_kwh"] += e["dhw_kwh"]
+        d["el_kwh"] += e["el_kwh"]
+        if e["cost_eur"] is not None:
+            d["cost_eur"] += e["cost_eur"]
+            d["cost_seen"] = True
+
+        sp = e.get("setpoint")
+        b = d["by_setpoint"].setdefault(
+            sp,
+            {
+                "setpoint": sp,
+                "episodes": 0,
+                "dhw_kwh": 0.0,
+                "el_kwh": 0.0,
+                "cost_eur": 0.0,
+                "cost_seen": False,
+            },
+        )
+        b["episodes"] += 1
+        b["dhw_kwh"] += e["dhw_kwh"]
+        b["el_kwh"] += e["el_kwh"]
+        if e["cost_eur"] is not None:
+            b["cost_eur"] += e["cost_eur"]
+            b["cost_seen"] = True
+
+    out: List[dict] = []
+    for key in order:
+        d = days[key]
+        d["cop"] = (d["dhw_kwh"] / d["el_kwh"]) if d["el_kwh"] > 0 else None
+        if not d["cost_seen"]:
+            d["cost_eur"] = None
+        subs = []
+        for sp in sorted(d["by_setpoint"], key=_sp_sort_key):
+            b = d["by_setpoint"][sp]
+            b["cop"] = (b["dhw_kwh"] / b["el_kwh"]) if b["el_kwh"] > 0 else None
+            if not b["cost_seen"]:
+                b["cost_eur"] = None
+            subs.append(b)
+        d["by_setpoint"] = subs
+        out.append(d)
+    return out
+
+
 def _minutes_between(a, b) -> Optional[float]:
     try:
         da = datetime.fromisoformat(str(a))
@@ -400,7 +484,8 @@ def _minutes_between(a, b) -> Optional[float]:
         return None
 
 
-def render_report(episodes: List[dict], rows: List[dict]) -> List[str]:
+def render_report(episodes: List[dict], rows: List[dict],
+                  show_episodes: bool = False) -> List[str]:
     lines = [f"SWW-opwarmepisodes: {len(episodes)} (uit {len(rows)} samples)"]
     if not episodes:
         lines.append("  (nog geen DHW-tellerstijging gezien — draait de logger al?)")
@@ -411,20 +496,22 @@ def render_report(episodes: List[dict], rows: List[dict]) -> List[str]:
     overall = (total_dhw / total_el) if total_el > 0 else None
     has_cost = any(e["cost_eur"] is not None for e in episodes)
 
-    for e in episodes:
-        cop = f"{e['cop']:.2f}" if e["cop"] is not None else "?"
-        out = f"{e['out_mean']:.1f} °C" if e["out_mean"] is not None else "?"
-        mins = f"{e['minutes']:.0f} min" if e["minutes"] is not None else "?"
-        extra = ""
-        if e["cost_eur"] is not None:
-            extra += f"  kosten €{e['cost_eur']:.3f}"
-        if e["setpoint"] is not None:
-            extra += f"  setpoint {e['setpoint']:g} °C"
-        lines.append(
-            f"  {e['start']} -> {e['end']}  ({mins})  "
-            f"ΔDHW {e['dhw_kwh']:.2f} kWh  ΔEl {e['el_kwh']:.2f} kWh  "
-            f"COP {cop}  buiten {out}{extra}"
-        )
+    # Detail: elke losse tellertik. Standaard verborgen (te ruizig: 1 kWh per regel).
+    if show_episodes:
+        for e in episodes:
+            cop = f"{e['cop']:.2f}" if e["cop"] is not None else "?"
+            out = f"{e['out_mean']:.1f} °C" if e["out_mean"] is not None else "?"
+            mins = f"{e['minutes']:.0f} min" if e["minutes"] is not None else "?"
+            extra = ""
+            if e["cost_eur"] is not None:
+                extra += f"  kosten €{e['cost_eur']:.3f}"
+            if e["setpoint"] is not None:
+                extra += f"  setpoint {e['setpoint']:g} °C"
+            lines.append(
+                f"  {e['start']} -> {e['end']}  ({mins})  "
+                f"ΔDHW {e['dhw_kwh']:.2f} kWh  ΔEl {e['el_kwh']:.2f} kWh  "
+                f"COP {cop}  buiten {out}{extra}"
+            )
 
     overall_txt = f"{overall:.2f}" if overall is not None else "?"
     total_line = (
@@ -437,17 +524,36 @@ def render_report(episodes: List[dict], rows: List[dict]) -> List[str]:
         eff_txt = f"{eff:.3f}" if eff is not None else "?"
         total_line += f"  kosten €{total_cost:.2f} (gem. {eff_txt} €/kWh)"
     lines.append(total_line)
-    if not has_cost:
-        lines.append(
-            "  (geen prijzen in de CSV — zet mqtt.energy_log.log_price op true "
-            "voor de kostanalyse)"
-        )
-        return lines
 
-    # Per setpoint: hiermee vergelijk je de strategieën (bv. 53 vs. 48 vs. 45 °C)
+    # Per dag: de tellers stappen in hele kWh, dus pas dagtotalen geven een
+    # zinvolle COP. Elk setpoint binnen de dag wordt apart uitgesplitst.
+    days = aggregate_by_day(episodes)
+    lines.append("  Per dag:")
+    for d in days:
+        cop_txt = f"{d['cop']:.2f}" if d["cop"] is not None else "?"
+        day_line = (
+            f"    {d['label']}  ({d['episodes']:>3} episodes)  "
+            f"ΔDHW {d['dhw_kwh']:6.1f} kWh  ΔEl {d['el_kwh']:5.1f} kWh  COP {cop_txt}"
+        )
+        if d["cost_eur"] is not None:
+            day_line += f"  kosten €{d['cost_eur']:.2f}"
+        lines.append(day_line)
+        for b in d["by_setpoint"]:
+            label = f"{b['setpoint']:g} °C" if b["setpoint"] is not None else "onbekend"
+            b_cop = f"{b['cop']:.2f}" if b["cop"] is not None else "?"
+            sub = (
+                f"        {label:>9}: {b['episodes']:>3} episodes  "
+                f"ΔDHW {b['dhw_kwh']:6.1f} kWh  ΔEl {b['el_kwh']:5.1f} kWh  COP {b_cop}"
+            )
+            if b["cost_eur"] is not None:
+                sub += f"  kosten €{b['cost_eur']:.2f}"
+            lines.append(sub)
+
+    # Per setpoint over alle dagen: hiermee vergelijk je de strategieën
+    # (bv. 53 vs. 48 vs. 45 °C).
     groups = group_by_setpoint(episodes)
     if any(k is not None for k, _ in groups):
-        lines.append("  Per setpoint:")
+        lines.append("  Per setpoint (totaal):")
         for sp, eps in groups:
             g_dhw = sum(e["dhw_kwh"] for e in eps)
             g_el = sum(e["el_kwh"] for e in eps)
@@ -462,6 +568,12 @@ def render_report(episodes: List[dict], rows: List[dict]) -> List[str]:
             if g_costs:
                 part += f"  kosten €{sum(g_costs):.2f}"
             lines.append(part)
+
+    if not has_cost:
+        lines.append(
+            "  (geen prijzen in de CSV — zet mqtt.energy_log.log_price op true "
+            "voor de kostanalyse)"
+        )
     return lines
 
 
@@ -743,6 +855,8 @@ def main(argv: List[str] | None = None) -> int:
         help="N seconden alle MQTT-berichten tonen (default 30)",
     )
     ap.add_argument("--report", action="store_true", help="samenvatting van het CSV-bestand")
+    ap.add_argument("--episodes", action="store_true",
+                    help="bij --report: ook elke losse tellertik tonen (detail)")
     ap.add_argument("--handshake", action="store_true",
                     help="de 3 handshake-registers meesturen in de query")
     ap.add_argument("--no-price", action="store_true",
@@ -780,7 +894,7 @@ def main(argv: List[str] | None = None) -> int:
         if args.json:
             print(json.dumps(episodes, ensure_ascii=False, indent=2, default=str))
         else:
-            print("\n".join(render_report(episodes, rows)))
+            print("\n".join(render_report(episodes, rows, show_episodes=args.episodes)))
         return 0
 
     if not mqtt_cfg.get("enabled"):

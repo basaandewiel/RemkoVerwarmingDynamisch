@@ -276,6 +276,81 @@ class TestSummarizeEpisodes(unittest.TestCase):
         self.assertTrue(any("Per setpoint" in ln for ln in lines))
 
 
+class TestAggregateByDay(unittest.TestCase):
+    def _ep(self, start, dhw, el, cost, setpoint):
+        return {
+            "start": start,
+            "dhw_kwh": dhw,
+            "el_kwh": el,
+            "cost_eur": cost,
+            "setpoint": setpoint,
+        }
+
+    def test_groups_by_day_and_setpoint(self):
+        eps = [
+            self._ep("2026-10-11T08:00:00+02:00", 5.0, 1.0, 0.20, 52.0),
+            self._ep("2026-10-11T09:00:00+02:00", 5.0, 1.0, 0.20, 52.0),
+            self._ep("2026-10-11T10:00:00+02:00", 4.0, 2.0, 0.40, 45.0),
+            self._ep("2026-10-12T08:00:00+02:00", 6.0, 2.0, 0.40, 52.0),
+        ]
+        days = energy_log.aggregate_by_day(eps)
+
+        self.assertEqual([d["date"] for d in days],
+                         ["2026-10-11", "2026-10-12"])
+        d0 = days[0]
+        self.assertEqual(d0["episodes"], 3)
+        self.assertAlmostEqual(d0["dhw_kwh"], 14.0)
+        self.assertAlmostEqual(d0["el_kwh"], 4.0)
+        self.assertAlmostEqual(d0["cop"], 3.5)
+        self.assertAlmostEqual(d0["cost_eur"], 0.80)
+        subs = {b["setpoint"]: b for b in d0["by_setpoint"]}
+        self.assertAlmostEqual(subs[52.0]["dhw_kwh"], 10.0)
+        self.assertAlmostEqual(subs[52.0]["cop"], 5.0)
+        self.assertAlmostEqual(subs[45.0]["cop"], 2.0)
+
+    def test_setpoints_sorted_with_unknown_last(self):
+        eps = [
+            self._ep("2026-10-11T08:00:00+02:00", 1.0, 1.0, None, None),
+            self._ep("2026-10-11T09:00:00+02:00", 1.0, 1.0, None, 52.0),
+            self._ep("2026-10-11T10:00:00+02:00", 1.0, 1.0, None, 45.0),
+        ]
+        days = energy_log.aggregate_by_day(eps)
+        self.assertEqual([b["setpoint"] for b in days[0]["by_setpoint"]],
+                         [45.0, 52.0, None])
+
+    def test_cop_none_without_electricity(self):
+        days = energy_log.aggregate_by_day(
+            [self._ep("2026-10-11T08:00:00+02:00", 2.0, 0.0, 0.0, 52.0)]
+        )
+        self.assertIsNone(days[0]["cop"])
+        self.assertIsNone(days[0]["by_setpoint"][0]["cop"])
+
+    def test_cost_none_when_no_price_seen(self):
+        days = energy_log.aggregate_by_day(
+            [self._ep("2026-10-11T08:00:00+02:00", 2.0, 1.0, None, 52.0)]
+        )
+        self.assertIsNone(days[0]["cost_eur"])
+        self.assertIsNone(days[0]["by_setpoint"][0]["cost_eur"])
+
+    def test_unknown_day_grouped(self):
+        days = energy_log.aggregate_by_day([self._ep("t0", 1.0, 1.0, None, None)])
+        self.assertEqual(len(days), 1)
+        self.assertIsNone(days[0]["date"])
+        self.assertEqual(days[0]["label"], "onbekend")
+
+    def test_report_shows_per_day_and_hides_episodes(self):
+        rows = [
+            _rowp("2026-10-11T12:00:00+02:00", 100.0, 200.0, 0.10, 52.0),
+            _rowp("2026-10-11T12:30:00+02:00", 101.0, 200.4, 0.10, 52.0),
+        ]
+        eps = energy_log.summarize_episodes(rows)
+        lines = energy_log.render_report(eps, rows)
+        self.assertTrue(any("Per dag:" in ln for ln in lines))
+        self.assertFalse(any(ln.strip().startswith("2026-10-11T") for ln in lines))
+        detail = energy_log.render_report(eps, rows, show_episodes=True)
+        self.assertTrue(any(ln.strip().startswith("2026-10-11T") for ln in detail))
+
+
 class _FakeClient:
     def __init__(self):
         self.published = []
