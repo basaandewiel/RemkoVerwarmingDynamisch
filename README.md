@@ -432,8 +432,10 @@ doucheschema** op te geven.
 **Zo werkt het** (elke `interval_minutes`, default 5 min):
 
 1. lees de SWW-temperatuur (register 5039) via MQTT;
-2. voorspel de temperatuur vooruit met de gemiddelde afkoeling
-   (`cooling_c_per_hour`, default 0,3 °C/h);
+2. voorspel de temperatuur vooruit met **Newton-afkoeling**: het vat staat
+   binnen (constante `ambient_temp`, default 19 °C) en verliest warmte
+   evenredig met het temperatuurverschil, dus een warmer vat koelt sneller af
+   (zie hieronder);
 3. zoek de eerstvolgende **deadline**: het moment binnen het venster waarop
    het vat zonder bijwarmen onder de buffer zou zakken;
 4. valt die deadline binnen `lead_hours` (default 4 u), dan zoekt de regeling
@@ -453,23 +455,45 @@ worden opgewarmd: 's nachts is de stroom vaak goedkoper, en zo is het vat om
 de lead-horizon valt — anders zou ze direct ná een opwarming meteen weer het
 goedkoopste blok "nu" kiezen en het vat onnodig warm houden.
 
+**Afkoelmodel (Newton).** Het vat staat binnen, dus de omgevingstemperatuur is
+constant (`ambient_temp`, default **19 °C**); de afkoelsnelheid hangt alleen af
+van de vattemperatuur:
+
+```
+U          = cooling_c_per_hour / (cooling_ref_temp − ambient_temp)
+T(t)       = ambient_temp + (T_nu − ambient_temp) · e^(−U·t)
+```
+
+`cooling_c_per_hour` (default 0,3 °C/h) geldt bij `cooling_ref_temp` (default
+gelijk aan `buffer_temp`, 47 °C). Een vat van 52 °C koelt dus iets sneller af
+dan één van 47 °C — belangrijk voor de **deadline** (moment waarop het vat de
+buffer zou raken) én voor de blokkeuze hieronder.
+
 **Energie-gewogen blokkeuze** (`energy_aware_blocks`, default `true`). Een blok
-kiezen op alleen `prijs / COP` negeert dat een **later** blok vanaf een verder
-afgekoeld vat moet opwarmen, dus méér kWh nodig heeft. De regeling weegt daarom
-elk kandidaat-blok met de **geschatte totale kosten**:
+kiezen op alleen `prijs / COP` negeert de afkoeling rond het blok. De regeling
+weegt elk kandidaat-blok daarom met de **geschatte totale kosten**, waarin beide
+kanten van de afkoeling meetellen:
 
 ```
-E(start)      = tank_liters × 4,186/3600 × (charge_temp − T_voorspeld(start))
-T_voorspeld   = T_nu − cooling_c_per_hour × (start − nu)
-totale kosten = (prijs / COP) × E(start)
+E_opwarm(start) = tank_liters × 4,186/3600 × (charge_temp − T_voorspeld(start))
+E_verlies       = tank_liters × 4,186/3600 × (charge_temp − max(T_voorspeld(deadline), buffer_temp))
+E_totaal        = E_opwarm + E_verlies          # E_verlies alleen met include_standby_loss
+totale kosten   = (prijs / COP) × E_totaal
 ```
 
-Hierdoor kan een blok dat een uur **eerder** begint (iets hogere eenheidsprijs,
-maar veel minder bijwarmte) per saldo goedkoper zijn dan een later, per kWh
-goedkoper blok — en wordt dus gekozen. Zet `energy_aware_blocks` op `false` voor
-de oude, puur op eenheidsprijs gebaseerde keuze. (Dit gebruikt `tank_liters`;
-zonder bekende vattemperatuur valt de regeling automatisch terug op de
-eenheidsprijs.)
+- **`E_opwarm`** — een *later* blok begint bij een verder afgekoeld vat, dus
+  moet méér bijwarmen (pleit voor vroeg).
+- **`E_verlies`** — een *eerder* blok houdt het vat langer heet, dus er lekt
+  vóór de deadline meer warmte weg (pleit voor laat).
+
+Het netto-effect is klein (beide termen heffen elkaar grotendeels op): de keuze
+blijft vooral door `prijs / COP` bepaald, met een lichte voorkeur voor het
+**laatste** blok binnen een goedkoop tariefdal — precies wat je wilt, want zo
+staat het vat zo kort mogelijk onnodig heet. Zet `energy_aware_blocks` op
+`false` voor de puur op eenheidsprijs gebaseerde keuze, of
+`include_standby_loss` op `false` om alleen `E_opwarm` mee te wegen. (Dit
+gebruikt `tank_liters`; zonder bekende vattemperatuur valt de regeling
+automatisch terug op de eenheidsprijs.)
 
 **Config** (`mqtt.dhw_comfort`, zie `config.example.json`):
 
@@ -481,8 +505,11 @@ eenheidsprijs.)
 | `charge_temp` | `52` | setpoint tijdens een opwarmblok; moet > ~4 °C (`deadband`) boven het vat liggen om de Remko te laten starten |
 | `off_temp` | `35` | setpoint buiten het venster (geen actieve verwarming) |
 | `tank_liters` | `300` | boilerinhoud — gebruikt voor de energie-gewogen blokkeuze |
-| `cooling_c_per_hour` | `0.3` | gemiddelde afkoeling per uur (deadline + energie-weging) |
+| `cooling_c_per_hour` | `0.3` | afkoelsnelheid bij `cooling_ref_temp` (deadline + energie-weging) |
+| `ambient_temp` | `19` | constante omgevingstemperatuur binnen (Newton-afkoeling) |
+| `cooling_ref_temp` | `buffer_temp` | vattemperatuur waarbij `cooling_c_per_hour` geldt |
 | `energy_aware_blocks` | `true` | weeg blokken op totale kosten (eenheidsprijs × benodigde kWh incl. afkoeling) i.p.v. alleen `prijs/COP` |
+| `include_standby_loss` | `true` | tel het stilstandsverlies (vat koelt af tot de deadline) mee in de blokkeuze |
 | `shower_drop_c` | `5.0` | temperatuurdaling per douchebeurt |
 | `shower_detect_c` | `2.0` | extra daling t.o.v. de verwachte afkoeling = douche (alleen voor het log) |
 | `charge_block_hours` | `1.0` | lengte van een opwarmblok |

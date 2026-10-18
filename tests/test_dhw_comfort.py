@@ -122,8 +122,9 @@ class TestFirstShortfall(unittest.TestCase):
         now = _dt(8, 0)
         horizon = now + timedelta(hours=48)
         dl = dhw_comfort.first_shortfall(now, 50.0, self.c, horizon)
-        # (50-47)/0,3 = 10 uur -> 18:00
-        self.assertEqual(dl, now + timedelta(hours=10))
+        # Newton-afkoeling (T_binnen 19 °C, 0,3 °C/h bij 47 °C):
+        # ln((50-19)/(47-19)) / U ≈ 9,5 uur -> ~17:30
+        self.assertAlmostEqual((dl - now).total_seconds() / 3600.0, 9.5, places=1)
 
     def test_before_window_needs_buffer_at_start(self):
         now = _dt(6, 0)
@@ -146,6 +147,35 @@ class TestFirstShortfall(unittest.TestCase):
         now = _dt(9, 0)
         horizon = now + timedelta(hours=48)
         self.assertEqual(dhw_comfort.first_shortfall(now, 45.0, self.c, horizon), now)
+
+
+class TestNewtonCooling(unittest.TestCase):
+    def setUp(self):
+        self.c = _cfg()
+
+    def test_cooling_u_from_reference(self):
+        # 0,3 °C/h bij 47 °C, binnen 19 °C -> U = 0,3 / 28
+        self.assertAlmostEqual(dhw_comfort.cooling_u(self.c), 0.3 / 28.0, places=9)
+
+    def test_warmer_tank_cools_faster(self):
+        ten_min = 10.0 / 60.0
+        drop_52 = 52.0 - dhw_comfort.tank_temp_after(52.0, ten_min, self.c)
+        drop_47 = 47.0 - dhw_comfort.tank_temp_after(47.0, ten_min, self.c)
+        self.assertGreater(drop_52, drop_47)
+
+    def test_temp_after_zero_hours_is_unchanged(self):
+        self.assertEqual(dhw_comfort.tank_temp_after(50.0, 0.0, self.c), 50.0)
+
+    def test_hours_to_temp(self):
+        self.assertAlmostEqual(
+            dhw_comfort.hours_to_temp(50.0, 47.0, self.c), 9.5, places=1
+        )
+        self.assertEqual(dhw_comfort.hours_to_temp(45.0, 47.0, self.c), 0.0)
+        # onder de binnen-temperatuur wordt nooit gehaald
+        self.assertIsNone(dhw_comfort.hours_to_temp(40.0, 19.0, self.c))
+
+    def test_ambient_default(self):
+        self.assertEqual(dhw_comfort.comfort_cfg({})["ambient_temp"], 19.0)
 
 
 class TestCheapestChargeBlock(unittest.TestCase):
@@ -204,22 +234,55 @@ class TestEnergyAwareBlocks(unittest.TestCase):
         late = {"start": _dt(10, 0), "mean_corrected": 0.11 / 3.0}
         c_early = dhw_comfort.block_total_cost(early, 48.0, self.now, self.c)
         c_late = dhw_comfort.block_total_cost(late, 48.0, self.now, self.c)
-        # het late blok is per kWh goedkoper, maar in totaal duurder
+        # zónder deadline telt alleen de opwarmwarmte: het late blok moet een
+        # verder afgekoeld vat opwarmen en is in totaal duurder
         self.assertLess(c_early, c_late)
 
+    def test_block_energy_with_deadline_includes_standby(self):
+        # mét deadline weegt het stilstandsverlies mee: het vroege blok houdt
+        # het vat langer heet, dus meer warmte die weglekt vóór de deadline
+        deadline = _dt(12, 0)
+        early = {
+            "start": self.now,
+            "end": self.now + timedelta(hours=1),
+            "mean_corrected": 0.12 / 3.0,
+        }
+        late = {
+            "start": _dt(10, 0),
+            "end": _dt(11, 0),
+            "mean_corrected": 0.11 / 3.0,
+        }
+        e_early = dhw_comfort.block_energy_kwh(
+            early, 48.0, self.now, self.c, deadline
+        )
+        e_late = dhw_comfort.block_energy_kwh(late, 48.0, self.now, self.c, deadline)
+        self.assertLess(e_late, e_early)
+
     def test_unit_price_picks_later(self):
-        # zonder T_now: terugval op de oude (eenheidsprijs-)rangschikking
+        # zonder T_now: terugval op de eenheidsprijs-rangschikking
         b = dhw_comfort.cheapest_charge_block(
             self.rows, 15, self.c, self.now, _dt(12, 0)
         )
         self.assertEqual(b["start"], _dt(10, 0))
 
-    def test_energy_aware_picks_earlier(self):
+    def test_energy_aware_picks_cheaper_later_block(self):
         b = dhw_comfort.cheapest_charge_block(
             self.rows, 15, self.c, self.now, _dt(12, 0), T_now=48.0
         )
-        # eerder blok: eenheidsprijs iets hoger, maar totale kosten lager
-        self.assertEqual(b["start"], self.now)
+        # het late blok is per eenheid goedkoper én houdt het vat korter heet,
+        # dus het wint ondanks dat het vanaf een kouder vat moet opwarmen
+        self.assertGreaterEqual(b["start"], _dt(10, 0))
+
+    def test_energy_aware_picks_end_of_cheap_plateau(self):
+        rows = _mk_rows(
+            self.now, 24, price_fn=lambda d: 0.10 if d.hour < 10 else 0.12
+        )
+        b = dhw_comfort.cheapest_charge_block(
+            rows, 15, self.c, self.now, _dt(12, 0), T_now=48.0
+        )
+        # goedkoop tarief t/m 10:00; het model kiest het laatste blok binnen dat
+        # dal (vat zo kort mogelijk heet), niet het eerste
+        self.assertEqual(b["start"], _dt(9, 0))
 
     def test_energy_aware_can_be_disabled(self):
         c = _cfg(energy_aware_blocks=False)
@@ -227,6 +290,14 @@ class TestEnergyAwareBlocks(unittest.TestCase):
             self.rows, 15, c, self.now, _dt(12, 0), T_now=48.0
         )
         self.assertEqual(b["start"], _dt(10, 0))
+
+    def test_standby_loss_can_be_disabled(self):
+        c = _cfg(include_standby_loss=False)
+        b = dhw_comfort.cheapest_charge_block(
+            self.rows, 15, c, self.now, _dt(12, 0), T_now=48.0
+        )
+        # alleen opwarmwarmte: het vroege blok wint weer
+        self.assertEqual(b["start"], self.now)
 
     def test_block_total_cost_missing_price_is_infinite(self):
         block = {"start": self.now, "mean_corrected": None}
@@ -303,7 +374,7 @@ class TestDecide(unittest.TestCase):
         out = dhw_comfort.decide(self.c, self.now, 48.0, rows, 15, {})
         self.assertEqual(out["status"], "schedule")
         self.assertEqual(out["setpoint_temp"], self.c["buffer_temp"])
-        self.assertEqual(out["block"]["start"], _dt(10, 0).isoformat())
+        self.assertEqual(out["block"]["start"], _dt(10, 15).isoformat())
 
     def test_no_data_keeps_floor(self):
         out = dhw_comfort.decide(self.c, self.now, 45.0, [], 15, {})

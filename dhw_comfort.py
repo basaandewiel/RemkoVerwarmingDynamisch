@@ -13,16 +13,22 @@ Doel (eenvoudiger dan de boost-planner in `dhw_boost.py`):
 
 Hoe het werkt:
   1. lees de **echte** SWW-temperatuur (register 5039) via MQTT;
-  2. voorspel de temperatuur vooruit met de gemiddelde afkoeling
-     (`cooling_c_per_hour`, default 0,3 °C/h): `T(t) = T_nu - 0,3 * uren`;
+  2. voorspel de temperatuur vooruit met **Newton-afkoeling**: het vat staat
+     binnen (constante `ambient_temp`, default 19 °C) en verliest warmte
+     evenredig met het temperatuurverschil `T − T_binnen`:
+     `T(t) = T_binnen + (T_nu − T_binnen) · e^(−U·uren)`, met
+     `U = cooling_c_per_hour / (cooling_ref_temp − T_binnen)`. De opgegeven
+     `cooling_c_per_hour` (default 0,3 °C/h) geldt bij `cooling_ref_temp`
+     (standaard de `buffer_temp`): een warmer vat koelt dus sneller af;
   3. zoek het eerstvolgende moment **binnen het venster** waarop dat onder de
      buffer zou zakken (de "deadline");
   4. is die deadline dichtbij (`lead_hours`, default 4 u), dan wordt in het
      venster [nu, deadline] het **goedkoopste opwarmblok** gezocht op basis
      van `prijs / COP(buitentemp.)` én de geschatte **totale** kosten
      (eenheidsprijs × de benodigde warmte om het vat vanaf de voorspelde
-     starttemperatuur naar `charge_temp` te brengen); gaat op dat moment het
-     setpoint (register 1082) naar `charge_temp` (default 52 °C);
+     starttemperatuur naar `charge_temp` te brengen, **plus** het geschatte
+     stilstandsverlies tot de deadline); gaat op dat moment het setpoint
+     (register 1082) naar `charge_temp` (default 52 °C);
   5. buiten zo'n blok staat het setpoint op de ondergrens: `buffer_temp`
      (default 47 °C) binnen het venster — de warmtepomp houdt het vat dan
      zelf op peil — en `off_temp` (default 35 °C) daarbuiten.
@@ -49,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -80,6 +87,7 @@ DEFAULT_CHARGE_TEMP = 52.0
 DEFAULT_OFF_TEMP = 35.0
 DEFAULT_TANK_LITERS = 300.0
 DEFAULT_COOLING_C_PER_HOUR = 0.3
+DEFAULT_AMBIENT_TEMP = 19.0
 DEFAULT_SHOWER_DROP_C = 5.0
 DEFAULT_SHOWER_DETECT_C = 2.0
 DEFAULT_CHARGE_BLOCK_HOURS = 1.0
@@ -99,19 +107,25 @@ def comfort_cfg(cfg: dict) -> dict:
     """Lees de `mqtt.dhw_comfort`-sectie met verstandige defaults."""
     mqtt_cfg = cfg.get("mqtt") or {}
     cc = mqtt_cfg.get("dhw_comfort") or {}
+    buffer_temp = float(cc.get("buffer_temp", DEFAULT_BUFFER_TEMP))
     return {
         "enabled": bool(cc.get("enabled", True)),
         "window_from": cc.get("window_from", DEFAULT_WINDOW_FROM),
         "window_to": cc.get("window_to", DEFAULT_WINDOW_TO),
         "min_temp": float(cc.get("min_temp", DEFAULT_MIN_TEMP)),
-        "buffer_temp": float(cc.get("buffer_temp", DEFAULT_BUFFER_TEMP)),
+        "buffer_temp": buffer_temp,
         "charge_temp": float(cc.get("charge_temp", DEFAULT_CHARGE_TEMP)),
         "off_temp": float(cc.get("off_temp", DEFAULT_OFF_TEMP)),
         "tank_liters": float(cc.get("tank_liters", DEFAULT_TANK_LITERS)),
         "cooling_c_per_hour": float(
             cc.get("cooling_c_per_hour", DEFAULT_COOLING_C_PER_HOUR)
         ),
+        # Newton-afkoeling: het vat staat binnen (constante omgevingstemperatuur).
+        # `cooling_c_per_hour` geldt bij `cooling_ref_temp` (default: buffer_temp).
+        "ambient_temp": float(cc.get("ambient_temp", DEFAULT_AMBIENT_TEMP)),
+        "cooling_ref_temp": float(cc.get("cooling_ref_temp", buffer_temp)),
         "energy_aware_blocks": bool(cc.get("energy_aware_blocks", True)),
+        "include_standby_loss": bool(cc.get("include_standby_loss", True)),
         "shower_drop_c": float(cc.get("shower_drop_c", DEFAULT_SHOWER_DROP_C)),
         "shower_detect_c": float(
             cc.get("shower_detect_c", DEFAULT_SHOWER_DETECT_C)
@@ -197,8 +211,50 @@ def build_setpoint_payload(temperature: float) -> dict:
     return {"FORCE_RESPONSE": True, "values": {str(SETPOINT_REGISTER): value_hex}}
 
 
-def _temp_at(T_now: float, now: datetime, t: datetime, cooling: float) -> float:
-    return T_now - cooling * (t - now).total_seconds() / 3600.0
+def _hours_between(a: datetime, b: datetime) -> float:
+    return (b - a).total_seconds() / 3600.0
+
+
+def cooling_u(ccfg: dict) -> float:
+    """Newton-afkoelcoëfficiënt U (1/h): afkoelsnelheid ∝ (T_vat − T_binnen).
+
+    `cooling_c_per_hour` is de afkoelsnelheid bij `cooling_ref_temp`:
+
+        U = cooling_c_per_hour / (cooling_ref_temp − ambient_temp)
+    """
+    denom = ccfg["cooling_ref_temp"] - ccfg["ambient_temp"]
+    if denom <= 0:
+        return 0.0
+    return ccfg["cooling_c_per_hour"] / denom
+
+
+def tank_temp_after(T_now: float, hours: float, ccfg: dict) -> float:
+    """Vattemperatuur na `hours` uren afkoelen (Newton, constante binnen-temp).
+
+    `T(t) = T_binnen + (T_nu − T_binnen) · e^(−U·t)`
+    """
+    if hours <= 0:
+        return T_now
+    u = cooling_u(ccfg)
+    if u <= 0:
+        return T_now
+    amb = ccfg["ambient_temp"]
+    return amb + (T_now - amb) * math.exp(-u * hours)
+
+
+def hours_to_temp(T_now: float, target: float, ccfg: dict) -> Optional[float]:
+    """Uren tot het vat (Newton) `target` bereikt.
+
+    0.0 als het al op/onder `target` is; None als het `target` nooit haalt
+    (geen afkoeling, of `target` ≤ de binnen-temperatuur).
+    """
+    if T_now <= target:
+        return 0.0
+    amb = ccfg["ambient_temp"]
+    u = cooling_u(ccfg)
+    if u <= 0 or target <= amb:
+        return None
+    return -math.log((target - amb) / (T_now - amb)) / u
 
 
 def first_shortfall(
@@ -212,23 +268,25 @@ def first_shortfall(
     (zonder bijwarmen) onder de buffer zou zakken — of None als dat binnen de
     horizon niet gebeurt.
 
-    Buiten het venster geldt geen eis; wel moet het vat aan het begin van het
-    volgende venster op peil zijn. Daarom kijkt de functie per venster naar
-    het minimum (het venstereinde, want het koelt monotoon af)."""
-    cool = ccfg["cooling_c_per_hour"]
-    buf = ccfg["buffer_temp"]
-    if cool <= 0:
+    De voorspelling gebruikt Newton-afkoeling (`tank_temp_after`). Buiten het
+    venster geldt geen eis; wel moet het vat aan het begin van het volgende
+    venster op peil zijn. Daarom kijkt de functie per venster naar het minimum
+    (het venstereinde, want het koelt monotoon af)."""
+    if ccfg["cooling_c_per_hour"] <= 0:
         return None
+    buf = ccfg["buffer_temp"]
     t = now
     for _ in range(max_windows):
         start, end = next_window(t, ccfg)
         if start >= horizon_end:
             return None
         s = max(start, now)
-        if _temp_at(T_now, now, s, cool) < buf:
+        if tank_temp_after(T_now, _hours_between(now, s), ccfg) < buf:
             return s
-        if _temp_at(T_now, now, end, cool) < buf:
-            hours = (T_now - buf) / cool
+        if tank_temp_after(T_now, _hours_between(now, end), ccfg) < buf:
+            hours = hours_to_temp(T_now, buf, ccfg)
+            if hours is None:
+                return None
             return now + timedelta(hours=hours)
         # dit venster is ruim; kijk naar het volgende
         t = end + timedelta(seconds=1)
@@ -263,18 +321,39 @@ def block_energy_kwh(
     T_now: float,
     now: datetime,
     ccfg: dict,
+    deadline: Optional[datetime] = None,
 ) -> float:
-    """Geschatte warmte (kWh) om het vat bij de start van het blok naar
-    `charge_temp` te brengen, op basis van de voorspelde vat-temperatuur:
+    """Geschatte warmte (kWh) voor een opwarmblok, op basis van Newton-afkoeling.
 
-        E(start) = tank_liters × 4,186/3600 × (charge_temp − T_voorspeld(start))
-        T_voorspeld(start) = T_nu − cooling × (start − nu)
+    1. **Opwarmwarmte** — het vat moet bij de start van het blok van de
+       voorspelde temperatuur naar `charge_temp`:
+
+           E_opwarm = tank_liters · 4,186/3600 · (charge_temp − T_voorspeld(start))
+
+    2. **Stilstandsverlies** (alleen met `deadline` én `include_standby_loss`)
+       — nadat het blok het vat op `charge_temp` heeft gebracht, koelt het weer
+       af tot de deadline. Hoe vroeger het blok, hoe langer het vat heet staat
+       en hoe meer warmte er weglekt:
+
+           E_verlies = k · (charge_temp − max(T_voorspeld(deadline), buffer_temp))
+
+    Zo wegen beide kanten van de afkoeling mee: een later blok moet vanaf een
+    kouder vat opwarmen (méér E_opwarm), maar houdt het vat korter heet
+    (minder E_verlies). Zonder `deadline` (of met `include_standby_loss=false`)
+    blijft alleen de opwarmwarmte over.
     """
-    hours = max(0.0, (block["start"] - now).total_seconds() / 3600.0)
-    t_start = T_now - ccfg["cooling_c_per_hour"] * hours
-    return tank_kwh_per_c(ccfg["tank_liters"]) * max(
-        0.0, ccfg["charge_temp"] - t_start
+    k = tank_kwh_per_c(ccfg["tank_liters"])
+    t_start = tank_temp_after(T_now, _hours_between(now, block["start"]), ccfg)
+    raise_kwh = k * max(0.0, ccfg["charge_temp"] - t_start)
+    if deadline is None or not ccfg.get("include_standby_loss", True):
+        return raise_kwh
+    end = block.get("end") or block["start"]
+    hours_after = max(0.0, _hours_between(end, deadline))
+    t_deadline = tank_temp_after(ccfg["charge_temp"], hours_after, ccfg)
+    standby_kwh = k * max(
+        0.0, ccfg["charge_temp"] - max(t_deadline, ccfg["buffer_temp"])
     )
+    return raise_kwh + standby_kwh
 
 
 def block_total_cost(
@@ -282,18 +361,19 @@ def block_total_cost(
     T_now: float,
     now: datetime,
     ccfg: dict,
+    deadline: Optional[datetime] = None,
 ) -> float:
     """Geschatte **totale** kosten van een opwarmblok (€).
 
-    = eenheidsprijs (€/kWh warmte) × de benodigde warmte (`block_energy_kwh`).
-    Zo weegt de afkoeling vóór het blok mee: een blok dat later begint moet een
-    verder afgekoeld vat opwarmen (meer kWh) en kan dus duurder uitvallen dan
-    een iets duurder maar eerder blok. Puur informatief/ordenend.
+    = eenheidsprijs (€/kWh warmte) × de benodigde warmte (`block_energy_kwh`,
+    inclusief het geschatte stilstandsverlies tot `deadline`). Zo weegt mee dat
+    een later blok een verder afgekoeld vat moet opwarmen, maar het vat ook
+    korter heet houdt. Puur informatief/ordenend.
     """
     corrected = block.get("mean_corrected")
     if corrected is None:
         return float("inf")
-    return corrected * block_energy_kwh(block, T_now, now, ccfg)
+    return corrected * block_energy_kwh(block, T_now, now, ccfg, deadline)
 
 
 def cheapest_charge_block(
@@ -310,8 +390,9 @@ def cheapest_charge_block(
     Standaard op `prijs / COP` (€/kWh warmte). Met `energy_aware_blocks` (en een
     bekende `T_now`) wordt elk kandidaat-blok daarnaast gewogen met de geschatte
     **totale** kosten (`block_total_cost`): een later blok moet een verder
-    afgekoeld vat opwarmen en weegt dan zwaarder mee. Zo kan een iets duurder
-    maar eerder blok winnen als het per saldo goedkoper is.
+    afgekoeld vat opwarmen (meer kWh), maar houdt het vat ook korter heet
+    (minder stilstandsverlies). Zo kan een iets duurder maar gunstiger blok
+    winnen.
 
     Past er geen volledig blok meer vóór de deadline, dan begint het blok
     meteen (beter een fractie te laat dan de buffer missen). Zonder
@@ -348,12 +429,18 @@ def cheapest_charge_block(
             and ccfg["cooling_c_per_hour"] > 0
         )
         if energy_ok:
-            eligible.sort(key=lambda b: block_total_cost(b, T_now, now, ccfg))
+            eligible.sort(
+                key=lambda b: block_total_cost(b, T_now, now, ccfg, deadline)
+            )
         chosen = eligible[0]
         if T_now is not None and ccfg["cooling_c_per_hour"] > 0:
             chosen = dict(chosen)
-            chosen["est_energy_kwh"] = block_energy_kwh(chosen, T_now, now, ccfg)
-            chosen["est_total_eur"] = block_total_cost(chosen, T_now, now, ccfg)
+            chosen["est_energy_kwh"] = block_energy_kwh(
+                chosen, T_now, now, ccfg, deadline
+            )
+            chosen["est_total_eur"] = block_total_cost(
+                chosen, T_now, now, ccfg, deadline
+            )
         return chosen
     # deadline te dichtbij voor een volledig blok: meteen beginnen
     return _immediate_block(now, block_hours)
@@ -386,7 +473,7 @@ def detect_shower(
         except (ValueError, TypeError):
             hours = None
         if hours and hours > 0:
-            expected = ccfg["cooling_c_per_hour"] * hours
+            expected = float(prev) - tank_temp_after(float(prev), hours, ccfg)
             observed = float(prev) - T_now
             if observed - expected >= ccfg["shower_detect_c"]:
                 drop = observed
