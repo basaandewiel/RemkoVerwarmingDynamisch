@@ -8,7 +8,7 @@
 #   bash start-register-monitor.sh status   # draait hij?
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$HOME/heating_probe.log"
 PIDFILE="$HOME/.cache/remko-wkf70/register_monitor.pid"
 ACTION="${1:-start}"
