@@ -45,7 +45,7 @@ fi
 
 # 3) Systemd-units installeren (sudo)
 sd_ke="${USER_NAME//\//}"
-for UNIT in remko-sww-boost remko-energy-log remko-dhw-comfort; do
+for UNIT in remko-sww-boost remko-energy-log remko-dhw-comfort remko-heating-comfort; do
     UNIT_SRC="$SCRIPT_DIR/$UNIT.service"
     UNIT_DST="/etc/systemd/system/$UNIT.service"
     echo ">> systemd-unit installeren ($UNIT_DST)"
@@ -61,6 +61,9 @@ echo ">> zelfcontrole: adviesberekening (--dry-run)"
 }
 "$DIR/venv/bin/python3" "$DIR/dhw_comfort.py" --dry-run --temp 45 || {
     echo "  (comfortregeling kon niet rekenen; check config.json.)" >&2
+}
+"$DIR/venv/bin/python3" "$DIR/heating_comfort.py" --dry-run || {
+    echo "  (vloerverwarming-regeling kon niet rekenen; check config.json.)" >&2
 }
 
 # 5) Services starten
@@ -81,5 +84,11 @@ echo "   mqtt.dhw_boost.enabled op false en mqtt.dhw_comfort.enabled op true, en
 echo "     sudo systemctl disable --now remko-sww-boost"
 echo "     sudo systemctl enable --now remko-dhw-comfort"
 echo "     journalctl -u remko-dhw-comfort -f"
+echo
+echo "-> Vloerverwarming op de goedkoopste uren laden (register 5085)? Zet in"
+echo "   config.json mqtt.heating_comfort.enabled op true, en:"
+echo "     sudo systemctl enable --now remko-heating-comfort"
+echo "     journalctl -u remko-heating-comfort -f"
+echo "   (draait naast de SWW-regeling; schrijft alleen register 5085)"
 echo
 echo "Vul eerst je ENTSO-E API-key in: nano $DIR/config.json  (daarna: sudo systemctl restart remko-sww-boost remko-energy-log)"

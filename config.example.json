@@ -97,6 +97,28 @@
       "qos": 1,
       "retain": false
     },
+    "heating_comfort": {
+      "enabled": false,
+      "charge_temp": 40,
+      "base_temp": 35,
+      "coast_temp": 28,
+      "min_supply": 20,
+      "max_supply": 45,
+      "charge_block_hours": 3.0,
+      "charge_blocks_per_day": 2,
+      "min_gap_hours": 6.0,
+      "coast_enabled": true,
+      "coast_block_hours": 2.0,
+      "coast_blocks_per_day": 1,
+      "horizon_hours": 24,
+      "max_outdoor_for_heating_c": 15,
+      "interval_minutes": 5,
+      "response_timeout_seconds": 8,
+      "rows_refresh_seconds": 1800,
+      "price_days_ahead": 3,
+      "qos": 1,
+      "retain": false
+    },
     "energy_log": {
       "enabled": true,
       "interval_seconds": 60,

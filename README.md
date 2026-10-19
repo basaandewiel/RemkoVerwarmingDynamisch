@@ -26,6 +26,11 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
    (minimaal 42 °C, met een buffer van ~47 °C zodat er ná een douche nog
    42 °C over is) en plant de opwarmmomenten op basis van de échte
    vattemperatuur, de uurvoorspelling, de COP en de kwartierprijzen.
+9. (optioneel) de **vloerverwarming-bufferregeling** (`heating_comfort.py`):
+   gebruikt de vloer als warmtebuffer en stuurt de **gewenste
+   aanvoertemperatuur ruimteverwarming** (register 5085) op de dynamische
+   prijs/COP — hoger in de goedkoopste uren (vloer laden), lager in de duurste
+   uren (vloer laten uitwerken) en daar tussenin de normale, constante waarde.
 
 Het resultaat kan optioneel via **MQTT** worden gepubliceerd (de MQTT-
 integratie van jouw warmtepomp draait al; dit programma publiceert alleen
@@ -579,6 +584,84 @@ RestartSec=60
 WantedBy=multi-user.target
 ```
 
+## Vloerverwarming-bufferregeling (`heating_comfort.py`) — laden op de goedkoopste uren
+
+De vloerverwarming is één grote warmtebuffer: als je de vloer tijdens de
+goedkoopste uren wat warmer maakt, houdt die de kamer daarna urenlang op
+temperatuur. `heating_comfort.py` gebruikt dat en stuurt de **gewenste
+aanvoertemperatuur ruimteverwarming** — register **5085**
+(`heat_water_temp_req`, instelbaar 20–60 °C) — op basis van dezelfde data als
+het advies: de **kwartierprijs**, de **uurvoorspelling** en de **COP** van de
+Remko (gecorrigeerde prijs = €/kWh ÷ COP).
+
+Drie niveau's:
+
+| Actie | Register 5085 | Betekenis |
+|---|---|---|
+| **laden** (`charge_temp`, default 40 °C) | hoog | in de goedkoopste uren van de horizon: vloer laadt warmte |
+| **normaal** (`base_temp`, default `heatpump.supply_temperature`, vaak 35 °C) | normaal | buiten de blokken: de bestaande, constante aanvoer |
+| **duur uur** (`coast_temp`, default 28 °C) | laag | in de duurste uren: warmtepomp stilstaat, vloer voedt de kamer |
+
+De regeling leest **geen ruimtetemperatuur**: het kamercomfort blijft bepaald
+door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 5085
+geschreven — **niet** aan de SWW-regeling (1082) of de hoofdmode (1951)
+geraakt, dus deze service kan naast `dhw_comfort.py` draaien.
+
+Het commando heeft hetzelfde wire-formaat als bij SWW:
+`{"FORCE_RESPONSE": true, "values": {"5085": "0190"}}` = 40 °C (temperatuur ×10
+in hexadecimaal). Er wordt alleen gepubliceerd als de waarde **verandert**; de
+statusfile `~/.cache/remko-wkf70/heating_comfort_state.json` onthoudt de laatst
+gezette aanvoertemperatuur.
+
+**Config** (`mqtt.heating_comfort`, zie `config.example.json`):
+
+| Sleutel | Default | Betekenis |
+|---|---|---|
+| `enabled` | `false` | regeling aan/uit (staat bewust uit tot je hem op de Pi test). |
+| `charge_temp` | `40` | aanvoertemperatuur tijdens een laadblok. |
+| `base_temp` | `heatpump.supply_temperature` | normale, constante aanvoer buiten de blokken. |
+| `coast_temp` | `28` | aanvoertemperatuur tijdens de duurste uren. |
+| `min_supply` / `max_supply` | `20` / `45` | harde grenzen op register 5085 (vloerbescherming). |
+| `charge_block_hours` | `3.0` | lengte van een laadblok (vloer is traag: 2–4 u). |
+| `charge_blocks_per_day` | `2` | aantal laadblokken per etmaal. |
+| `min_gap_hours` | `6.0` | minimale tussenruimte tussen blokken. |
+| `coast_enabled` | `true` | duurste uren ook daadwerkelijk "uit" vragen. |
+| `coast_block_hours` / `coast_blocks_per_day` | `2.0` / `1` | lengte en aantal duur-uur-blokken. |
+| `horizon_hours` | `24` | hoe ver vooruit wordt gepland. |
+| `max_outdoor_for_heating_c` | `15` | boven deze buitentemperatuur geen blokken: dan verwarmt een vloerverwarmingshuis doorgaans niet. |
+| `interval_minutes` | `5` | herberekeninterval in `--watch`. |
+
+```bash
+# één beslissing, en publiceren (schrijft register 5085):
+~/remkoverwarming/venv/bin/python3 heating_comfort.py
+
+# niets publiceren, alleen tonen:
+~/remkoverwarming/venv/bin/python3 heating_comfort.py --dry-run
+
+# vast tijdstip simuleren:
+~/remkoverwarming/venv/bin/python3 heating_comfort.py \
+    --dry-run --now 2026-10-11T08:00:00+02:00
+
+# als continue service:
+~/remkoverwarming/venv/bin/python3 heating_comfort.py --watch
+```
+
+`deploy/install.sh` installeert de unit `remko-heating-comfort` mee, maar start
+hem bewust **niet** automatisch (zet eerst `mqtt.heating_comfort.enabled` op
+`true`):
+
+```bash
+sudo systemctl enable --now remko-heating-comfort
+journalctl -u remko-heating-comfort -f
+```
+
+> **Let op — hoe de Remko omgaat met 5085.** Of het verhogen/verlagen van 5085
+> de warmtepomp daadwerkelijk aan/uit zet, verschilt per installatie: bij een
+> vloerverwarming met mengunit/thermostaat (zoals een Watts-thermostaat) bepaalt
+> die vaak de echte vraag, en begrenst 5085 vooral de aanvoer zodra er vraag is.
+> Test daarom eerst met `--dry-run` en kijk in `journalctl` mee wat de Remko
+> doet voordat je de service live inschakelt.
+
 ## Energie-logger (`energy_log.py`) — echte COP meten
 
 De REMKO-gateway publiceert **kWh-tellers** over MQTT. Die kun je gebruiken om
@@ -601,6 +684,10 @@ komen overeen met de sensoren in Home Assistant):
 | 5032 / 5039 | — | buitentemperatuur / boilertemperatuur |
 | 5085 / 5190 / 1082 | — | heating-water req./actual, SWW-setpoint |
 | 5822 | — | compressorstarts |
+
+Register **5085** is de **gewenste aanvoertemperatuur ruimteverwarming**
+(20–60 °C) en het aangrijppunt van `heating_comfort.py`; 1082 is het
+SWW-setpoint (`dhw_boost.py` / `dhw_comfort.py`).
 
 Per opwarmepisode geldt dan
 `COP = Δ(Energy DHW heating) / Δ(Electr. energy heatpump)`.
