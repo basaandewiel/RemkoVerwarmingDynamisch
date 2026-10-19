@@ -817,6 +817,18 @@ De laatste rij is de beslissende proef (20:49–20:52):
 20:51:57  -> 50 Hz, 1100 W el / 4500 W th   aanvoer 24,0 °C, retour 19,0 °C
 ```
 
+En de omgekeerde proef (21:06): **thermostaat op 19 °C bij 20 °C kamer** (dus
+géén kamervraag) terwijl `5085 = 30 °C` — de compressor draaide onverstoorbaar
+door:
+
+```
+5205 compressor  54 Hz      5321 thermisch  6400 -> 6700 W
+5132 aanvoer     26,5 °C    5581 retour     19 -> 21 °C (warmte wordt opgenomen)
+5156/5157/5577/5799/5059/5071 = 0   (HC1-kring blijft onzichtbaar)
+```
+
+De Remko is dus **blind voor de kamerthermostaat**: hij volgt uitsluitend `5085`.
+
 Conclusies:
 
 * **Register `5085` is exact de "gewenste aanvoertemperatuur" die je in de GUI
@@ -826,6 +838,10 @@ Conclusies:
 * **`5085` is óók de aan/uit-knop:** 19 °C → stilstand; 30 °C → draaien. De
   aanvoer liep op (5132) terwijl de retour laag bleef (5581), dus er werd warmte
   afgegeven aan het circuit.
+* De Remko is **blind voor de kamerthermostaat**: met de thermostaat op 19 °C bij
+  20 °C kamer bleef de compressor op 54 Hz draaien zolang `5085` hoog stond.
+  "Verwarmen aan/uit" gebeurt dus volledig via `5085`; het kamercomfort (of de
+  vloer die warmte krijgt) bepaalt de mengunit/thermostaat daarnaast.
 * De **HC1-vloerkring** (`5156/5157` mengklep, `5577/5799` pomp, `5059` debiet,
   `5071` vermogen) bleef in alle metingen op **0**, óók toen de kamerthermostaat
   (Watts) op 23 °C stond bij 20 °C kamertemperatuur. `5048 hc1_room_temp` is `0`
