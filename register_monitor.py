@@ -104,6 +104,14 @@ CATALOG: List[Tuple[int, str, str, str]] = [
     (5582, "heating_flow_rate", "num", "l/min"),
     (5071, "hc1_power", "num", "kW"),
     (5718, "hc1_setpoint_offset", "temp", "°C"),
+    # --- overige/onbekende maar wél gestuurde registers (meeloggen om te duiden) ---
+    (5029, "reg_5029", "num", ""),
+    (5198, "reg_5198", "num", ""),
+    (1976, "reg_1976", "num", ""),
+    (1978, "reg_1978", "num", ""),
+    (1979, "reg_1979", "num", ""),
+    (1974, "fixed_temp_req", "temp", "°C"),
+    (5027, "circulation_temp", "temp", "°C"),
     # --- warmtegenerator ---
     (5051, "heat_gen_status", "bool", ""),
     (5049, "hp_state", "mode", ""),
@@ -146,6 +154,7 @@ DEFAULT_REGISTERS: List[int] = [
     5048, 5077, 5068, 5148, 5711, 5156, 5157, 5799, 5577,     # HC1/thermostaat
     5059, 5582, 5071, 5718,                                   # HC1 debiet/vermogen
     5051, 5049, 5625, 5205, 5822, 5320, 5321,                 # warmtegenerator
+    5029, 5198, 1976, 1978, 1979,                             # nog te duiden
     5032, 5056, 5131, 5034,                                   # buiten/buffer/vloer
     5039, 1082,                                               # SWW-context
     5105, 5374, 5376,                                         # energie
