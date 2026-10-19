@@ -100,7 +100,7 @@
     "heating_comfort": {
       "enabled": false,
       "charge_temp": 40,
-      "base_temp": 35,
+      "base_temp": null,
       "coast_temp": 28,
       "min_supply": 20,
       "max_supply": 45,

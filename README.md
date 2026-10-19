@@ -604,8 +604,15 @@ Drie niveau's:
 | Actie | Register 5085 | Betekenis |
 |---|---|---|
 | **laden** (`charge_temp`, default 40 °C) | hoog | in de goedkoopste uren van de horizon: vloer laadt warmte |
-| **normaal** (`base_temp`, default `heatpump.supply_temperature`, vaak 35 °C) | normaal | buiten de blokken: de bestaande, constante aanvoer |
+| **normaal** (`base_temp`, default = de bestaande vaste waarde uit register 1974/5085) | normaal | buiten de blokken: de bestaande, constante aanvoer |
 | **duur uur** (`coast_temp`, default 28 °C) | laag | in de duurste uren: warmtepomp stilstaat, vloer voedt de kamer |
+
+De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**: de
+"vaste waarde" die in de GUI van de VK-modus staat (register `1974`
+`fixed_temp_req`, met `5085` als terugval). Verzet je die in de GUI, dan volgt de
+regeling hem bij de volgende verversing automatisch. In de config kun je
+`base_temp` ook op een vast getal of op `"config"` zetten (dan
+`heatpump.supply_temperature`). Met `--read-base` lees je hem los uit:
 
 De regeling leest **geen ruimtetemperatuur**: het kamercomfort blijft bepaald
 door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 5085
@@ -624,7 +631,7 @@ gezette aanvoertemperatuur.
 |---|---|---|
 | `enabled` | `false` | regeling aan/uit (staat bewust uit tot je hem op de Pi test). |
 | `charge_temp` | `40` | aanvoertemperatuur tijdens een laadblok. |
-| `base_temp` | `heatpump.supply_temperature` | normale, constante aanvoer buiten de blokken. |
+| `base_temp` | `null` = uit register | normale, constante aanvoer buiten de blokken. `null`/weggelaten = bij de start lezen uit register 1974/5085; een getal = vast; `"config"` = `heatpump.supply_temperature`. |
 | `coast_temp` | `28` | aanvoertemperatuur tijdens de duurste uren. |
 | `min_supply` / `max_supply` | `20` / `45` | harde grenzen op register 5085 (vloerbescherming). |
 | `charge_block_hours` | `3.0` | lengte van een laadblok (vloer is traag: 2–4 u). |
@@ -647,6 +654,9 @@ gezette aanvoertemperatuur.
 ~/remkoverwarming/venv/bin/python3 heating_comfort.py \
     --dry-run --now 2026-10-11T08:00:00+02:00
 
+# de rustwaarde (vaste waarde) los uit register 1974/5085 lezen en tonen:
+~/remkoverwarming/venv/bin/python3 heating_comfort.py --read-base
+
 # als continue service:
 ~/remkoverwarming/venv/bin/python3 heating_comfort.py --watch
 ```
@@ -660,12 +670,12 @@ sudo systemctl enable --now remko-heating-comfort
 journalctl -u remko-heating-comfort -f
 ```
 
-> **Let op — hoe de Remko omgaat met 5085.** Of het verhogen/verlagen van 5085
-> de warmtepomp daadwerkelijk aan/uit zet, verschilt per installatie: bij een
-> vloerverwarming met mengunit/thermostaat (zoals een Watts-thermostaat) bepaalt
-> die vaak de echte vraag, en begrenst 5085 vooral de aanvoer zodra er vraag is.
-> Test daarom eerst met `--dry-run` en kijk in `journalctl` mee wat de Remko
-> doet voordat je de service live inschakelt.
+> **Let op — hoe de Remko omgaat met 5085 (gemeten 19-10-2026).** Register 5085
+> is de **aan/uit- én modulatieknop** van de warmtepomp. Met de vaste waarde in
+> de GUI op 19 °C stond de compressor stil (`5001 = Nawerking`, 0 Hz); op 30 °C
+> ging hij binnen ~6 s draaien en moduleerde 16 → 50 Hz / 1100 W, met de aanvoer
+> die opliep (19,5 → 24,0 °C) en de retour op 19 °C — er werd dus warmte
+> afgegeven. Zie ook “Wat we hiermee hebben vastgesteld”.
 
 ## Registermonitor (`register_monitor.py`) — uitzoeken hoe de thermostaat de vraag stuurt
 
@@ -796,6 +806,16 @@ Met de monitor is de warmtevraag-keten van de WKF 70 in kaart gebracht:
 | zomerstand uit → **Verwarmen** | `1951` → `5001` | `5001` Standby→Verwarmen; `5085` 10→27 °C |
 | VK-modus **stooklijn → vaste waarde 28 °C** | `1972` + `5085` | kring aan; `5085` = 28 °C |
 | vaste waarde **19 °C** | `5085` | `5085` = 19 °C; compressor toert af → opmode Nawerking |
+| vaste waarde **19 → 30 °C** (klep 63%, thermostaat 23 °C, kamer 20 °C) | `5085` → `5001` | `5001` Verwarmen; compressor binnen ~6 s aan |
+
+De laatste rij is de beslissende proef (20:49–20:52):
+
+```
+20:49:45  5085 = 30 °C  ->  5001 = Verwarmen, compressor nog uit
+20:49:51  compressor AAN: 16 Hz, starts 9684 -> 9685
+20:50:20  -> 28 Hz, 700 W        aanvoer 19,5 -> 22,0 °C
+20:51:57  -> 50 Hz, 1100 W el / 4500 W th   aanvoer 24,0 °C, retour 19,0 °C
+```
 
 Conclusies:
 
@@ -803,13 +823,19 @@ Conclusies:
   instelt** (via "vaste waarde" of stooklijn). De Remko volgt die en moduleert de
   compressor (0→54 Hz, 0→1800 W). Dat is dus het juiste aangrijppunt voor
   `heating_comfort.py`.
+* **`5085` is óók de aan/uit-knop:** 19 °C → stilstand; 30 °C → draaien. De
+  aanvoer liep op (5132) terwijl de retour laag bleef (5581), dus er werd warmte
+  afgegeven aan het circuit.
 * De **HC1-vloerkring** (`5156/5157` mengklep, `5577/5799` pomp, `5059` debiet,
   `5071` vermogen) bleef in alle metingen op **0**, óók toen de kamerthermostaat
   (Watts) op 23 °C stond bij 20 °C kamertemperatuur. `5048 hc1_room_temp` is `0`
-  (geen ruimtesensor op de HC1).
+  (geen ruimtesensor op de HC1). De klep die SmartWeb op **63 %** toont (rondje
+  met driehoek) heeft **geen enkel register** en beweegt nergens mee.
 * Daarmee: de **kamerwarmtevraag loopt buiten de Remko-gateway om** — de
-  thermostaat stuurt de mengunit/pomp rechtstreeks. De Remko levert alleen het
-  primaire warme water op de aanvoer die `5085` voorschrijft.
+  thermostaat + mengklep sturen de vloerkring rechtstreeks. De Remko levert alleen
+  het primaire warme water op de aanvoer die `5085` voorschrijft. Voor
+  prijssturing is dat precies goed: wij sturen `5085`, het kamercomfort blijft van
+  de thermostaat.
 * `5124/5123` (HC1 aanvoer/retour) en `5131` (buffervat) geven **300,0 °C** =
   sentinel "geen sensor".
 

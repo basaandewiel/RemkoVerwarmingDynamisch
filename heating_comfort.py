@@ -12,8 +12,13 @@ Remko:
   * in de **duurste uren** vraagt ze een **lage** aanvoertemperatuur
     (`coast_temp`, default 28 °C) zodat de warmtepomp stilstaat en de vloer de
     kamer blijft voeden;
-  * daarbuiten staat de aanvoer op de normale, constante waarde (`base_temp`,
-    default gelijk aan `heatpump.supply_temperature`, meestal 35 °C).
+  * daarbuiten staat de aanvoer op de normale, constante waarde (`base_temp`).
+
+De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**: de
+"vaste waarde" die in de GUI van de VK-modus staat (register `1974`
+`fixed_temp_req`, met `5085` als terugval). Verzet je die in de GUI, dan volgt
+de regeling hem bij de volgende verversing automatisch. In de config kun je
+`base_temp` ook op een vast getal of op `"config"` zetten.
 
 Er wordt **geen ruimtetemperatuur gelezen**: het kamercomfort blijft bepaald
 door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 5085
@@ -55,6 +60,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Register
 SUPPLY_REGISTER = 5085      # gewenste aanvoertemperatuur ruimteverwarming
+FIXED_TEMP_REGISTER = 1974  # opgeslagen "vaste waarde" van de VK-modus
 
 # Defaults (zie de module-docstring)
 DEFAULT_CHARGE_TEMP = 40.0
@@ -73,6 +79,11 @@ DEFAULT_INTERVAL_MINUTES = 5.0
 DEFAULT_RESPONSE_TIMEOUT = 8.0
 DEFAULT_ROWS_REFRESH_SECONDS = 1800.0
 DEFAULT_PRICE_DAYS_AHEAD = 3
+DEFAULT_BASE_READ_TIMEOUT = 8.0
+# Ondergrens/ bovengrens waarbinnen een uit register 1974/5085 gelezen
+# rustwaarde geloofwaardig is (daarbuiten negeren we hem).
+MIN_READABLE_BASE_TEMP = 15.0
+MAX_READABLE_BASE_TEMP = 50.0
 EPS = 1e-6
 
 
@@ -81,18 +92,37 @@ EPS = 1e-6
 # --------------------------------------------------------------------------- #
 
 def heating_cfg(cfg: dict) -> dict:
-    """Lees de `mqtt.heating_comfort`-sectie met verstandige defaults."""
+    """Lees de `mqtt.heating_comfort`-sectie met verstandige defaults.
+
+    `base_temp` (de rustwaarde buiten de blokken) mag op drie manieren:
+
+    * een getal  -> die waarde wordt gebruikt;
+    * ``null`` of weggelaten -> de **bestaande vaste waarde** wordt bij de start
+      uit register 1974 (`fixed_temp_req`) gelezen, met 5085 als terugval. Dat is
+      de waarde die in de GUI onder "vaste waarde" staat, zodat er buiten de
+      blokken niets verandert;
+    * ``"config"`` -> terugvallen op `heatpump.supply_temperature`.
+    """
     mqtt_cfg = cfg.get("mqtt") or {}
     hc = mqtt_cfg.get("heating_comfort") or {}
     hp = cfg.get("heatpump") or {}
-    # Zonder expliciete `base_temp` valt de normale aanvoer terug op de
-    # aanvoertemperatuur uit de heatpump-config (meestal 35 °C), zodat er
-    # buiten de blokken niets verandert aan de bestaande, constante aanvoer.
-    base_default = float(hp.get("supply_temperature", DEFAULT_BASE_TEMP))
+    raw_base = hc.get("base_temp", None)
+    # Een expliciet getal in de config gebruikt dat; anders lezen we de vaste
+    # waarde uit het register (zie read_fixed_temp).
+    if raw_base is None or str(raw_base).strip() in ("", "null", "register"):
+        base_temp = float(hp.get("supply_temperature", DEFAULT_BASE_TEMP))
+        base_from_register = True
+    elif str(raw_base).strip() == "config":
+        base_temp = float(hp.get("supply_temperature", DEFAULT_BASE_TEMP))
+        base_from_register = False
+    else:
+        base_temp = float(raw_base)
+        base_from_register = False
     return {
         "enabled": bool(hc.get("enabled", False)),
         "charge_temp": float(hc.get("charge_temp", DEFAULT_CHARGE_TEMP)),
-        "base_temp": float(hc.get("base_temp", base_default)),
+        "base_temp": base_temp,
+        "base_temp_from_register": base_from_register,
         "coast_temp": float(hc.get("coast_temp", DEFAULT_COAST_TEMP)),
         "min_supply": float(hc.get("min_supply", DEFAULT_MIN_SUPPLY)),
         "max_supply": float(hc.get("max_supply", DEFAULT_MAX_SUPPLY)),
@@ -124,6 +154,9 @@ def heating_cfg(cfg: dict) -> dict:
             hc.get("rows_refresh_seconds", DEFAULT_ROWS_REFRESH_SECONDS)
         ),
         "price_days_ahead": int(hc.get("price_days_ahead", DEFAULT_PRICE_DAYS_AHEAD)),
+        "base_read_timeout_seconds": float(
+            hc.get("base_read_timeout_seconds", DEFAULT_BASE_READ_TIMEOUT)
+        ),
         "qos": int(hc.get("qos", 1)),
         "retain": bool(hc.get("retain", False)),
     }
@@ -303,6 +336,7 @@ def decide(
         "enabled": ccfg["enabled"],
         "charge_temp": ccfg["charge_temp"],
         "base_temp": ccfg["base_temp"],
+        "base_temp_from_register": ccfg.get("base_temp_from_register", False),
         "coast_temp": ccfg["coast_temp"],
         "min_supply": ccfg["min_supply"],
         "max_supply": ccfg["max_supply"],
@@ -373,6 +407,118 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     with open(state_path(), "w", encoding="utf-8") as fh:
         json.dump(state, fh, ensure_ascii=False, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# De bestaande vaste waarde uitlezen (register 1974 / 5085)
+# --------------------------------------------------------------------------- #
+
+def read_fixed_temp(mqtt_cfg: dict, timeout: float = DEFAULT_BASE_READ_TIMEOUT) -> Optional[float]:
+    """Lees de in de GUI ingestelde **vaste waarde** van de VK-modus.
+
+    Dat is register **1974** (`fixed_temp_req`, de opgeslagen instelling); als de
+    gateway die niet meestuurt, valt het terug op register **5085**
+    (`heat_water_temp_req`, de actieve vraag). Geeft ``None`` als er niets
+    bruikbaars terugkwam.
+
+    Read-only: stuurt alleen een `FORCE_RESPONSE`-query.
+    """
+    values = _query_registers(mqtt_cfg, [FIXED_TEMP_REGISTER, SUPPLY_REGISTER], timeout)
+    for reg in (FIXED_TEMP_REGISTER, SUPPLY_REGISTER):
+        if reg not in values:
+            continue
+        temp = float(values[reg])
+        if MIN_READABLE_BASE_TEMP <= temp <= MAX_READABLE_BASE_TEMP:
+            return round(temp, 1)
+    return None
+
+
+def _query_registers(mqtt_cfg: dict, registers: List[int],
+                     timeout: float = DEFAULT_BASE_READ_TIMEOUT) -> dict:
+    """Vraag een paar registers op en geef {register: waarde} terug.
+
+    Blokkeert tot `timeout` seconden of tot de gateway antwoordt. Fouten worden
+    stil opgevangen: de regeling moet zonder MQTT-antwoord gewoon door kunnen.
+    """
+    try:
+        mqtt = mqtt_out._paho()
+    except Exception:  # noqa: BLE001 — paho ontbreekt
+        return {}
+    got: dict = {}
+    done = threading.Event()
+    cmd_topic = energy_log.command_topic(mqtt_cfg)
+    data_topic = energy_log.data_topic(mqtt_cfg)
+    if not cmd_topic or not data_topic:
+        return {}
+
+    def on_connect(client, _userdata, _flags, _rc, properties=None):
+        try:
+            client.subscribe(data_topic, qos=0)
+            client.publish(cmd_topic,
+                           json.dumps(energy_log.build_query(registers)), qos=0)
+        except Exception:  # noqa: BLE001
+            done.set()
+
+    def on_message(_client, _userdata, message):
+        if message.topic != data_topic:
+            return
+        try:
+            payload = message.payload.decode()
+        except Exception:  # noqa: BLE001
+            return
+        parsed = energy_log.parse_values(payload)
+        wanted = {r: v for r, v in parsed.items() if r in registers}
+        if wanted:
+            got.update(wanted)
+            done.set()
+
+    client = None
+    try:
+        client = energy_log._make_connected_client(mqtt, mqtt_cfg)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.loop_start()
+        done.wait(timeout)
+    except Exception:  # noqa: BLE001 — geen verbinding
+        return {}
+    finally:
+        if client is not None:
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+    return got
+
+
+def resolve_base_temp(ccfg: dict, mqtt_cfg: dict, state: dict,
+                      log=None) -> float:
+    """Bepaal de rustwaarde (`base_temp`), indien nodig uit de regeling.
+
+    Werkt `ccfg["base_temp"]` bij als `base_temp_from_register` aan staat:
+    bij voorkeur uit register 1974/5085, anders uit de eerder opgeslagen waarde
+    in de statusfile, en anders blijft de config-waarde staan.
+    """
+    if not ccfg.get("base_temp_from_register"):
+        return ccfg["base_temp"]
+    temp = read_fixed_temp(mqtt_cfg, ccfg.get("base_read_timeout_seconds",
+                                              DEFAULT_BASE_READ_TIMEOUT))
+    if temp is None:
+        remembered = state.get("base_temp")
+        if isinstance(remembered, (int, float)):
+            temp = float(remembered)
+            if log:
+                log(f"vaste waarde niet leesbaar — eerder gelezen {temp:g} °C")
+        else:
+            if log:
+                log("vaste waarde niet leesbaar — config-waarde "
+                    f"{ccfg['base_temp']:g} °C blijft staan")
+            return ccfg["base_temp"]
+    ccfg["base_temp"] = float(temp)
+    state["base_temp"] = float(temp)
+    if log:
+        log(f"vaste waarde uit register: {temp:g} °C")
+    return ccfg["base_temp"]
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +654,9 @@ def watch(cfg: dict, tz: ZoneInfo, ccfg: dict, dry_run: bool) -> int:
     )
 
     state = load_state()
+    if ccfg.get("base_temp_from_register"):
+        resolve_base_temp(ccfg, mqtt_cfg, state, log=_log)
+        save_state(state)
     rows: List[dict] = []
     granularity = 15
     rows_at = 0.0
@@ -523,6 +672,10 @@ def watch(cfg: dict, tz: ZoneInfo, ccfg: dict, dry_run: bool) -> int:
                 _log("FOUT: prijzen/voorspelling ophalen mislukt:", exc)
                 if rows:
                     rows_at = time.time()
+            # Lees de vaste waarde opnieuw: verzet de gebruiker 's winters de
+            # GUI, dan volgt de rustwaarde automatisch.
+            if ccfg.get("base_temp_from_register"):
+                resolve_base_temp(ccfg, mqtt_cfg, state, log=_log)
 
         out = decide(ccfg, now, rows, granularity, state)
         execute(out, mqtt_cfg, ccfg, state, dry_run)
@@ -586,6 +739,11 @@ def render_human(out: dict) -> List[str]:
         f"duur uur {out.get('coast_temp', DEFAULT_COAST_TEMP):g} °C "
         f"(register {SUPPLY_REGISTER})"
     )
+    if out.get("base_temp_from_register"):
+        lines.append(
+            f"Rustwaarde: {out.get('base_temp', DEFAULT_BASE_TEMP):g} °C "
+            f"uit register {FIXED_TEMP_REGISTER}/{SUPPLY_REGISTER}"
+        )
 
     status = out.get("status")
     if status == "disabled":
@@ -652,6 +810,10 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--watch", action="store_true", help="blijf draaien")
     ap.add_argument("--interval", type=float, default=None,
                     help="seconden tussen samples in --watch (default uit config)")
+    ap.add_argument("--base-temp", type=float, default=None,
+                    help="rustwaarde overschrijven (anders uit config/register 1974)")
+    ap.add_argument("--read-base", action="store_true",
+                    help="de rustwaarde nu uit register 1974/5085 lezen en tonen")
     args = ap.parse_args(argv)
 
     try:
@@ -667,6 +829,24 @@ def main(argv: List[str] | None = None) -> int:
     ccfg = heating_cfg(cfg)
     if args.interval is not None:
         ccfg["interval_minutes"] = args.interval / 60.0
+    if args.base_temp is not None:
+        ccfg["base_temp"] = float(args.base_temp)
+        ccfg["base_temp_from_register"] = False
+
+    mqtt_cfg = cfg.get("mqtt") or {}
+    state = load_state()
+
+    if args.read_base:
+        temp = read_fixed_temp(mqtt_cfg, ccfg["base_read_timeout_seconds"])
+        if temp is None:
+            print("vaste waarde: niet leesbaar (register 1974/5085 gaf niets)",
+                  file=sys.stderr)
+            return 1
+        state["base_temp"] = temp
+        save_state(state)
+        print(f"vaste waarde (register {FIXED_TEMP_REGISTER}/"
+              f"{SUPPLY_REGISTER}): {temp:g} °C")
+        return 0
 
     if args.watch and not args.now:
         return watch(cfg, tz, ccfg, dry_run=args.dry_run)
@@ -675,7 +855,9 @@ def main(argv: List[str] | None = None) -> int:
     if now.tzinfo is None:
         now = now.replace(tzinfo=tz)
 
-    mqtt_cfg = cfg.get("mqtt") or {}
+    if ccfg.get("base_temp_from_register"):
+        resolve_base_temp(ccfg, mqtt_cfg, state, log=lambda m: print(m, file=sys.stderr))
+
     rows: List[dict] = []
     granularity = 15
     try:
@@ -683,7 +865,6 @@ def main(argv: List[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — nette melding, ga door zonder data
         print(f"WAARSCHUWING: prijzen/voorspelling ophalen mislukt: {exc}", file=sys.stderr)
 
-    state = load_state()
     out = decide(ccfg, now, rows, granularity, state)
     execute(out, mqtt_cfg, ccfg, state, dry_run=args.dry_run)
 

@@ -50,7 +50,9 @@ class TestHeatingCfg(unittest.TestCase):
         c = _cfg()
         self.assertFalse(c["enabled"])
         self.assertEqual(c["charge_temp"], 40.0)
-        self.assertEqual(c["base_temp"], 35.0)
+        # Zonder base_temp in de config komt hij uit het register (1974/5085).
+        self.assertTrue(c["base_temp_from_register"])
+        self.assertEqual(c["base_temp"], 35.0)  # voorlopige fallback
         self.assertEqual(c["coast_temp"], 28.0)
         self.assertEqual(c["min_supply"], 20.0)
         self.assertEqual(c["max_supply"], 45.0)
@@ -61,9 +63,20 @@ class TestHeatingCfg(unittest.TestCase):
         self.assertEqual(c["coast_blocks_per_day"], 1)
         self.assertEqual(c["max_outdoor_for_heating_c"], 15.0)
 
-    def test_base_temp_follows_heatpump_supply(self):
+    def test_base_temp_null_means_register(self):
+        c = _cfg(base_temp=None)
+        self.assertTrue(c["base_temp_from_register"])
+
+    def test_base_temp_config_uses_heatpump_supply(self):
+        c = _cfg(base_temp="config")
+        self.assertFalse(c["base_temp_from_register"])
+        self.assertEqual(c["base_temp"], 35.0)
+
+    def test_base_temp_from_heatpump_when_register(self):
         cfg = {"heatpump": {"supply_temperature": 45}, "mqtt": {"heating_comfort": {}}}
-        self.assertEqual(heating_comfort.heating_cfg(cfg)["base_temp"], 45.0)
+        c = heating_comfort.heating_cfg(cfg)
+        self.assertTrue(c["base_temp_from_register"])
+        self.assertEqual(c["base_temp"], 45.0)
 
     def test_overrides(self):
         c = _cfg(enabled=True, charge_temp=42, base_temp=32, coast_temp=26,
@@ -71,6 +84,7 @@ class TestHeatingCfg(unittest.TestCase):
         self.assertTrue(c["enabled"])
         self.assertEqual(c["charge_temp"], 42.0)
         self.assertEqual(c["base_temp"], 32.0)
+        self.assertFalse(c["base_temp_from_register"])
         self.assertEqual(c["coast_temp"], 26.0)
         self.assertEqual(c["charge_blocks_per_day"], 3)
         self.assertEqual(c["max_outdoor_for_heating_c"], 12.0)
@@ -265,6 +279,77 @@ class TestRender(unittest.TestCase):
         out = heating_comfort.decide(_cfg(), _dt(8, 0), [], 15, {})
         lines = "\n".join(heating_comfort.render_human(out))
         self.assertIn("uit", lines)
+
+
+class TestReadFixedTemp(unittest.TestCase):
+    """Register 1974/5085 uitlezen en als rustwaarde gebruiken."""
+
+    def setUp(self):
+        self.orig = heating_comfort._query_registers
+        self.seen = []
+
+    def tearDown(self):
+        heating_comfort._query_registers = self.orig
+
+    def _fake(self, values):
+        def impl(_cfg, registers, timeout=0):
+            self.seen.append(list(registers))
+            return dict(values)
+        heating_comfort._query_registers = impl
+
+    def test_prefers_1974(self):
+        self._fake({1974: 30.0, 5085: 19.0})
+        self.assertEqual(heating_comfort.read_fixed_temp({}), 30.0)
+
+    def test_falls_back_to_5085(self):
+        self._fake({5085: 27.5})
+        self.assertEqual(heating_comfort.read_fixed_temp({}), 27.5)
+
+    def test_ignores_implausible(self):
+        self._fake({1974: 300.0, 5085: 0.0})
+        self.assertIsNone(heating_comfort.read_fixed_temp({}))
+
+    def test_nothing_readable(self):
+        self._fake({})
+        self.assertIsNone(heating_comfort.read_fixed_temp({}))
+
+    def test_queries_both_registers(self):
+        self._fake({1974: 30.0})
+        heating_comfort.read_fixed_temp({})
+        self.assertEqual(self.seen[0], [1974, 5085])
+
+    def test_resolve_uses_register(self):
+        self._fake({1974: 28.0})
+        c = _cfg(enabled=True)          # base_temp_from_register = True
+        state = {}
+        got = heating_comfort.resolve_base_temp(c, {}, state)
+        self.assertEqual(got, 28.0)
+        self.assertEqual(c["base_temp"], 28.0)
+        self.assertEqual(state["base_temp"], 28.0)
+
+    def test_resolve_remembers_last(self):
+        self._fake({})                 # niets leesbaar
+        c = _cfg(enabled=True)
+        state = {"base_temp": 26.0}
+        got = heating_comfort.resolve_base_temp(c, {}, state)
+        self.assertEqual(got, 26.0)
+        self.assertEqual(c["base_temp"], 26.0)
+
+    def test_resolve_keeps_config_without_memory(self):
+        self._fake({})
+        c = _cfg(enabled=True, base_temp=None)
+        c["base_temp"] = 33.0
+        c["base_temp_from_register"] = True
+        got = heating_comfort.resolve_base_temp(c, {}, {})
+        self.assertEqual(got, 33.0)
+
+    def test_resolve_skips_when_disabled(self):
+        self._fake({1974: 28.0})
+        c = _cfg(enabled=True, base_temp=32)
+        c["base_temp_from_register"] = False
+        got = heating_comfort.resolve_base_temp(c, {}, {})
+        self.assertEqual(got, 32.0)
+        self.assertEqual(self.seen, [])
 
 
 if __name__ == "__main__":
