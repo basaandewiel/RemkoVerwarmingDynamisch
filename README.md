@@ -856,30 +856,45 @@ Conclusies:
 * `5124/5123` (HC1 aanvoer/retour) en `5131` (buffervat) geven **300,0 °C** =
   sentinel "geen sensor".
 
-#### Belangrijk: er zitten twee modus-lagen bóven `5085` (21:37)
+#### Belangrijk: er zitten twee modus-lagen bóven `5085` (21:37–21:55)
 
 Toen de vloerverwarming "maar bleef verwarmen" bleek er een **hoofdmodus** te
 zijn die alles overrulet. Via *Instellingen → Expert → Verwarmen/koelen → modus*
-stond die op **Verwarmen**; op **automatisch (01)** ging de warmtepomp naar
-**Standby**. Gemeten gevolg:
+stond die op **Verwarmen**; op **automatisch (01)** ging de warmtepomp eerst naar
+**Standby**, maar startte daarna zélf een verwarmingscyclus op de **stooklijn**.
 
-| Hoofdmodus | `1951` / `5001` | `5085` schrijfbaar? | compressor |
+Gemeten gedrag (met testpublicaties van `5085`):
+
+| Expert-hoofdmodus | VK-modus | `5085` overgenomen? | Gedrag |
 |---|---|---|---|
-| **Verwarmen** | Verwarmen | ja (bij VK-modus *vaste waarde*) | draait door, ook zonder kamervraag |
-| **automatisch (01)** / Standby | Standby | **nee** — setpoint wordt genegeerd | uit |
+| **Verwarmen** | **vaste waarde** | ✅ ja | volgt ons setpoint (0 → 50 Hz) |
+| **Verwarmen** | stooklijn | ❌ nee | stooklijn houdt `5085` vast |
+| **Auto (01)** | vaste waarde | ❌ nee | stooklijn actief; setpoint genegeerd |
+| **Auto (01)** | stooklijn | ❌ nee | stooklijn actief; setpoint genegeerd |
+| Standby | — | ❌ nee | pomp stil (retour ≈ aanvoer) → compressor uit |
 
-Bovendien **overschrijft de VK-modus *stooklijn* het setpoint**: met de VK-modus
-op stooklijn bleef `5085 = 27,5 °C` staan terwijl we 28/26/24 °C publiceerden
-(alleen "bevestigd" van de broker, geen effect). Alleen met de VK-modus op
-**vaste waarde** nam de Remko `5085` over.
+Bewijs Auto-modus: we publiceerden `5085 = 22 °C` midden in een Auto-cyclus →
+`5085` bleef 6 keer op `27,5 °C` staan (`5001 = 6` Verwarmen). De Remko startte
+die cyclus **zelf** doordat de aanvoer afkoelde naar ~21,5 °C:
+
+```
+21:51:50  aanvoer 24,0 -> 22,5 °C (pomp draait, systeem koelt af)
+21:52:39  compressor AAN: 19 Hz        (aanvoer was 21,5 °C)
+21:53:21  -> 30 Hz / 900 W    aanvoer 25,0 °C
+21:54:40  -> 47 Hz / 1200 W   aanvoer 27,0 °C   (klimt naar stooklijn 27,5)
+```
 
 > **Gevolg voor `heating_comfort.py`.** Register 5085 sturen werkt **alleen** als:
 > 1. de expert-hoofdmodus op **Verwarmen** staat (niet standby/automatisch), én
 > 2. de VK-modus op **vaste waarde** staat (niet stooklijn).
 >
-> In andere modi wordt het setpoint genegeerd of overschreven. Dit is nog een
-> open ontwerpvraag: sturen op `5085` (met de modus vast) of op de hoofdmodus
-> (`1951`/`5001`) als aan/uit-knop.
+> In Auto/standby wordt het setpoint genegeerd; met stooklijn wordt het
+> overschreven. Dan moet `heating_comfort` dus **zelf** het "uit" regelen
+> (`coast_temp`) — de Remko heeft in de Verwarmen-modus geen eigen stop
+> (die bleef vanavond op 30 °C onbeperkt stoken).
+>
+> Open ontwerpvraag: sturen op `5085` (expert-modus vast op Verwarmen) of op de
+> hoofdmodus (`1951`/`5001`) als aan/uit-knop.
 
 #### Wanneer stopt de Remko? (fysische voorwaarde)
 
