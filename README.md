@@ -34,7 +34,8 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
 10. (optioneel) een **registermonitor** (`register_monitor.py`) om uit te zoeken
     **hoe de thermostaat de warmtevraag stuurt**: logt een set Remko-registers
     (aanvoer/retour, HC1-mengklep/pomp, ruimte, opmode, …) met de tijd naar een
-    CSV en toont live alleen de wijzigingen.
+    CSV en toont live alleen de wijzigingen. Met `analyse_heating_demand.py`
+    volgt de conclusie (zie “Wat we hiermee hebben vastgesteld”).
 
 Het resultaat kan optioneel via **MQTT** worden gepubliceerd (de MQTT-
 integratie van jouw warmtepomp draait al; dit programma publiceert alleen
@@ -763,6 +764,66 @@ wijziging met tijdstip (`oud -> nieuw`). Met `--no-csv` schrijf je niets weg.
 | `csv` | `~/.cache/remko-wkf70/heating_probe.csv` | tijdreeks. |
 | `log_csv` | `true` | CSV wegschrijven (uit = alleen live tonen, `--no-csv`). |
 | `include_handshake` | `false` | de 3 handshake-registers meesturen in de query. |
+
+### Doorlopend meten (meerdere dagen)
+
+De monitor hoeft geen aparte service te zijn: met cron start hij na elke reboot
+en draait door zonder SSH-sessie. `deploy/start-register-monitor.sh` regelt
+start/stop/status (geen sudo nodig):
+
+```bash
+bash deploy/start-register-monitor.sh          # (her)start nu
+bash deploy/start-register-monitor.sh status   # draait hij?
+bash deploy/start-register-monitor.sh stop     # stoppen
+```
+
+Cron-regels die daarbij horen (log groeit niet onbeperkt door de rotatie):
+
+```
+@reboot sleep 30 && bash ~/github/RemkoVerwarmingDynamisch/deploy/start-register-monitor.sh >/dev/null 2>&1
+15 4 * * * bash ~/github/RemkoVerwarmingDynamisch/deploy/rotate-monitor-log.sh >/dev/null 2>&1
+```
+
+Daarna de bevindingen uitlezen met `analyse_heating_demand.py` (zie onder) of met
+`register_monitor.py --report`.
+
+### Wat we hiermee hebben vastgesteld (19-10-2026)
+
+Met de monitor is de warmtevraag-keten van de WKF 70 in kaart gebracht:
+
+| Handeling (SmartWeb GUI) | Register | Effect |
+|---|---|---|
+| zomerstand uit → **Verwarmen** | `1951` → `5001` | `5001` Standby→Verwarmen; `5085` 10→27 °C |
+| VK-modus **stooklijn → vaste waarde 28 °C** | `1972` + `5085` | kring aan; `5085` = 28 °C |
+| vaste waarde **19 °C** | `5085` | `5085` = 19 °C; compressor toert af → opmode Nawerking |
+
+Conclusies:
+
+* **Register `5085` is exact de "gewenste aanvoertemperatuur" die je in de GUI
+  instelt** (via "vaste waarde" of stooklijn). De Remko volgt die en moduleert de
+  compressor (0→54 Hz, 0→1800 W). Dat is dus het juiste aangrijppunt voor
+  `heating_comfort.py`.
+* De **HC1-vloerkring** (`5156/5157` mengklep, `5577/5799` pomp, `5059` debiet,
+  `5071` vermogen) bleef in alle metingen op **0**, óók toen de kamerthermostaat
+  (Watts) op 23 °C stond bij 20 °C kamertemperatuur. `5048 hc1_room_temp` is `0`
+  (geen ruimtesensor op de HC1).
+* Daarmee: de **kamerwarmtevraag loopt buiten de Remko-gateway om** — de
+  thermostaat stuurt de mengunit/pomp rechtstreeks. De Remko levert alleen het
+  primaire warme water op de aanvoer die `5085` voorschrijft.
+* `5124/5123` (HC1 aanvoer/retour) en `5131` (buffervat) geven **300,0 °C** =
+  sentinel "geen sensor".
+
+**Nachtanalyse** — `analyse_heating_demand.py` leest de CSV, detecteert de
+verwarmingsperiodes en toont of de mengklep/pomp bewogen (bewijs dat de
+thermostaat vraagt):
+
+```bash
+~/remkoverwarming/venv/bin/python3 analyse_heating_demand.py
+~/remkoverwarming/venv/bin/python3 analyse_heating_demand.py --json
+```
+
+Alleen de mengklep/pomp (`5156/5157/5799/5577/5059/5071`) geldt als hard bewijs;
+het primaire debiet (`5582`) en `1972` (kan uit een GUI-instelling komen) niet.
 
 ## Energie-logger (`energy_log.py`) — echte COP meten
 
