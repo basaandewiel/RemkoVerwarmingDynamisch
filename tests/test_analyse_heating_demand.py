@@ -79,8 +79,18 @@ class TestRender(unittest.TestCase):
     def test_conclusion_positive(self):
         lines = analyse.render_report(_rows(hc1_moves=True), "test.csv")
         text = "\n".join(lines)
-        self.assertIn("HC1-kring BEWOOG", text)
+        self.assertIn("HC1-mengklep/pomp BEWOOG", text)
         self.assertIn("via de HC1-registers", text)
+
+    def test_1972_alone_is_not_proof(self):
+        # Alleen heating_circ_mode beweegt (GUI-instelling): geen hard bewijs.
+        rows = _rows(hc1_moves=False)
+        for r in rows:
+            r["heating_circ_mode"] = "1"
+        rows[3]["heating_circ_mode"] = "0"
+        lines = analyse.render_report(rows, "test.csv")
+        text = "\n".join(lines)
+        self.assertIn("buiten de gateway om", text)
 
     def test_no_periods(self):
         lines = analyse.render_report(_rows(99, 99), "test.csv")

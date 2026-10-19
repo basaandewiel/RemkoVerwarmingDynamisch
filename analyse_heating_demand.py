@@ -39,17 +39,27 @@ DEFAULT_CSV = os.path.join(
     os.path.expanduser("~"), ".cache", "remko-wkf70", "heating_probe.csv"
 )
 
-# Registers van de HC1-vloerkring (de thermostaat/mengunit)
+# Registers van de HC1-vloerkring (de thermostaat/mengunit).
+# LET OP: 5582 (`heating_flow_rate`) is het *primaire* debiet van de warmtepomp,
+# niet de HC1-kring; die hoort hier dus NIET bij. `1972` (heating_circ_mode) is
+# de kring aan/uit maar kan ook door een GUI-instelling komen; daarom telt hij
+# mee als "kring actief" maar niet als hard bewijs dat de *thermostaat* vraagt.
 HC1_REGISTERS = {
     5156: "hc1_mixer_status",
     5157: "hc1_mixer_position",
     5799: "hc1_pump_demand",
     5577: "hc1_pump_speed_rel",
     5059: "hc1_flow_rate",
-    5582: "heating_flow_rate",
     5071: "hc1_power",
     5068: "hc1_op_mode",
     1972: "heating_circ_mode",
+}
+
+# De mengklep/pomp: als deze van 0 afkomen, komt de vraag écht van de
+# thermostaat/mengunit (en niet van een GUI-instelling).
+HC1_MIXER_PUMP = {
+    "hc1_mixer_status", "hc1_mixer_position", "hc1_pump_demand",
+    "hc1_pump_speed_rel", "hc1_flow_rate", "hc1_power",
 }
 
 # Aantal opeenvolgende samples dat de vraag aan moet houden voor een "periode".
@@ -194,8 +204,14 @@ def render_report(rows: List[dict], path: str) -> List[str]:
             f"aanvoer {s['hp_flow_temp_range']} °C, retour {s['hp_return_temp_range']} °C"
         )
         if s["hc1_moved"]:
-            hc1_evidence = True
-            lines.append("      HC1-kring BEWOOG (thermostaat vraagt!):")
+            mixer_pump = {
+                n: e for n, e in s["hc1_moved"].items() if n in HC1_MIXER_PUMP
+            }
+            if mixer_pump:
+                hc1_evidence = True
+                lines.append("      HC1-mengklep/pomp BEWOOG (thermostaat vraagt!):")
+            else:
+                lines.append("      HC1-kring actief (maar zonder mengklep/pomp-beweging):")
             for name, events in s["hc1_moved"].items():
                 lines.append(f"        - {name}: " + "; ".join(events[:6]))
         else:
@@ -207,10 +223,10 @@ def render_report(rows: List[dict], path: str) -> List[str]:
     lines.append("")
     lines.append("  Conclusie:")
     if hc1_evidence:
-        lines.append("    De thermostaat stuurt de HC1-kring aan (mengklep/pomp bewegen).")
-        lines.append("    -> de Remko ziet de vraag dus via de HC1-registers.")
+        lines.append("    De thermostaat stuurt de HC1-mengklep/pomp aan.")
+        lines.append("    -> de Remko ziet de kamerwarmtevraag dus via de HC1-registers.")
     else:
-        lines.append("    De HC1-kring bleef de hele nacht ongemoeid (mengklep/pomp = 0).")
+        lines.append("    De HC1-mengklep/pomp kwamen de hele periode niet van 0.")
         lines.append("    -> de thermostaat stuurt NIET via de Remko-registers;")
         lines.append("       de kamerwarmtevraag loopt buiten de gateway om.")
     return lines
