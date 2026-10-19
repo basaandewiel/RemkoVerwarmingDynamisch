@@ -827,7 +827,8 @@ door:
 5156/5157/5577/5799/5059/5071 = 0   (HC1-kring blijft onzichtbaar)
 ```
 
-De Remko is dus **blind voor de kamerthermostaat**: hij volgt uitsluitend `5085`.
+De Remko is dus **blind voor de kamerthermostaat**: hij volgt uitsluitend `5085` —
+maar wel binnen de grenzen van de **hoofdmodus** (zie de modus-lagen hierboven).
 
 Conclusies:
 
@@ -855,6 +856,38 @@ Conclusies:
 * `5124/5123` (HC1 aanvoer/retour) en `5131` (buffervat) geven **300,0 °C** =
   sentinel "geen sensor".
 
+#### Belangrijk: er zitten twee modus-lagen bóven `5085` (21:37)
+
+Toen de vloerverwarming "maar bleef verwarmen" bleek er een **hoofdmodus** te
+zijn die alles overrulet. Via *Instellingen → Expert → Verwarmen/koelen → modus*
+stond die op **Verwarmen**; op **automatisch (01)** ging de warmtepomp naar
+**Standby**. Gemeten gevolg:
+
+| Hoofdmodus | `1951` / `5001` | `5085` schrijfbaar? | compressor |
+|---|---|---|---|
+| **Verwarmen** | Verwarmen | ja (bij VK-modus *vaste waarde*) | draait door, ook zonder kamervraag |
+| **automatisch (01)** / Standby | Standby | **nee** — setpoint wordt genegeerd | uit |
+
+Bovendien **overschrijft de VK-modus *stooklijn* het setpoint**: met de VK-modus
+op stooklijn bleef `5085 = 27,5 °C` staan terwijl we 28/26/24 °C publiceerden
+(alleen "bevestigd" van de broker, geen effect). Alleen met de VK-modus op
+**vaste waarde** nam de Remko `5085` over.
+
+> **Gevolg voor `heating_comfort.py`.** Register 5085 sturen werkt **alleen** als:
+> 1. de expert-hoofdmodus op **Verwarmen** staat (niet standby/automatisch), én
+> 2. de VK-modus op **vaste waarde** staat (niet stooklijn).
+>
+> In andere modi wordt het setpoint genegeerd of overschreven. Dit is nog een
+> open ontwerpvraag: sturen op `5085` (met de modus vast) of op de hoofdmodus
+> (`1951`/`5001`) als aan/uit-knop.
+
+#### Wanneer stopt de Remko? (fysische voorwaarde)
+
+Met de pomp stil (`5582 = 0 l/min`) en **retour ≈ aanvoer** (`5581 24,0`
+tegen `5132 24,5 °C`) is er geen warmteafname meer en stopt de compressor
+(`5205 = 0 Hz`, `5320/5321 = 0 W`). De klep die SmartWeb toonde ging mee van
+**63 % → 0 %**. De HC1-klep-registers in de gateway blijven echter `0`.
+
 **Nachtanalyse** — `analyse_heating_demand.py` leest de CSV, detecteert de
 verwarmingsperiodes en toont of de mengklep/pomp bewogen (bewijs dat de
 thermostaat vraagt):
@@ -866,6 +899,13 @@ thermostaat vraagt):
 
 Alleen de mengklep/pomp (`5156/5157/5799/5577/5059/5071`) geldt als hard bewijs;
 het primaire debiet (`5582`) en `1972` (kan uit een GUI-instelling komen) niet.
+
+**Uit-drempel sweepen** — `probe_supply_temp.py` zet een reeks 5085-waarden en
+meet na elke stap of de compressor draait (let op: dit **schrijft** 5085):
+
+```bash
+~/remkoverwarming/venv/bin/python3 probe_supply_temp.py --temps 28,26,24,22,20
+```
 
 ## Energie-logger (`energy_log.py`) — echte COP meten
 

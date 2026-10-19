@@ -85,6 +85,7 @@ def probe(mqtt_cfg: dict, temps: List[float], settle: float, sample: float,
         last = {}
         peak_freq = 0.0
         peak_el = 0.0
+        accepted = False
         while time.time() < t_end:
             time.sleep(sample)
             last = _read(mqtt_cfg, WATCH_REGISTERS)
@@ -92,24 +93,39 @@ def probe(mqtt_cfg: dict, temps: List[float], settle: float, sample: float,
             el = last.get(5320, 0.0)
             peak_freq = max(peak_freq, freq)
             peak_el = max(peak_el, el)
-            _log(f"   {_fmt(last)}")
+            got = last.get(5085)
+            if got is not None and abs(got - temp) <= 0.6:
+                accepted = True
+            _log(f"   {_fmt(last)}"
+                 + ("" if accepted else "   [5085 NIET overgenomen]"))
 
         results.append({
             "setpoint": temp,
             "final": last,
             "peak_freq": peak_freq,
             "peak_el": peak_el,
+            "accepted": accepted,
         })
 
     _log("")
     _log("=== samenvatting ===")
     for r in results:
-        run = r["peak_freq"] > 0
-        verdict = "DRAAIT" if run else "STIL"
-        _log(f"  5085 = {r['setpoint']:>5g} °C  ->  {verdict:<7} "
+        if not r["final"]:
+            verdict = "GEEN DATA"
+        elif not r["accepted"]:
+            verdict = "GENEGEERD"
+        else:
+            verdict = "DRAAIT" if r["peak_freq"] > 0 else "STIL"
+        _log(f"  5085 = {r['setpoint']:>5g} °C  ->  {verdict:<9} "
              f"(piek {r['peak_freq']:g} Hz / {r['peak_el']:g} W; "
-             f"eind {r['final'].get(5085, float('nan')):g} °C "
-             f"compressor={r['final'].get(5625, '?')})")
+             f"eind 5085={r['final'].get(5085, float('nan')):g} °C, "
+             f"compressor={r['final'].get(5625, r['final'].get(5205, '?'))})")
+    if any(not r["accepted"] for r in results):
+        _log("")
+        _log("LET OP: één of meer setpoints werden NIET overgenomen. Dat gebeurt als")
+        _log("  de VK-modus op 'stooklijn' staat (die overschrijft 5085) of als de")
+        _log("  hoofdmodus op Standby/automatisch staat. Zet de VK-modus op 'vaste")
+        _log("  waarde' en de expert-modus op 'Verwarmen' om 5085 te kunnen sturen.")
 
     if restore and original is not None:
         payload = heating_comfort.build_setpoint_payload(original)
