@@ -141,7 +141,7 @@ ID_BY_NAME: Dict[str, int] = {name: reg for reg, name, _, _ in CATALOG}
 # Standaardset: de registers die samen de warmtevraag-keten vormen. Uit te
 # breiden/te beperken via `mqtt.register_monitor.registers` of `--registers`.
 DEFAULT_REGISTERS: List[int] = [
-    5001, 1951, 1972, 1946,                                  # modus/vraag
+    5001, 1951, 1972, 1974, 1946,                             # modus/vraag
     5085, 5190, 5132, 5581, 5124, 5123, 5055, 5036, 5035,    # aanvoer/retour
     5048, 5077, 5068, 5148, 5711, 5156, 5157, 5799, 5577,     # HC1/thermostaat
     5059, 5582, 5071, 5718,                                   # HC1 debiet/vermogen

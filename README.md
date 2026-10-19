@@ -688,7 +688,7 @@ Standaard wordt de hele "vraagketen" gevolgd:
 |---|---|
 | 5001 | `opmode` — `10` = standby, `6` = verwarmen, `4` = SWW laden, `9` = nawerking |
 | 1951 | `main_mode` — `2` = verwarmen, `3` = standby |
-| 1972 / 1946 | kringmodus (aan/uit) / kouder-warmer-correctie |
+| 1972 / 1974 / 1946 | `heating_circ_mode` (aan/uit) / `fixed_temp_req` (vaste waarde) / kouder-warmer-correctie |
 | 5085 / 5190 | gewenste aanvoer (`heat_water_temp_req`) / werkelijke aanvoer |
 | 5132 / 5581 | warmtepomp aanvoer / retour |
 | 5124 / 5123 / 5055 | HC1 aanvoer / retour / gemengd |
