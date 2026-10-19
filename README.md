@@ -896,6 +896,46 @@ die cyclus **zelf** doordat de aanvoer afkoelde naar ~21,5 °C:
 > Open ontwerpvraag: sturen op `5085` (expert-modus vast op Verwarmen) of op de
 > hoofdmodus (`1951`/`5001`) als aan/uit-knop.
 
+#### Welke registers zijn schrijfbaar via MQTT? (21:56–22:20)
+
+Belangrijk: **niet elk register dat de gateway toont, kun je ook schrijven.**
+Systematisch getest door een waarde te publiceren en het effect terug te lezen:
+
+| Register | Schrijfbaar? | Effect |
+|---|---|---|
+| **1082** `water_temp_req` (SWW-setpoint) | ✅ **ja** | directe setpoint-wijziging (35 → 45 °C bleef staan) |
+| **1972** `heating_circ_mode` | ✅ **ja** | **schakelt stooklijn ↔ vaste waarde** → verandert `5085`! |
+| **5085** `heat_water_temp_req` | ❌ **nee** | read-only resultante (publicatie wordt genegeerd) |
+| 1974 `fixed_temp_req` (vaste waarde) | ❌ nee | niet in antwoord, niet overgenomen |
+| 1951 `main_mode` (expert-modus) | ? | geen observeerbaar effect (niet terugleesbaar) |
+| 1946 `temp_adjust` | ? | niet terugleesbaar |
+
+De schrijfroute zelf is goed: `1082` veranderde wél (payload `{"values": {"1082":
+"01C2"}}`, ook met `FORCE_RESPONSE`). Het probleem is **5085-specifiek**: de
+gateway accepteert geen schrijfactie op `5085`.
+
+**Bewijs dat `1972` de echte knop is:**
+
+```
+1972 = 0  (uit)  ->  5085 = 27,5 °C   (stooklijn, volgt buitentemp)
+1972 = 1  (aan)  ->  5085 = 30,0 °C   (vaste waarde uit de GUI)
+```
+
+Dus de vloerverwarming-aanvoer is **niet vrij instelbaar via MQTT**; je kunt
+alleen **tussen twee modi schakelen** (stooklijn of vaste waarde). De vaste
+waarde zelf wordt alleen via de GUI gezet.
+
+> **Ontwerpgevolg.** `heating_comfort.py` kan `5085` niet sturen. Werkbare opties:
+> * **`1972` als aan/uit**: 1 = verwarmen op de vaste waarde, 0 = stooklijn
+>   (lager). Dat is een grof tweestanden-signaal, geen modulatie.
+> * **de vaste waarde in de GUI** bepalen en `heating_comfort` alleen `1972`
+>   laten schakelen op prijs/COP;
+> * of uitzoeken of de vaste waarde via een ander (nog onbekend) register
+>   schrijfbaar is.
+>
+> Dit is nog te beslissen; de regeling zoals gebouwd (direct 5085 sturen) werkt
+> **niet** op deze installatie.
+
 #### Wanneer stopt de Remko? (fysische voorwaarde)
 
 Met de pomp stil (`5582 = 0 l/min`) en **retour ≈ aanvoer** (`5581 24,0`
