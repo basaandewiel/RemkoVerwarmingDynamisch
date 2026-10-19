@@ -119,6 +119,16 @@
       "qos": 1,
       "retain": false
     },
+    "register_monitor": {
+      "registers": [],
+      "interval_seconds": 15,
+      "response_timeout_seconds": 8,
+      "settle_seconds": 1.5,
+      "heartbeat_seconds": 300,
+      "csv": "~/.cache/remko-wkf70/heating_probe.csv",
+      "log_csv": true,
+      "include_handshake": false
+    },
     "energy_log": {
       "enabled": true,
       "interval_seconds": 60,

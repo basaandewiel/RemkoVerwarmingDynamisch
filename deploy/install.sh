@@ -91,4 +91,10 @@ echo "     sudo systemctl enable --now remko-heating-comfort"
 echo "     journalctl -u remko-heating-comfort -f"
 echo "   (draait naast de SWW-regeling; schrijft alleen register 5085)"
 echo
+echo "-> Uitzoeken hoe de thermostaat de warmtevraag stuurt? Draai (read-only,"
+echo "   geen service) de registermonitor en kijk welke registers veranderen:"
+echo "     venv/bin/python3 register_monitor.py --once     # één sample"
+echo "     venv/bin/python3 register_monitor.py            # live wijzigingenlog"
+echo "     venv/bin/python3 register_monitor.py --report   # wijzigingen uit CSV"
+echo
 echo "Vul eerst je ENTSO-E API-key in: nano $DIR/config.json  (daarna: sudo systemctl restart remko-sww-boost remko-energy-log)"

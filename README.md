@@ -31,6 +31,10 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
    aanvoertemperatuur ruimteverwarming** (register 5085) op de dynamische
    prijs/COP — hoger in de goedkoopste uren (vloer laden), lager in de duurste
    uren (vloer laten uitwerken) en daar tussenin de normale, constante waarde.
+10. (optioneel) een **registermonitor** (`register_monitor.py`) om uit te zoeken
+    **hoe de thermostaat de warmtevraag stuurt**: logt een set Remko-registers
+    (aanvoer/retour, HC1-mengklep/pomp, ruimte, opmode, …) met de tijd naar een
+    CSV en toont live alleen de wijzigingen.
 
 Het resultaat kan optioneel via **MQTT** worden gepubliceerd (de MQTT-
 integratie van jouw warmtepomp draait al; dit programma publiceert alleen
@@ -661,6 +665,104 @@ journalctl -u remko-heating-comfort -f
 > die vaak de echte vraag, en begrenst 5085 vooral de aanvoer zodra er vraag is.
 > Test daarom eerst met `--dry-run` en kijk in `journalctl` mee wat de Remko
 > doet voordat je de service live inschakelt.
+
+## Registermonitor (`register_monitor.py`) — uitzoeken hoe de thermostaat de vraag stuurt
+
+De vloerverwarming vraagt warmte via een mengklep/thermostaat (bij jou een
+Watts-thermostaat). Hoe de Remko dat vertaalt naar zijn eigen registers is niet
+gedocumenteerd. `register_monitor.py` **logt een set registers met de tijd** en
+toont live alléén wat verandert, zodat je kunt afleiden welke registers de
+"vraag" dragen: verandert `5085` (`heat_water_temp_req`, de gewenste aanvoer)
+als je de thermostaat hoger zet, of gebeurt de vraag juist via de HC1-mengklep
+en -pomp (`5156`/`5157`/`5577`), de kringmodus (`1972`) of de bedrijfsmodus
+(`5001`)?
+
+Het programma is **read-only**: het stuurt alleen een `FORCE_RESPONSE`-query
+(zoals `energy_log.py`) en schrijft **nooit** een register. Je kunt het dus
+rustig naast de bestaande services laten draaien terwijl je aan de thermostaat
+draait.
+
+Standaard wordt de hele "vraagketen" gevolgd:
+
+| Register | Betekenis |
+|---|---|
+| 5001 | `opmode` — `10` = standby, `6` = verwarmen, `4` = SWW laden, `9` = nawerking |
+| 1951 | `main_mode` — `2` = verwarmen, `3` = standby |
+| 1972 / 1946 | kringmodus (aan/uit) / kouder-warmer-correctie |
+| 5085 / 5190 | gewenste aanvoer (`heat_water_temp_req`) / werkelijke aanvoer |
+| 5132 / 5581 | warmtepomp aanvoer / retour |
+| 5124 / 5123 / 5055 | HC1 aanvoer / retour / gemengd |
+| 5048 / 5077 | HC1 kamertemperatuur ist / soll |
+| 5068 / 5148 / 5711 | HC1 bedrijfsmodus / ruimteklimaat / HVAC-modus |
+| 5156 / 5157 / 5799 / 5577 / 5059 / 5071 | mengklepstatus / mengklepstand / pompvraag / pomptoerental / debiet / vermogen |
+| 5051 / 5049 / 5625 / 5205 / 5822 | warmtegenerator aan-uit / HP-status / compressor aan-uit / compressorfrequentie / compressorstarts |
+| 5032 / 5056 / 5034 / 5131 | buitentemperatuur / gedempte buitentemp. / vertrek (vloer) / buffervat |
+| 5039 / 1082 | SWW-werkelijk / SWW-setpoint (om verwarmen van SWW-laden te onderscheiden) |
+| 5105 / 5374 / 5376 | energietellers (elektrisch / verwarming / SWW, kWh) |
+
+> **Let op — sentinel `300.0 °C`.** Registers als `5124`/`5123` (HC1 aanvoer/
+> retour) en `5131` (buffervat) geven **300.0** als er geen (aangesloten) sensor
+> is; de gateway stuurt dan een vast "onbekend"-getal. Eveneens kan `5048`
+> (kamertemperatuur) `0.0` zijn als er geen ruimtesensor op de HC1 hangt.
+
+**Registertypen** (overgenomen uit
+[`Altrec/remko_mqtt-ha`](https://github.com/Altrec/remko_mqtt-ha)): temperaturen
+zijn 16-bits signed gedeeld door 10; het elektrische vermogen (`5320`/`5321`)
+is `raw × 100` W; de overige sensoren zijn raw unsigned integers. De modus-
+labels komen uit dezelfde integratie (alleen `5001`, `1951` en `1079` zijn
+gedocumenteerd; andere mode-registers tonen we als ruw getal).
+
+```bash
+# catalogus met alle ondersteunde registers (en welke standaard aanstaan):
+~/remkoverwarming/venv/bin/python3 register_monitor.py --list
+
+# één sample, leesbare tabel (verifieer eerst de verbinding):
+~/remkoverwarming/venv/bin/python3 register_monitor.py --once
+
+# live wijzigingenlog (Ctrl-C stopt); schrijft ook de CSV:
+~/remkoverwarming/venv/bin/python3 register_monitor.py
+
+# sneller pollen / alleen bepaalde registers:
+~/remkoverwarming/venv/bin/python3 register_monitor.py --interval 10
+~/remkoverwarming/venv/bin/python3 register_monitor.py --registers 5001,5085,1972,5157
+
+# een meetvenster van een uur, dan stoppen:
+~/remkoverwarming/venv/bin/python3 register_monitor.py --duration 3600
+
+# elke sample de volledige tabel (i.p.v. alleen wijzigingen):
+~/remkoverwarming/venv/bin/python3 register_monitor.py --all
+
+# achteraf de wijzigingen uit de CSV samenvatten:
+~/remkoverwarming/venv/bin/python3 register_monitor.py --report
+```
+
+Antwoordt de gateway niet, probeer dan `--once --handshake` (dezelfde drie
+handshake-registers die de HA-integratie meestuurt).
+
+Om een paar uur/dagen onafgebroken te meten (overleeft een SSH-verbreking):
+
+```bash
+nohup ~/remkoverwarming/venv/bin/python3 register_monitor.py \
+    --duration 86400 > ~/heating_probe.log 2>&1 &
+tail -f ~/heating_probe.log
+```
+
+De CSV (`~/.cache/remko-wkf70/heating_probe.csv`) bevat per sample één regel met
+alle gekozen registers; `--report` leest die terug en toont per register elke
+wijziging met tijdstip (`oud -> nieuw`). Met `--no-csv` schrijf je niets weg.
+
+**Config** (`mqtt.register_monitor`, zie `config.example.json`):
+
+| Sleutel | Default | Betekenis |
+|---|---|---|
+| `registers` | leeg = standaardset | eigen registerlijst (zie `--list`). |
+| `interval_seconds` | `15` | seconden tussen samples. |
+| `response_timeout_seconds` | `8` | wachten op het eerste antwoord van de gateway. |
+| `settle_seconds` | `1.5` | daarna nog even doorluisteren voor de overige registers. |
+| `heartbeat_seconds` | `300` | zonder wijzigingen elke N s een korte statusregel. |
+| `csv` | `~/.cache/remko-wkf70/heating_probe.csv` | tijdreeks. |
+| `log_csv` | `true` | CSV wegschrijven (uit = alleen live tonen, `--no-csv`). |
+| `include_handshake` | `false` | de 3 handshake-registers meesturen in de query. |
 
 ## Energie-logger (`energy_log.py`) — echte COP meten
 
