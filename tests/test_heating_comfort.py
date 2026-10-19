@@ -93,14 +93,16 @@ class TestHeatingCfg(unittest.TestCase):
 class TestPayload(unittest.TestCase):
     def test_known_values(self):
         p = heating_comfort.build_setpoint_payload(40.0)
-        self.assertEqual(p["values"]["5085"], "0190")
-        self.assertEqual(heating_comfort.build_setpoint_payload(35.0)["values"]["5085"], "015e")
-        self.assertEqual(heating_comfort.build_setpoint_payload(28.0)["values"]["5085"], "0118")
-        self.assertEqual(heating_comfort.build_setpoint_payload(24.0)["values"]["5085"], "00f0")
-        self.assertEqual(heating_comfort.build_setpoint_payload(45.0)["values"]["5085"], "01c2")
+        # We schrijven de schrijfbare vaste waarde (1975); 5085 volgt.
+        self.assertEqual(p["values"]["1975"], "0190")
+        self.assertEqual(heating_comfort.build_setpoint_payload(35.0)["values"]["1975"], "015e")
+        self.assertEqual(heating_comfort.build_setpoint_payload(28.0)["values"]["1975"], "0118")
+        self.assertEqual(heating_comfort.build_setpoint_payload(24.0)["values"]["1975"], "00f0")
+        self.assertEqual(heating_comfort.build_setpoint_payload(45.0)["values"]["1975"], "01c2")
 
-    def test_force_response(self):
-        self.assertTrue(heating_comfort.build_setpoint_payload(40.0)["FORCE_RESPONSE"])
+    def test_no_force_response_on_write(self):
+        # Een schrijfactie mag GEEN FORCE_RESPONSE bevatten (dat zou een query zijn).
+        self.assertNotIn("FORCE_RESPONSE", heating_comfort.build_setpoint_payload(40.0))
 
 
 class TestClamp(unittest.TestCase):
@@ -262,7 +264,7 @@ class TestExecute(unittest.TestCase):
             heating_comfort.mqtt_out.publish_command = orig
         self.assertTrue(out["mqtt_published"])
         self.assertEqual(state["last_sent_setpoint"], self.c["charge_temp"])
-        self.assertEqual(out["payload"]["values"]["5085"], "0190")
+        self.assertEqual(out["payload"]["values"]["1975"], "0190")
 
 
 class TestRender(unittest.TestCase):
@@ -273,7 +275,7 @@ class TestRender(unittest.TestCase):
         out = heating_comfort.decide(c, now, rows, 15, {})
         lines = "\n".join(heating_comfort.render_human(out))
         self.assertIn("Vloerverwarming", lines)
-        self.assertIn("5085", lines)
+        self.assertIn("1975", lines)   # we sturen de schrijfbare vaste waarde
 
     def test_render_disabled(self):
         out = heating_comfort.decide(_cfg(), _dt(8, 0), [], 15, {})
@@ -282,7 +284,7 @@ class TestRender(unittest.TestCase):
 
 
 class TestReadFixedTemp(unittest.TestCase):
-    """Register 1974/5085 uitlezen en als rustwaarde gebruiken."""
+    """Register 1975/1974/5085 uitlezen en als rustwaarde gebruiken."""
 
     def setUp(self):
         self.orig = heating_comfort._query_registers
@@ -297,29 +299,33 @@ class TestReadFixedTemp(unittest.TestCase):
             return dict(values)
         heating_comfort._query_registers = impl
 
-    def test_prefers_1974(self):
-        self._fake({1974: 30.0, 5085: 19.0})
+    def test_prefers_1975(self):
+        self._fake({1975: 30.0, 1974: 26.0, 5085: 19.0})
         self.assertEqual(heating_comfort.read_fixed_temp({}), 30.0)
+
+    def test_falls_back_to_1974(self):
+        self._fake({1974: 26.0, 5085: 19.0})
+        self.assertEqual(heating_comfort.read_fixed_temp({}), 26.0)
 
     def test_falls_back_to_5085(self):
         self._fake({5085: 27.5})
         self.assertEqual(heating_comfort.read_fixed_temp({}), 27.5)
 
     def test_ignores_implausible(self):
-        self._fake({1974: 300.0, 5085: 0.0})
+        self._fake({1975: 300.0, 1974: 300.0, 5085: 0.0})
         self.assertIsNone(heating_comfort.read_fixed_temp({}))
 
     def test_nothing_readable(self):
         self._fake({})
         self.assertIsNone(heating_comfort.read_fixed_temp({}))
 
-    def test_queries_both_registers(self):
-        self._fake({1974: 30.0})
+    def test_queries_three_registers(self):
+        self._fake({1975: 30.0})
         heating_comfort.read_fixed_temp({})
-        self.assertEqual(self.seen[0], [1974, 5085])
+        self.assertEqual(self.seen[0], [1975, 1974, 5085])
 
     def test_resolve_uses_register(self):
-        self._fake({1974: 28.0})
+        self._fake({1975: 28.0})
         c = _cfg(enabled=True)          # base_temp_from_register = True
         state = {}
         got = heating_comfort.resolve_base_temp(c, {}, state)
@@ -344,7 +350,7 @@ class TestReadFixedTemp(unittest.TestCase):
         self.assertEqual(got, 33.0)
 
     def test_resolve_skips_when_disabled(self):
-        self._fake({1974: 28.0})
+        self._fake({1975: 28.0})
         c = _cfg(enabled=True, base_temp=32)
         c["base_temp_from_register"] = False
         got = heating_comfort.resolve_base_temp(c, {}, {})

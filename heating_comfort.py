@@ -2,9 +2,10 @@
 """Vloerverwarming-bufferregeling: laad de vloer op de goedkoopste uren.
 
 De vloerverwarming is een grote warmtebuffer. Deze regeling stuurt de
-**gewenste aanvoertemperatuur ruimteverwarming** (register 5085,
-`heat_water_temp_req`) op basis van de dynamische stroomprijs en de COP van de
-Remko:
+**vaste waarde van de VK-modus** (register **1975**) op basis van de dynamische
+stroomprijs en de COP van de Remko. De gateway werkt daarna de gewenste
+aanvoertemperatuur `heat_water_temp_req` (**5085**) bij; 5085 is zelf
+**read-only** en volgt 1975.
 
   * in de **goedkoopste uren** (kwartierprijs / COP) vraagt ze een **hogere**
     aanvoertemperatuur (`charge_temp`, default 40 °C) zodat de vloer warmte
@@ -14,11 +15,10 @@ Remko:
     kamer blijft voeden;
   * daarbuiten staat de aanvoer op de normale, constante waarde (`base_temp`).
 
-De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**: de
-"vaste waarde" die in de GUI van de VK-modus staat (register `1974`
-`fixed_temp_req`, met `5085` als terugval). Verzet je die in de GUI, dan volgt
-de regeling hem bij de volgende verversing automatisch. In de config kun je
-`base_temp` ook op een vast getal of op `"config"` zetten.
+De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**:
+register `1975` (met `1974` en `5085` als terugval). Verzet je de vaste waarde in
+de GUI, dan volgt de regeling hem bij de volgende verversing automatisch. In de
+config kun je `base_temp` ook op een vast getal of op `"config"` zetten.
 
 Er wordt **geen ruimtetemperatuur gelezen**: het kamercomfort blijft bepaald
 door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 5085
@@ -59,8 +59,16 @@ from optimizer import build_corrected_rows, find_cheapest_blocks
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Register
-SUPPLY_REGISTER = 5085      # gewenste aanvoertemperatuur ruimteverwarming
-FIXED_TEMP_REGISTER = 1974  # opgeslagen "vaste waarde" van de VK-modus
+# Registers van de ruimteverwarming.
+#
+# De gewenste aanvoertemperatuur (`heat_water_temp_req`) zit in 5085, maar dat is
+# een **read-only resultante**: de gateway accepteert er geen schrijfacties op.
+# De **schrijfbare** instelling is 1975 (de "vaste waarde" van de VK-modus, die
+# de GUI ook zet); 5085 volgt 1975 automatisch. We sturen dus **1975** en lezen
+# 5085 terug als controle.
+SUPPLY_REGISTER = 5085        # gewenste aanvoertemperatuur (read-only resultante)
+FIXED_TEMP_REGISTER = 1975    # schrijfbare "vaste waarde" van de VK-modus
+FIXED_TEMP_FALLBACK = 1974    # oudere/alternatieve vaste-waarde-register
 
 # Defaults (zie de module-docstring)
 DEFAULT_CHARGE_TEMP = 40.0
@@ -172,13 +180,17 @@ def clamp_supply(temperature: float, ccfg: dict) -> float:
 
 
 def build_setpoint_payload(temperature: float) -> dict:
-    """5085-waarde = gewenste aanvoertemperatuur (°C × 10) in hexadecimaal.
+    """Payload die de **vaste waarde** van de VK-modus zet (register 1975).
 
-    Zelfde wire-formaat als `dhw_comfort.build_setpoint_payload`:
-    40 °C -> 400 decimaal -> 0x0190 -> "0190".
+    We schrijven **1975** (schrijfbaar); de gateway werkt daarna 5085
+    (`heat_water_temp_req`) bij. Wire-formaat: temperatuur × 10 in hexadecimaal,
+    4 tekens — 40 °C -> 400 -> 0x0190 -> "0190".
+
+    Let op: geen `FORCE_RESPONSE` — dat zou als *query* gelezen worden; een
+    schrijfactie is alleen `{"values": {...}}` (zoals de HA-integratie doet).
     """
     value_hex = format(int(round(temperature * 10.0)), "04x")
-    return {"FORCE_RESPONSE": True, "values": {str(SUPPLY_REGISTER): value_hex}}
+    return {"values": {str(FIXED_TEMP_REGISTER): value_hex}}
 
 
 def _hours_per_day(horizon_hours: float) -> int:
@@ -410,21 +422,21 @@ def save_state(state: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# De bestaande vaste waarde uitlezen (register 1974 / 5085)
+# De bestaande vaste waarde uitlezen (register 1975 / 5085)
 # --------------------------------------------------------------------------- #
 
 def read_fixed_temp(mqtt_cfg: dict, timeout: float = DEFAULT_BASE_READ_TIMEOUT) -> Optional[float]:
     """Lees de in de GUI ingestelde **vaste waarde** van de VK-modus.
 
-    Dat is register **1974** (`fixed_temp_req`, de opgeslagen instelling); als de
-    gateway die niet meestuurt, valt het terug op register **5085**
-    (`heat_water_temp_req`, de actieve vraag). Geeft ``None`` als er niets
-    bruikbaars terugkwam.
+    Dat is register **1975**; als de gateway die niet meestuurt, valt het terug
+    op **1974** en daarna op **5085** (`heat_water_temp_req`, de actieve
+    resultante). Geeft ``None`` als er niets bruikbaars terugkwam.
 
     Read-only: stuurt alleen een `FORCE_RESPONSE`-query.
     """
-    values = _query_registers(mqtt_cfg, [FIXED_TEMP_REGISTER, SUPPLY_REGISTER], timeout)
-    for reg in (FIXED_TEMP_REGISTER, SUPPLY_REGISTER):
+    order = (FIXED_TEMP_REGISTER, FIXED_TEMP_FALLBACK, SUPPLY_REGISTER)
+    values = _query_registers(mqtt_cfg, list(order), timeout)
+    for reg in order:
         if reg not in values:
             continue
         temp = float(values[reg])
@@ -737,7 +749,7 @@ def render_human(out: dict) -> List[str]:
         f"Regeling : laden {out.get('charge_temp', DEFAULT_CHARGE_TEMP):g} °C, "
         f"normaal {out.get('base_temp', DEFAULT_BASE_TEMP):g} °C, "
         f"duur uur {out.get('coast_temp', DEFAULT_COAST_TEMP):g} °C "
-        f"(register {SUPPLY_REGISTER})"
+        f"(register {FIXED_TEMP_REGISTER})"
     )
     if out.get("base_temp_from_register"):
         lines.append(
@@ -839,13 +851,13 @@ def main(argv: List[str] | None = None) -> int:
     if args.read_base:
         temp = read_fixed_temp(mqtt_cfg, ccfg["base_read_timeout_seconds"])
         if temp is None:
-            print("vaste waarde: niet leesbaar (register 1974/5085 gaf niets)",
+            print("vaste waarde: niet leesbaar (register 1975/1974/5085 gaf niets)",
                   file=sys.stderr)
             return 1
         state["base_temp"] = temp
         save_state(state)
         print(f"vaste waarde (register {FIXED_TEMP_REGISTER}/"
-              f"{SUPPLY_REGISTER}): {temp:g} °C")
+              f"{FIXED_TEMP_FALLBACK}/{SUPPLY_REGISTER}): {temp:g} °C")
         return 0
 
     if args.watch and not args.now:

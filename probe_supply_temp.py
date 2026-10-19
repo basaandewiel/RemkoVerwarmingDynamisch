@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Bepaal de "uit-drempel" van register 5085: bij welke gewenste
+"""Bepaal de "uit-drempel" van de ruimteverwarming: bij welke gewenste
 aanvoertemperatuur stopt de compressor?
 
-Achtergrond: `5085` (`heat_water_temp_req`) is de **aan/uit- én modulatieknop**
-van de Remko. Uit losse metingen bleek 19 °C -> compressor uit (Nawerking) en
-28-30 °C -> vol draaien. Dit hulpprogramma zet een reeks setpoints (aflopend) en
-meet na elke stap de reactie, zodat we de omslag precies kunnen vinden en
-`coast_temp` daarop kunnen instellen.
+Achtergrond: we schrijven de **schrijfbare vaste waarde** (register **1975**);
+de gateway werkt daarna `heat_water_temp_req` **5085** bij, en dát is de
+**aan/uit- én modulatieknop** van de Remko. Uit losse metingen bleek 19 °C ->
+compressor uit (Nawerking) en 28-30 °C -> vol draaien. Dit hulpprogramma zet een
+reeks waarden (aflopend) en meet na elke stap de reactie (we lezen `5085` terug
+als controle), zodat we de omslag precies kunnen vinden en `coast_temp` daarop
+kunnen instellen.
 
-**Let op:** dit schrijft register 5085 (het is dus géén read-only tool). De
+**Let op:** dit schrijft register 1975 (het is dus géén read-only tool). De
 huidige waarde wordt aan het begin gelezen en aan het eind teruggezet (tenzij
 `--no-restore`).
 
@@ -40,7 +42,7 @@ DEFAULT_SETTLE = 100.0          # seconden wachten na het zetten van een setpoin
 DEFAULT_SAMPLE = 10.0           # seconden tussen metingen binnen een stap
 
 # Registers die de reactie van de warmtepomp tonen.
-WATCH_REGISTERS = [5085, 5190, 5132, 5581, 5051, 5625, 5205, 5320, 5321, 5049]
+WATCH_REGISTERS = [1975, 5085, 5190, 5132, 5581, 5051, 5625, 5205, 5320, 5321, 5049]
 
 
 def _log(*parts) -> None:
@@ -66,7 +68,9 @@ def probe(mqtt_cfg: dict, temps: List[float], settle: float, sample: float,
     _log(f"commando-topic: {topic}")
 
     before = _read(mqtt_cfg, WATCH_REGISTERS)
-    original = before.get(5085)
+    # De rustwaarde lezen we bij voorkeur uit 1975 (de schrijfbare vaste waarde),
+    # met 5085 (de resultante) als terugval.
+    original = before.get(1975, before.get(5085))
     _log(f"huidige toestand: {_fmt(before)}")
 
     results = []
@@ -76,7 +80,7 @@ def probe(mqtt_cfg: dict, temps: List[float], settle: float, sample: float,
             mqtt_cfg, topic, payload,
             qos=1, retain=False,
         )
-        _log(f"-> 5085 = {temp:g} °C   ({json.dumps(payload)})  "
+        _log(f"-> 1975 = {temp:g} °C   ({json.dumps(payload)})  "
              f"[{'verstuurd' if ok else 'MISLUKT: ' + detail}]")
         if not ok:
             continue
@@ -97,7 +101,7 @@ def probe(mqtt_cfg: dict, temps: List[float], settle: float, sample: float,
             if got is not None and abs(got - temp) <= 0.6:
                 accepted = True
             _log(f"   {_fmt(last)}"
-                 + ("" if accepted else "   [5085 NIET overgenomen]"))
+                 + ("" if accepted else "   [1975/5085 NIET overgenomen]"))
 
         results.append({
             "setpoint": temp,
@@ -122,10 +126,10 @@ def probe(mqtt_cfg: dict, temps: List[float], settle: float, sample: float,
              f"compressor={r['final'].get(5625, r['final'].get(5205, '?'))})")
     if any(not r["accepted"] for r in results):
         _log("")
-        _log("LET OP: één of meer setpoints werden NIET overgenomen. Dat gebeurt als")
+        _log("LET OP: één of meer waarden werden NIET overgenomen. Dat gebeurt als")
         _log("  de VK-modus op 'stooklijn' staat (die overschrijft 5085) of als de")
         _log("  hoofdmodus op Standby/automatisch staat. Zet de VK-modus op 'vaste")
-        _log("  waarde' en de expert-modus op 'Verwarmen' om 5085 te kunnen sturen.")
+        _log("  waarde' en de expert-modus op 'Verwarmen' om via 1975 te kunnen sturen.")
 
     if restore and original is not None:
         payload = heating_comfort.build_setpoint_payload(original)
@@ -135,7 +139,7 @@ def probe(mqtt_cfg: dict, temps: List[float], settle: float, sample: float,
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Bepaal de uit-drempel van register 5085")
+    ap = argparse.ArgumentParser(description="Bepaal de uit-drempel van de ruimteverwarming (via 1975)")
     ap.add_argument("--config", default=os.path.join(SCRIPT_DIR, "config.json"))
     ap.add_argument("--temps", default=",".join(str(t) for t in DEFAULT_TEMPS),
                     help="komma-lijst van setpoints (aflopend aanbevolen)")

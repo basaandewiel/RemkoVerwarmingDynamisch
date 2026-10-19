@@ -27,10 +27,11 @@ Bepaalt wanneer de warmtepomp de komende ~24–48 uur het beste een blok van
    42 °C over is) en plant de opwarmmomenten op basis van de échte
    vattemperatuur, de uurvoorspelling, de COP en de kwartierprijzen.
 9. (optioneel) de **vloerverwarming-bufferregeling** (`heating_comfort.py`):
-   gebruikt de vloer als warmtebuffer en stuurt de **gewenste
-   aanvoertemperatuur ruimteverwarming** (register 5085) op de dynamische
-   prijs/COP — hoger in de goedkoopste uren (vloer laden), lager in de duurste
-   uren (vloer laten uitwerken) en daar tussenin de normale, constante waarde.
+   gebruikt de vloer als warmtebuffer en stuurt de **vaste waarde van de
+   VK-modus** (register 1975; de gewenste aanvoertemperatuur 5085 volgt die) op
+   de dynamische prijs/COP — hoger in de goedkoopste uren (vloer laden), lager
+   in de duurste uren (vloer laten uitwerken) en daar tussenin de normale,
+   constante waarde.
 10. (optioneel) een **registermonitor** (`register_monitor.py`) om uit te zoeken
     **hoe de thermostaat de warmtevraag stuurt**: logt een set Remko-registers
     (aanvoer/retour, HC1-mengklep/pomp, ruimte, opmode, …) met de tijd naar een
@@ -593,37 +594,38 @@ WantedBy=multi-user.target
 
 De vloerverwarming is één grote warmtebuffer: als je de vloer tijdens de
 goedkoopste uren wat warmer maakt, houdt die de kamer daarna urenlang op
-temperatuur. `heating_comfort.py` gebruikt dat en stuurt de **gewenste
-aanvoertemperatuur ruimteverwarming** — register **5085**
-(`heat_water_temp_req`, instelbaar 20–60 °C) — op basis van dezelfde data als
-het advies: de **kwartierprijs**, de **uurvoorspelling** en de **COP** van de
-Remko (gecorrigeerde prijs = €/kWh ÷ COP).
+temperatuur. `heating_comfort.py` gebruikt dat en stuurt de **vaste waarde van
+de VK-modus** — register **1975** (de schrijfbare instelling; de gewenste
+aanvoertemperatuur `heat_water_temp_req` **5085** volgt hem automatisch) — op
+basis van dezelfde data als het advies: de **kwartierprijs**, de
+**uurvoorspelling** en de **COP** van de Remko (gecorrigeerde prijs = €/kWh ÷
+COP).
 
 Drie niveau's:
 
-| Actie | Register 5085 | Betekenis |
+| Actie | Waarde (via register 1975) | Betekenis |
 |---|---|---|
 | **laden** (`charge_temp`, default 40 °C) | hoog | in de goedkoopste uren van de horizon: vloer laadt warmte |
-| **normaal** (`base_temp`, default = de bestaande vaste waarde uit register 1974/5085) | normaal | buiten de blokken: de bestaande, constante aanvoer |
+| **normaal** (`base_temp`, default = de bestaande vaste waarde uit register 1975) | normaal | buiten de blokken: de bestaande, constante aanvoer |
 | **duur uur** (`coast_temp`, default 28 °C) | laag | in de duurste uren: warmtepomp stilstaat, vloer voedt de kamer |
 
-De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**: de
-"vaste waarde" die in de GUI van de VK-modus staat (register `1974`
-`fixed_temp_req`, met `5085` als terugval). Verzet je die in de GUI, dan volgt de
+De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**:
+register `1975` (`fixed_temp_req`, de vaste waarde die de GUI ook zet), met
+`1974` en `5085` als terugval. Verzet je de vaste waarde in de GUI, dan volgt de
 regeling hem bij de volgende verversing automatisch. In de config kun je
 `base_temp` ook op een vast getal of op `"config"` zetten (dan
-`heatpump.supply_temperature`). Met `--read-base` lees je hem los uit:
+`heatpump.supply_temperature`). Met `--read-base` lees je hem los uit.
 
 De regeling leest **geen ruimtetemperatuur**: het kamercomfort blijft bepaald
-door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 5085
-geschreven — **niet** aan de SWW-regeling (1082) of de hoofdmode (1951)
-geraakt, dus deze service kan naast `dhw_comfort.py` draaien.
+door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 1975
+geschreven — **niet** aan de SWW-regeling (1082) of de hoofdmode (1951) geraakt,
+dus deze service kan naast `dhw_comfort.py` draaien.
 
-Het commando heeft hetzelfde wire-formaat als bij SWW:
-`{"FORCE_RESPONSE": true, "values": {"5085": "0190"}}` = 40 °C (temperatuur ×10
-in hexadecimaal). Er wordt alleen gepubliceerd als de waarde **verandert**; de
-statusfile `~/.cache/remko-wkf70/heating_comfort_state.json` onthoudt de laatst
-gezette aanvoertemperatuur.
+Het schrijfcommando is `{"values": {"1975": "0190"}}` = 40 °C (temperatuur ×10 in
+hexadecimaal). Bewust **zonder** `FORCE_RESPONSE`: dat veld zou het bericht als
+*query* (lezen) laten opvatten. Er wordt alleen gepubliceerd als de waarde
+**verandert**; de statusfile `~/.cache/remko-wkf70/heating_comfort_state.json`
+onthoudt de laatst gezette waarde.
 
 **Config** (`mqtt.heating_comfort`, zie `config.example.json`):
 
@@ -631,9 +633,9 @@ gezette aanvoertemperatuur.
 |---|---|---|
 | `enabled` | `false` | regeling aan/uit (staat bewust uit tot je hem op de Pi test). |
 | `charge_temp` | `40` | aanvoertemperatuur tijdens een laadblok. |
-| `base_temp` | `null` = uit register | normale, constante aanvoer buiten de blokken. `null`/weggelaten = bij de start lezen uit register 1974/5085; een getal = vast; `"config"` = `heatpump.supply_temperature`. |
+| `base_temp` | `null` = uit register | normale, constante aanvoer buiten de blokken. `null`/weggelaten = bij de start lezen uit register 1975 (met 1974/5085 als terugval); een getal = vast; `"config"` = `heatpump.supply_temperature`. |
 | `coast_temp` | `28` | aanvoertemperatuur tijdens de duurste uren. |
-| `min_supply` / `max_supply` | `20` / `45` | harde grenzen op register 5085 (vloerbescherming). |
+| `min_supply` / `max_supply` | `20` / `45` | harde grenzen op de geschreven waarde (vloerbescherming). |
 | `charge_block_hours` | `3.0` | lengte van een laadblok (vloer is traag: 2–4 u). |
 | `charge_blocks_per_day` | `2` | aantal laadblokken per etmaal. |
 | `min_gap_hours` | `6.0` | minimale tussenruimte tussen blokken. |
@@ -644,7 +646,7 @@ gezette aanvoertemperatuur.
 | `interval_minutes` | `5` | herberekeninterval in `--watch`. |
 
 ```bash
-# één beslissing, en publiceren (schrijft register 5085):
+# één beslissing, en publiceren (schrijft register 1975 = vaste waarde VK):
 ~/remkoverwarming/venv/bin/python3 heating_comfort.py
 
 # niets publiceren, alleen tonen:
@@ -654,7 +656,7 @@ gezette aanvoertemperatuur.
 ~/remkoverwarming/venv/bin/python3 heating_comfort.py \
     --dry-run --now 2026-10-11T08:00:00+02:00
 
-# de rustwaarde (vaste waarde) los uit register 1974/5085 lezen en tonen:
+# de rustwaarde (vaste waarde) los uit register 1975/1974/5085 lezen en tonen:
 ~/remkoverwarming/venv/bin/python3 heating_comfort.py --read-base
 
 # als continue service:
@@ -670,12 +672,14 @@ sudo systemctl enable --now remko-heating-comfort
 journalctl -u remko-heating-comfort -f
 ```
 
-> **Let op — hoe de Remko omgaat met 5085 (gemeten 19-10-2026).** Register 5085
-> is de **aan/uit- én modulatieknop** van de warmtepomp. Met de vaste waarde in
-> de GUI op 19 °C stond de compressor stil (`5001 = Nawerking`, 0 Hz); op 30 °C
-> ging hij binnen ~6 s draaien en moduleerde 16 → 50 Hz / 1100 W, met de aanvoer
-> die opliep (19,5 → 24,0 °C) en de retour op 19 °C — er werd dus warmte
-> afgegeven. Zie ook “Wat we hiermee hebben vastgesteld”.
+> **Let op — hoe de Remko omgaat met 1975/5085 (gemeten 19-10-2026).** Register
+> 1975 is de **schrijfbare "vaste waarde" van de VK-modus**; de gateway werkt
+> daarna `heat_water_temp_req` **5085** bij, en dát is de **aan/uit- én
+> modulatieknop** van de warmtepomp. Met de vaste waarde op 19 °C stond de
+> compressor stil (`5001 = Nawerking`, 0 Hz); op 30 °C ging hij binnen ~6 s
+> draaien en moduleerde 16 → 50 Hz / 1100 W. Zette `heating_comfort` `1975 = 24`
+> (5085 = 24 °C), dan toerde de compressor terug naar 36 Hz. Zie ook “Wat we
+> hiermee hebben vastgesteld”.
 
 ## Registermonitor (`register_monitor.py`) — uitzoeken hoe de thermostaat de vraag stuurt
 
@@ -699,7 +703,7 @@ Standaard wordt de hele "vraagketen" gevolgd:
 |---|---|
 | 5001 | `opmode` — `10` = standby, `6` = verwarmen, `4` = SWW laden, `9` = nawerking |
 | 1951 | `main_mode` — `2` = verwarmen, `3` = standby |
-| 1972 / 1974 / 1946 | `heating_circ_mode` (aan/uit) / `fixed_temp_req` (vaste waarde) / kouder-warmer-correctie |
+| 1972 / 1975 / 1946 | `heating_circ_mode` (stooklijn/vaste waarde) / `fixed_temp_req` (vaste waarde) / kouder-warmer-correctie |
 | 5085 / 5190 | gewenste aanvoer (`heat_water_temp_req`) / werkelijke aanvoer |
 | 5132 / 5581 | warmtepomp aanvoer / retour |
 | 5124 / 5123 / 5055 | HC1 aanvoer / retour / gemengd |
@@ -804,9 +808,11 @@ Met de monitor is de warmtevraag-keten van de WKF 70 in kaart gebracht:
 | Handeling (SmartWeb GUI) | Register | Effect |
 |---|---|---|
 | zomerstand uit → **Verwarmen** | `1951` → `5001` | `5001` Standby→Verwarmen; `5085` 10→27 °C |
-| VK-modus **stooklijn → vaste waarde 28 °C** | `1972` + `5085` | kring aan; `5085` = 28 °C |
-| vaste waarde **19 °C** | `5085` | `5085` = 19 °C; compressor toert af → opmode Nawerking |
-| vaste waarde **19 → 30 °C** (klep 63%, thermostaat 23 °C, kamer 20 °C) | `5085` → `5001` | `5001` Verwarmen; compressor binnen ~6 s aan |
+| VK-modus **stooklijn → vaste waarde 28 °C** | `1972` + `1975` | kring aan; `5085` = 28 °C |
+| vaste waarde **19 °C** | `1975` → `5085` | `5085` = 19 °C; compressor toert af → opmode Nawerking |
+| vaste waarde **19 → 30 °C** (klep 63%, thermostaat 23 °C, kamer 20 °C) | `1975` → `5085` → `5001` | `5001` Verwarmen; compressor binnen ~6 s aan |
+| `heating_comfort` schrijft **1975 = 24 °C** | `1975` → `5085` | `5085` = 24 °C; compressor 54 → 36 Hz |
+| `heating_comfort` schrijft **1975 = 35 °C** | `1975` → `5085` | `5085` = 35 °C binnen 7 s; blijft staan |
 
 De laatste rij is de beslissende proef (20:49–20:52):
 
@@ -827,15 +833,16 @@ door:
 5156/5157/5577/5799/5059/5071 = 0   (HC1-kring blijft onzichtbaar)
 ```
 
-De Remko is dus **blind voor de kamerthermostaat**: hij volgt uitsluitend `5085` —
-maar wel binnen de grenzen van de **hoofdmodus** (zie de modus-lagen hierboven).
+De Remko is dus **blind voor de kamerthermostaat**: hij volgt uitsluitend `5085`
+(de resultante van de vaste waarde `1975`) — maar wel binnen de grenzen van de
+**hoofdmodus** (zie de modus-lagen hierboven).
 
 Conclusies:
 
-* **Register `5085` is exact de "gewenste aanvoertemperatuur" die je in de GUI
-  instelt** (via "vaste waarde" of stooklijn). De Remko volgt die en moduleert de
-  compressor (0→54 Hz, 0→1800 W). Dat is dus het juiste aangrijppunt voor
-  `heating_comfort.py`.
+* **Register `1975` is de schrijfbare "vaste waarde" van de VK-modus; `5085` is de
+  resulterende "gewenste aanvoertemperatuur".** De Remko volgt `5085` en
+  moduleert de compressor (0→54 Hz, 0→1800 W). Dat is dus het juiste aangrijppunt
+  voor `heating_comfort.py` — maar dan via **1975**, niet 5085 (dat is read-only).
 * **`5085` is óók de aan/uit-knop:** 19 °C → stilstand; 30 °C → draaien. De
   aanvoer liep op (5132) terwijl de retour laag bleef (5581), dus er werd warmte
   afgegeven aan het circuit.
@@ -896,7 +903,7 @@ die cyclus **zelf** doordat de aanvoer afkoelde naar ~21,5 °C:
 > Open ontwerpvraag: sturen op `5085` (expert-modus vast op Verwarmen) of op de
 > hoofdmodus (`1951`/`5001`) als aan/uit-knop.
 
-#### Welke registers zijn schrijfbaar via MQTT? (21:56–22:20)
+#### Welke registers zijn schrijfbaar via MQTT? (21:56–22:35)
 
 Belangrijk: **niet elk register dat de gateway toont, kun je ook schrijven.**
 Systematisch getest door een waarde te publiceren en het effect terug te lezen:
@@ -904,37 +911,42 @@ Systematisch getest door een waarde te publiceren en het effect terug te lezen:
 | Register | Schrijfbaar? | Effect |
 |---|---|---|
 | **1082** `water_temp_req` (SWW-setpoint) | ✅ **ja** | directe setpoint-wijziging (35 → 45 °C bleef staan) |
-| **1972** `heating_circ_mode` | ✅ **ja** | **schakelt stooklijn ↔ vaste waarde** → verandert `5085`! |
+| **1972** `heating_circ_mode` | ✅ **ja** | schakelt stooklijn ↔ vaste waarde (gebruikt de GUI-waarde) |
+| **1975** `fixed_temp_req` (**vaste waarde VK**) | ✅ **ja** | **dé knop**: `1975` zetten → `5085` volgt direct |
 | **5085** `heat_water_temp_req` | ❌ **nee** | read-only resultante (publicatie wordt genegeerd) |
-| 1974 `fixed_temp_req` (vaste waarde) | ❌ nee | niet in antwoord, niet overgenomen |
+| 1974 (vaste waarde, oud) | ❌ nee | niet in antwoord, niet overgenomen |
 | 1951 `main_mode` (expert-modus) | ? | geen observeerbaar effect (niet terugleesbaar) |
 | 1946 `temp_adjust` | ? | niet terugleesbaar |
 
 De schrijfroute zelf is goed: `1082` veranderde wél (payload `{"values": {"1082":
 "01C2"}}`, ook met `FORCE_RESPONSE`). Het probleem is **5085-specifiek**: de
-gateway accepteert geen schrijfactie op `5085`.
+gateway accepteert geen schrijfactie op `5085`, want dat is de *resultante*.
 
-**Bewijs dat `1972` de echte knop is:**
+**Hoe we `1975` vonden.** Met `dump_registers.py` dump je álle registers; met
+`compare_dumps.py` diff je twee dumps terwijl je in de GUI de vaste waarde
+verzet. De diff liet één temperatuurregister meebewegen:
 
 ```
-1972 = 0  (uit)  ->  5085 = 27,5 °C   (stooklijn, volgt buitentemp)
-1972 = 1  (aan)  ->  5085 = 30,0 °C   (vaste waarde uit de GUI)
+dump A (GUI 30 °C):  1975 = 012C = 300 = 30,0 °C
+dump B (GUI 21 °C):  1975 = 00D2 = 210 = 21,0 °C    5085 = 21,0 °C
 ```
 
-Dus de vloerverwarming-aanvoer is **niet vrij instelbaar via MQTT**; je kunt
-alleen **tussen twee modi schakelen** (stooklijn of vaste waarde). De vaste
-waarde zelf wordt alleen via de GUI gezet.
+Daarna `1975` geschreven — en `5085` volgde **binnen 7 s** en bleef staan:
 
-> **Ontwerpgevolg.** `heating_comfort.py` kan `5085` niet sturen. Werkbare opties:
-> * **`1972` als aan/uit**: 1 = verwarmen op de vaste waarde, 0 = stooklijn
->   (lager). Dat is een grof tweestanden-signaal, geen modulatie.
-> * **de vaste waarde in de GUI** bepalen en `heating_comfort` alleen `1972`
->   laten schakelen op prijs/COP;
-> * of uitzoeken of de vaste waarde via een ander (nog onbekend) register
->   schrijfbaar is.
->
-> Dit is nog te beslissen; de regeling zoals gebouwd (direct 5085 sturen) werkt
-> **niet** op deze installatie.
+```
+1975 = 35 °C  ->  5085 = 35,0 °C   (compressor toerde terug zodra het lager werd)
+1975 = 24 °C  ->  5085 = 24,0 °C   (compressor 54 -> 36 Hz)
+```
+
+De keten is dus:
+
+```
+1975 (schrijfbaar, "vaste waarde" VK-modus)  ->  5085 (resultante)  ->  compressor-modulatie
+```
+
+> **Ontwerpgevolg.** `heating_comfort.py` stuurt daarom **register 1975** (niet
+> 5085). Schrijven naar de resultante `5085` werkt niet; `1975` is de echte knop.
+> Payload bewust **zonder** `FORCE_RESPONSE`: `{"values": {"1975": "0190"}}`.
 
 #### Wanneer stopt de Remko? (fysische voorwaarde)
 
@@ -955,11 +967,24 @@ thermostaat vraagt):
 Alleen de mengklep/pomp (`5156/5157/5799/5577/5059/5071`) geldt als hard bewijs;
 het primaire debiet (`5582`) en `1972` (kan uit een GUI-instelling komen) niet.
 
-**Uit-drempel sweepen** — `probe_supply_temp.py` zet een reeks 5085-waarden en
-meet na elke stap of de compressor draait (let op: dit **schrijft** 5085):
+**Uit-drempel sweepen** — `probe_supply_temp.py` zet een reeks waarden op de
+schrijfbare vaste waarde (register 1975) en meet na elke stap of de compressor
+draait (let op: dit **schrijft** een register):
 
 ```bash
 ~/remkoverwarming/venv/bin/python3 probe_supply_temp.py --temps 28,26,24,22,20
+```
+
+**Register van de GUI-vaste-waarde vinden** — `dump_registers.py` schrijft álle
+registers naar JSON; `compare_dumps.py` diff't twee dumps (met `--ignore` voor
+ruis). Zo vonden we dat de GUI-waarde in `1975` zit:
+
+```bash
+~/remkoverwarming/venv/bin/python3 dump_registers.py --out /tmp/a.json
+#  ... verzet de vaste waarde in de GUI ...
+~/remkoverwarming/venv/bin/python3 dump_registers.py --out /tmp/b.json
+~/remkoverwarming/venv/bin/python3 compare_dumps.py /tmp/a.json /tmp/b.json \
+    --ignore 5032,5582,5132
 ```
 
 ## Energie-logger (`energy_log.py`) — echte COP meten

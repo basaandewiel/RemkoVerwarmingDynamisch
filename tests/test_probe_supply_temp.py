@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regressietests voor de 5085-sweep (probe_supply_temp.py).
+"""Regressietests voor de sweep op de schrijfbare vaste waarde
+(probe_supply_temp.py).
 
 We mocken de MQTT-laag, zodat de logica (setpoints publiceren, reactie meten,
 accepteren/negeren herkennen, terugzetten) los testbaar is.
@@ -26,7 +27,8 @@ class TestProbe(unittest.TestCase):
 
     def _fake_publish(self, ok=True):
         def impl(_cfg, topic, payload, qos=None, retain=None):
-            self.published.append(payload["values"]["5085"])
+            # We sturen de schrijfbare vaste waarde (1975).
+            self.published.append(payload["values"]["1975"])
             return ok, "bevestigd"
         probe.mqtt_out.publish_command = impl
 
@@ -47,9 +49,9 @@ class TestProbe(unittest.TestCase):
         self._fake_publish()
         # eerste read = huidige waarde, daarna per setpoint een read
         self._fake_read([
-            {5085: 27.5, 5205: 0},         # before
-            {5085: 27.5, 5205: 0},         # stap 1
-            {5085: 10.0, 5205: 0},         # stap 2
+            {1975: 27.5, 5085: 27.5, 5205: 0},   # before
+            {1975: 28.0, 5085: 27.5, 5205: 0},   # stap 1
+            {1975: 22.0, 5085: 10.0, 5205: 0},   # stap 2
         ])
         rc = probe.probe({}, [28.0, 22.0], settle=0.0, sample=0.0, restore=True)
         self.assertEqual(rc, 0)
@@ -59,33 +61,43 @@ class TestProbe(unittest.TestCase):
 
     def test_no_restore_keeps_last(self):
         self._fake_publish()
-        self._fake_read([{5085: 27.5}, {5085: 10.0}, {5085: 10.0}])
+        self._fake_read([{1975: 27.5}, {1975: 22.0}, {1975: 22.0}])
         probe.probe({}, [22.0], settle=0.0, sample=0.0, restore=False)
         self.assertEqual(self.published[-1], "00dc")  # 22 °C
 
     def test_publish_failure_skips_step(self):
         self._fake_publish(ok=False)
-        self._fake_read([{5085: 27.5}])
+        self._fake_read([{1975: 27.5}])
         rc = probe.probe({}, [26.0], settle=0.0, sample=0.0, restore=False)
         self.assertEqual(rc, 0)
         # alleen de mislukte publicatie, geen restore
         self.assertEqual(len(self.published), 1)
 
     def test_accept_detection(self):
-        # 5085 komt overeen -> accepted True; compressor draait -> DRAAIT
+        # 5085 (de resultante) komt overeen -> accepted True; compressor draait.
         self._fake_publish()
         self._fake_read([
-            {5085: 27.5},                  # before
-            {5085: 30.0, 5205: 40, 5320: 1200},  # accept
+            {1975: 27.5, 5085: 27.5},                  # before
+            {1975: 30.0, 5085: 30.0, 5205: 40, 5320: 1200},  # accept
         ])
         probe.probe({}, [30.0], settle=0.0, sample=0.0, restore=False)
         # geen exception = goed; inhoudelijke accept-check gebeurt in _fmt-resultaten
 
+    def test_restores_from_1975_not_5085(self):
+        # De rustwaarde moet uit 1975 komen (schrijfbaar), ook als 5085 afwijkt.
+        self._fake_publish()
+        self._fake_read([
+            {1975: 31.0, 5085: 27.5, 5205: 0},   # before: 1975 leidend
+            {1975: 22.0, 5085: 22.0, 5205: 0},
+        ])
+        probe.probe({}, [22.0], settle=0.0, sample=0.0, restore=True)
+        self.assertEqual(self.published[-1], format(int(31.0 * 10), "04x"))
+
     def test_payload_format(self):
-        # Het gepubliceerde 5085-formaat moet hex temp*10 zijn.
+        # Het gepubliceerde formaat moet hex temp*10 zijn op de schrijfbare 1975.
         import heating_comfort
         p = heating_comfort.build_setpoint_payload(40.0)
-        self.assertEqual(p["values"]["5085"], "0190")
+        self.assertEqual(p["values"]["1975"], "0190")
 
 
 if __name__ == "__main__":
