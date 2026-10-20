@@ -192,6 +192,30 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(out["status"], "disabled")
         self.assertIsNone(out["setpoint_temp"])
 
+    def test_dhw_loading_skips(self):
+        # Tijdens SWW-laden (5001 = 4) doet de regeling niets.
+        out = heating_comfort.decide(self.c, self.now, self.rows, 15, {},
+                                     opmode=heating_comfort.SWW_LOADING_OPMODE)
+        self.assertEqual(out["status"], "dhw")
+        self.assertIsNone(out["setpoint_temp"])
+
+    def test_dhw_loading_overrides_charge(self):
+        # Zelfs midden in een laadblok: SWW gaat vóór.
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        out = heating_comfort.decide(self.c, self.now, rows, 15, {}, opmode=4)
+        self.assertEqual(out["status"], "dhw")
+        self.assertIsNone(out["setpoint_temp"])
+
+    def test_heating_opmode_proceeds(self):
+        out = heating_comfort.decide(self.c, self.now, self.rows, 15, {}, opmode=6)
+        self.assertNotEqual(out["status"], "dhw")
+        self.assertIsNotNone(out["setpoint_temp"])
+
+    def test_no_opmode_proceeds(self):
+        # Onleesbare opmode -> gewoon door (geen valse SWW-detectie).
+        out = heating_comfort.decide(self.c, self.now, self.rows, 15, {}, opmode=None)
+        self.assertNotEqual(out["status"], "dhw")
+
     def test_no_data(self):
         out = heating_comfort.decide(self.c, self.now, [], 15, {})
         self.assertEqual(out["status"], "no_data")
@@ -281,6 +305,41 @@ class TestRender(unittest.TestCase):
         out = heating_comfort.decide(_cfg(), _dt(8, 0), [], 15, {})
         lines = "\n".join(heating_comfort.render_human(out))
         self.assertIn("uit", lines)
+
+
+class TestOpMode(unittest.TestCase):
+    """Bedrijfsmodus (5001) lezen en SWW-detectie."""
+
+    def setUp(self):
+        self.orig = heating_comfort._query_registers
+
+    def tearDown(self):
+        heating_comfort._query_registers = self.orig
+
+    def _fake(self, values):
+        heating_comfort._query_registers = lambda *a, **k: dict(values)
+
+    def test_read_opmode(self):
+        self._fake({5001: 4})
+        self.assertEqual(heating_comfort.read_opmode({}), 4)
+
+    def test_read_opmode_missing(self):
+        self._fake({})
+        self.assertIsNone(heating_comfort.read_opmode({}))
+
+    def test_is_dhw_loading(self):
+        self.assertTrue(heating_comfort.is_dhw_loading(4))
+        self.assertFalse(heating_comfort.is_dhw_loading(6))
+        self.assertFalse(heating_comfort.is_dhw_loading(None))
+
+    def test_render_dhw(self):
+        c = _cfg(enabled=True)
+        now = _dt(8, 0)
+        rows = _mk_rows(now, 96, price=0.20, temp=8.0)
+        out = heating_comfort.decide(c, now, rows, 15, {}, opmode=4)
+        lines = "\n".join(heating_comfort.render_human(out))
+        self.assertIn("SWW", lines)
+        self.assertIn("wacht", lines)
 
 
 class TestReadFixedTemp(unittest.TestCase):

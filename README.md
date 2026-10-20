@@ -924,8 +924,37 @@ alleen hoeveel warmte de vloerkring opneemt (`5156/5157/5577/5059/5071` blijven 
 de gateway op **0**). Voor prijssturing is dat precies wat we willen: **wij sturen
 `1975`/`5085`, de Remko zorgt zelf voor aan/uit en modulatie.**
 
-> **Open ontwerpvraag:** sturen op `1975`/`5085` (expert-modus vast op Verwarmen) of
-> de hoofdmodus (`1951`/`5001`) als extra aan/uit-knop gebruiken.
+**De Remko heeft geen eigen stop.** Met `5085 = 30 °C` bleef de Remko urenlang
+onafgebroken op ~54 Hz / 6800 W stoken, terwijl de aanvoer 27 → 29 °C klom — er
+zit **geen kamertemperatuurbewaking** in (`5048 hc1_room_temp` = 0, de Remko meet
+de kamer niet). Zonder verlaging van `5085`/`1975` stopt hij niet. Daarom moet
+`heating_comfort.py` het "uit" via `coast_temp` regelen.
+
+**De vloerklep is onzichtbaar in de registers.** Tijdens SWW-laden (aanvoer
+60 °C) stond de klep in de GUI op **0 %** (dicht), zodat het hete water niet door
+de vloer ging — maar `5156/5157/5577/5059/5071` bleven **0**: de mengunit beweegt
+volledig buiten de gateway om. De vloer wordt dus door de **mengunit** beschermd,
+niet door de Remko. Wij sturen alleen de **primaire** aanvoer; met
+`max_supply = 45 °C` kan er nooit iets te heets richting de vloer worden gevraagd.
+
+#### SWW laden overrulet `5085` — de regeling wacht (20-10-2026)
+
+Zodra de Remko **SWW laadt** (`5001 = 4`, `dhw_comfort.py` stuurt `1082` → vat op
+temperatuur), stuwt hij `5085` **zelf** op naar ~60 °C, ongeacht onze vaste waarde
+`1975`:
+
+```
+1975 = 30,0 °C   (onze vaste waarde, bleef staan)
+5085 = 60,0 °C   (opgestuwd door de SWW-vraag)
+1082 = 50,0 °C   (SWW-setpoint, dhw_comfort)
+5001 = SWW laden
+```
+
+`heating_comfort.py` **leest daarom register 5001** en doet **niets** zolang dat
+`4` (SWW laden) is — status `dhw`. Anders zou de regeling de SWW-vraag
+tegenspreken. Zodra de Remko terug is op ruimteverwarming, pakt de regeling zijn
+eigen vaste waarde weer op. Zo kunnen `dhw_comfort.py` en `heating_comfort.py`
+naast elkaar draaien.
 
 #### Welke registers zijn schrijfbaar via MQTT? (21:56–22:35)
 

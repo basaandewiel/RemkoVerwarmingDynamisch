@@ -21,9 +21,16 @@ de GUI, dan volgt de regeling hem bij de volgende verversing automatisch. In de
 config kun je `base_temp` ook op een vast getal of op `"config"` zetten.
 
 Er wordt **geen ruimtetemperatuur gelezen**: het kamercomfort blijft bepaald
-door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 5085
+door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 1975
 geschreven — niet aan de SWW-regeling (register 1082) of aan de hoofdmode
 (register 1951) geraakt. Draai deze service daarom naast `dhw_comfort`.
+
+**Belangrijk — SWW gaat vóór.** Meet de regeling op dat de Remko **SWW aan het
+laden** is (`opmode` register **5001** = 4), dan doet ze **niets**: in die modus
+stuwt de Remko `5085` zélf op (naar ~60 °C) om het boilervat te laden en heeft
+onze vaste waarde geen effect. We laten het SWW-laden dus met rust en wachten tot
+de Remko terug is op ruimteverwarming. (De mengunit/klep van de vloerkring —
+onzichtbaar in de registers — houdt dat hete water sowieso buiten de vloer.)
 
 Wire-formaat (zelfde als 1082): temperatuur × 10 in hexadecimaal, 4 tekens.
 40 °C -> 400 decimaal -> 0x0190 -> "0190".
@@ -69,6 +76,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SUPPLY_REGISTER = 5085        # gewenste aanvoertemperatuur (read-only resultante)
 FIXED_TEMP_REGISTER = 1975    # schrijfbare "vaste waarde" van de VK-modus
 FIXED_TEMP_FALLBACK = 1974    # oudere/alternatieve vaste-waarde-register
+OPMODE_REGISTER = 5001        # bedrijfsmodus (4 = SWW laden, 6 = verwarmen, 9 = nawerking)
+
+# `opmode`-waarden (register 5001) die betekenen: niet aan de ruimteverwarming
+# komen. Tijdens SWW-laden stuwt de Remko `5085` zelf op (~60 °C) en heeft onze
+# vaste waarde geen effect; we laten dat laden dus met rust.
+SWW_LOADING_OPMODE = 4
 
 # Defaults (zie de module-docstring)
 DEFAULT_CHARGE_TEMP = 40.0
@@ -336,11 +349,16 @@ def decide(
     rows: List[dict],
     granularity_min: int,
     state: Optional[dict] = None,
+    opmode: Optional[int] = None,
 ) -> dict:
-    """Bepaal de gewenste aanvoertemperatuur (register 5085) en de status.
+    """Bepaal de gewenste aanvoertemperatuur (register 1975) en de status.
 
     Geeft een dict met o.a. `status`, `setpoint_temp` en het gekozen blok.
     `setpoint_temp` is None als er niets te doen valt (niet schrijven).
+
+    ``opmode`` is de bedrijfsmodus (register 5001). Staat die op **SWW laden**
+    (4), dan doet de regeling niets: de Remko stuwt `5085` dan zélf op en onze
+    vaste waarde heeft geen effect.
     """
     state = state or {}
     out: dict = {
@@ -352,9 +370,16 @@ def decide(
         "coast_temp": ccfg["coast_temp"],
         "min_supply": ccfg["min_supply"],
         "max_supply": ccfg["max_supply"],
+        "opmode": opmode,
     }
     if not ccfg["enabled"]:
         out["status"] = "disabled"
+        out["setpoint_temp"] = None
+        return out
+
+    if is_dhw_loading(opmode):
+        # SWW gaat vóór: laat het laden met rust, onze vaste waarde doet nu niets.
+        out["status"] = "dhw"
         out["setpoint_temp"] = None
         return out
 
@@ -443,6 +468,26 @@ def read_fixed_temp(mqtt_cfg: dict, timeout: float = DEFAULT_BASE_READ_TIMEOUT) 
         if MIN_READABLE_BASE_TEMP <= temp <= MAX_READABLE_BASE_TEMP:
             return round(temp, 1)
     return None
+
+
+def read_opmode(mqtt_cfg: dict, timeout: float = DEFAULT_BASE_READ_TIMEOUT) -> Optional[int]:
+    """Lees de bedrijfsmodus (register 5001).
+
+    ``4`` = SWW laden, ``6`` = verwarmen, ``9`` = nawerking, ``10`` = standby.
+    Geeft ``None`` als het niet leesbaar is (dan gaan we uit van "geen SWW").
+    """
+    values = _query_registers(mqtt_cfg, [OPMODE_REGISTER], timeout)
+    if OPMODE_REGISTER not in values:
+        return None
+    try:
+        return int(values[OPMODE_REGISTER])
+    except (TypeError, ValueError):
+        return None
+
+
+def is_dhw_loading(opmode: Optional[int]) -> bool:
+    """True als de Remko op dit moment SWW aan het laden is (register 5001 = 4)."""
+    return opmode == SWW_LOADING_OPMODE
 
 
 def _query_registers(mqtt_cfg: dict, registers: List[int],
@@ -689,7 +734,10 @@ def watch(cfg: dict, tz: ZoneInfo, ccfg: dict, dry_run: bool) -> int:
             if ccfg.get("base_temp_from_register"):
                 resolve_base_temp(ccfg, mqtt_cfg, state, log=_log)
 
-        out = decide(ccfg, now, rows, granularity, state)
+        # SWW-laden? Dan niets doen (de Remko stuurt 5085 zelf op).
+        opmode = read_opmode(mqtt_cfg, ccfg.get("base_read_timeout_seconds",
+                                                DEFAULT_BASE_READ_TIMEOUT))
+        out = decide(ccfg, now, rows, granularity, state, opmode=opmode)
         execute(out, mqtt_cfg, ccfg, state, dry_run)
         save_state(state)
         _log(_status_log(out))
@@ -713,6 +761,8 @@ def _status_log(out: dict) -> str:
             parts.append(f"volgend laadblok {_fmt_iso(nb['start'])}")
     elif status == "no_data":
         parts = ["geen prijs-/temperatuurdata — aanvoer ongemoeid"]
+    elif status == "dhw":
+        parts = ["SWW laden actief — regeling wacht (5085 volgt de SWW-vraag)"]
     elif status == "disabled":
         parts = ["uit"]
     else:
@@ -763,6 +813,11 @@ def render_human(out: dict) -> List[str]:
         return lines
     if status == "no_data":
         lines.append("Status   : geen prijs-/temperatuurdata — aanvoer ongemoeid")
+        return lines
+    if status == "dhw":
+        lines.append("Status   : SWW laden actief — regeling wacht; de Remko stuurt "
+                     "5085 zelf op")
+        lines.append("           (onze vaste waarde heeft nu geen effect)")
         return lines
 
     label = {"charge": "LADEN", "coast": "DUUR UUR", "base": "NORMAAL"}.get(
@@ -877,7 +932,9 @@ def main(argv: List[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — nette melding, ga door zonder data
         print(f"WAARSCHUWING: prijzen/voorspelling ophalen mislukt: {exc}", file=sys.stderr)
 
-    out = decide(ccfg, now, rows, granularity, state)
+    opmode = read_opmode(mqtt_cfg, ccfg.get("base_read_timeout_seconds",
+                                            DEFAULT_BASE_READ_TIMEOUT))
+    out = decide(ccfg, now, rows, granularity, state, opmode=opmode)
     execute(out, mqtt_cfg, ccfg, state, dry_run=args.dry_run)
 
     if args.json:
