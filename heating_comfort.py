@@ -137,6 +137,9 @@ DEFAULT_BASE_READ_TIMEOUT = 8.0
 # Marge rond een gepland SWW-laadvenster waarin we de vloer niet laten laden
 # (de compressor kan maar één ding tegelijk).
 DEFAULT_DHW_GUARD_MINUTES = 15.0
+# De gateway stuurt 1951 alleen in periodieke statusframes (~20-30 s), niet in
+# een query-antwoord; luister daarom iets langer dan de gewone read-timeout.
+DEFAULT_MAIN_MODE_READ_TIMEOUT = 35.0
 # Ondergrens/ bovengrens waarbinnen een uit register 1974/5085 gelezen
 # rustwaarde geloofwaardig is (daarbuiten negeren we hem).
 MIN_READABLE_BASE_TEMP = 15.0
@@ -638,12 +641,16 @@ def is_dhw_loading(opmode: Optional[int]) -> bool:
 
 
 def read_main_mode(mqtt_cfg: dict,
-                   timeout: float = DEFAULT_BASE_READ_TIMEOUT) -> Optional[str]:
+                   timeout: float = DEFAULT_MAIN_MODE_READ_TIMEOUT) -> Optional[str]:
     """Lees de hoofdmodus (register 1951) als hex-tekens, bv. "02"/"03".
 
-    Geeft ``None`` als het niet leesbaar is.
+    Let op: de gateway echoot `1951` **niet** in een `FORCE_RESPONSE`-antwoord
+    op een gerichte query (gemeten 20-10-2026), maar stuurt hem wél mee in zijn
+    **periodieke statusframes** (~elke 20-30 s). We luisteren daarom passief
+    mee in plaats van te queryen. Geeft ``None`` als er binnen `timeout` niets
+    bruikbaars langskomt.
     """
-    values = _query_registers(mqtt_cfg, [MAIN_MODE_REGISTER], timeout)
+    values = _listen_registers(mqtt_cfg, [MAIN_MODE_REGISTER], timeout)
     if MAIN_MODE_REGISTER not in values:
         return None
     try:
@@ -690,6 +697,63 @@ def _query_registers(mqtt_cfg: dict, registers: List[int],
         if wanted:
             got.update(wanted)
             done.set()
+
+    client = None
+    try:
+        client = energy_log._make_connected_client(mqtt, mqtt_cfg)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.loop_start()
+        done.wait(timeout)
+    except Exception:  # noqa: BLE001 — geen verbinding
+        return {}
+    finally:
+        if client is not None:
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+    return got
+
+
+def _listen_registers(mqtt_cfg: dict, registers: List[int],
+                      timeout: float = DEFAULT_MAIN_MODE_READ_TIMEOUT) -> dict:
+    """Luister passief naar de periodieke statusframes en geef {register: waarde}.
+
+    Voor registers die de gateway **niet** in een query-antwoord echoot (zoals
+    `1951`), maar wél periodiek uitzendt. Er wordt niets gepubliceerd. Blokkeert
+    tot `timeout` seconden of tot alle gevraagde registers langsgekomen zijn.
+    """
+    try:
+        mqtt = mqtt_out._paho()
+    except Exception:  # noqa: BLE001 — paho ontbreekt
+        return {}
+    got: dict = {}
+    done = threading.Event()
+    data_topic = energy_log.data_topic(mqtt_cfg)
+    if not data_topic:
+        return {}
+
+    def on_connect(client, _userdata, _flags, _rc, properties=None):
+        try:
+            client.subscribe(data_topic, qos=0)
+        except Exception:  # noqa: BLE001
+            done.set()
+
+    def on_message(_client, _userdata, message):
+        if message.topic != data_topic:
+            return
+        try:
+            payload = message.payload.decode()
+        except Exception:  # noqa: BLE001
+            return
+        parsed = energy_log.parse_values(payload)
+        wanted = {r: v for r, v in parsed.items() if r in registers}
+        if wanted:
+            got.update(wanted)
+            if all(r in got for r in registers):
+                done.set()
 
     client = None
     try:

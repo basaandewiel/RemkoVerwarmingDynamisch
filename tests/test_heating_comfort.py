@@ -436,22 +436,41 @@ class TestMainMode(unittest.TestCase):
 
 
 class TestReadMainMode(unittest.TestCase):
+    """1951 lezen: de gateway echoot hem niet in query-antwoorden, maar stuurt
+    hem in periodieke statusframes — daarom luisteren we passief."""
+
     def setUp(self):
-        self.orig = heating_comfort._query_registers
+        self.orig = heating_comfort._listen_registers
 
     def tearDown(self):
-        heating_comfort._query_registers = self.orig
+        heating_comfort._listen_registers = self.orig
 
     def _fake(self, values):
-        heating_comfort._query_registers = lambda *a, **k: dict(values)
+        heating_comfort._listen_registers = lambda *a, **k: dict(values)
 
     def test_reads_hex(self):
         self._fake({1951: 3})
         self.assertEqual(heating_comfort.read_main_mode({}), "03")
 
+    def test_reads_heat(self):
+        self._fake({1951: 2})
+        self.assertEqual(heating_comfort.read_main_mode({}), "02")
+
     def test_missing(self):
         self._fake({})
         self.assertIsNone(heating_comfort.read_main_mode({}))
+
+    def test_uses_listen_not_query(self):
+        # Bevestig dat read_main_mode de passieve luisteraar gebruikt.
+        calls = {}
+
+        def fake_listen(mqtt_cfg, registers, timeout=None):
+            calls["registers"] = registers
+            return {1951: 3}
+
+        heating_comfort._listen_registers = fake_listen
+        heating_comfort.read_main_mode({})
+        self.assertEqual(calls["registers"], [1951])
 
 
 class TestDhwExclusion(unittest.TestCase):
