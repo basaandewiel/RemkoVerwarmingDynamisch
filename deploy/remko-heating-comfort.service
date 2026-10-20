@@ -1,5 +1,5 @@
 [Unit]
-Description=REMKO WKF70 vloerverwarming-bufferregeling (aanvoer op goedkoopste uren via MQTT, register 5085)
+Description=REMKO WKF70 vloerverwarming-regeling (goedkoopste laadblok via MQTT; hoofdmodus 1951 of vaste waarde 1975)
 After=network-online.target
 Wants=network-online.target
 
