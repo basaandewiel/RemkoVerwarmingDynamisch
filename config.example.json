@@ -100,7 +100,9 @@
     "heating_comfort": {
       "enabled": false,
       "control": "supply",
-      "avoid_dhw": true,
+      "avoid_dhw": false,
+      "extend_for_dhw": true,
+      "max_extend_hours": 6.0,
       "dhw_guard_minutes": 15,
       "charge_temp": 40,
       "base_temp": null,

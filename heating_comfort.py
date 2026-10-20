@@ -24,13 +24,19 @@ Er zijn twee regelwijzen (config `mqtt.heating_comfort.control`):
   * daarbuiten schrijft ze **1951 = 03** (Standby): compressor en pomp staan
     écht stil — geen sluipverbruik. Dit is de krachtigste zuinige stand.
 
-**SWW gaat vóór.** Er is één compressor, dus SWW laden en ruimteverwarming
-kunnen niet samen. Daarom:
+**SWW gaat vóór, maar het vloerblok wordt ingehaald.** Er is één compressor,
+dus SWW laden en ruimteverwarming kunnen niet samen. Daarom:
 
-  * bij het **kiezen** van het laadblok worden uren overgeslagen die met een
-    gepland SWW-laadvenster (`dhw_comfort_state.json`) overlappen;
   * bij het **draaien** pauzeert de regeling zodra de Remko op dat moment echt
-    SWW laadt (`opmode` register **5001** = 4), en hervat daarna.
+    SWW laadt (`opmode` register **5001** = 4): in `onoff`-stand gaat 1951 dan op
+    **Standby**. Zodra het SWW klaar is, hervat de verwarming.
+  * de vloer krijgt altijd zijn **volle `charge_block_hours`**: de pauzetijd
+    wordt bij het blokeinde opgeteld (`extend_for_dhw`, default aan), dus het
+    blok schuift precies zo veel op als het SWW-laden heeft gekost. Zet
+    `extend_for_dhw: false` om dat uit te zetten (het blok vervalt dan deels).
+  * optioneel worden bij het **plannen** ook blokken overgeslagen die met een
+    gepland SWW-laadvenster (`dhw_comfort_state.json`) overlappen
+    (`avoid_dhw`, default uit — het inhalen regelt het normaal al).
 
 De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**:
 register `1975` (met `1974` en `5085` als terugval). Verzet je de vaste waarde in
@@ -137,6 +143,11 @@ DEFAULT_BASE_READ_TIMEOUT = 8.0
 # Marge rond een gepland SWW-laadvenster waarin we de vloer niet laten laden
 # (de compressor kan maar één ding tegelijk).
 DEFAULT_DHW_GUARD_MINUTES = 15.0
+# Als het vloerblok met SWW-laden samenvalt, pauzeert de regeling en schuift ze
+# het blokeinde op met precies de verloren tijd, zodat de vloer alsnog zijn volle
+# `charge_block_hours` krijgt.
+DEFAULT_EXTEND_FOR_DHW = True
+DEFAULT_MAX_EXTEND_HOURS = 6.0
 # De gateway stuurt 1951 alleen in periodieke statusframes (~20-30 s), niet in
 # een query-antwoord; luister daarom iets langer dan de gewone read-timeout.
 DEFAULT_MAIN_MODE_READ_TIMEOUT = 35.0
@@ -184,7 +195,13 @@ def heating_cfg(cfg: dict) -> dict:
     return {
         "enabled": bool(hc.get("enabled", False)),
         "control": control,
-        "avoid_dhw": bool(hc.get("avoid_dhw", True)),
+        "avoid_dhw": bool(hc.get("avoid_dhw", False)),
+        "extend_for_dhw": bool(
+            hc.get("extend_for_dhw", DEFAULT_EXTEND_FOR_DHW)
+        ),
+        "max_extend_hours": float(
+            hc.get("max_extend_hours", DEFAULT_MAX_EXTEND_HOURS)
+        ),
         "dhw_guard_minutes": float(
             hc.get("dhw_guard_minutes", DEFAULT_DHW_GUARD_MINUTES)
         ),
@@ -310,6 +327,51 @@ def _conflicts_dhw(
     return _overlaps(
         block["start"], block["end"], start, end, guard_minutes / 60.0
     )
+
+
+def effective_block_end(
+    block: dict, extend_seconds: float, max_extend_hours: float
+) -> datetime:
+    """Het blokeinde, opgeschoven met de ingehaalde SWW-pauzetijd.
+
+    De vloer krijgt altijd zijn volle `charge_block_hours`: valt het SWW-laden
+    tijdens ons blok, dan schuift het einde op met precies de verloren tijd
+    (begrensd door `max_extend_hours`).
+    """
+    seconds = max(0.0, float(extend_seconds))
+    seconds = min(seconds, max(0.0, max_extend_hours) * 3600.0)
+    return block["end"] + timedelta(seconds=seconds)
+
+
+def accrue_dhw_extension(
+    state: dict,
+    now: datetime,
+    blocked: bool,
+    extend_seconds: float,
+) -> float:
+    """Werk de ingehaalde SWW-pauzetijd bij op grond van de huidige toestand.
+
+    ``blocked`` = de regeling wordt nu door SWW-laden tegengehouden. Zolang dat
+    duurt loopt de teller; zodra het voorbij is, is de verstreken tijd bij de
+    extensie opgeteld. Geeft de nieuwe stand van `dhw_extend_seconds` terug en
+    werkt `state` bij.
+    """
+    started = state.get("dhw_pause_started_at")
+    if blocked:
+        if not started:
+            state["dhw_pause_started_at"] = now.isoformat()
+        return float(extend_seconds)
+    if started:
+        try:
+            pause_start = datetime.fromisoformat(str(started))
+        except (TypeError, ValueError):
+            pause_start = None
+        if pause_start is not None:
+            lost = (now - pause_start).total_seconds()
+            if lost > 0:
+                extend_seconds = float(extend_seconds) + lost
+        state.pop("dhw_pause_started_at", None)
+    return float(extend_seconds)
 
 
 def _hours_per_day(horizon_hours: float) -> int:
@@ -458,6 +520,69 @@ def classify(
     return "base", None
 
 
+def _decide_onoff(
+    ccfg: dict,
+    now: datetime,
+    charge_blocks: List[dict],
+    state: dict,
+    opmode: Optional[int],
+    out: dict,
+) -> dict:
+    """De aan/uit-beslissing (register 1951), met SWW-inhaal.
+
+    De vloer krijgt altijd zijn volle `charge_block_hours`. Valt het SWW-laden
+    (één compressor) tijdens ons blok, dan zetten we de Remko op **Standby**
+    (status `dhw`) en schuiven we het blokeinde op met precies de verloren tijd
+    (`dhw_extend_seconds` in de statusfile). Zodra het SWW klaar is, hervatten
+    we en loopt het blok door tot het opgeschoven einde.
+    """
+    extend_seconds = float(state.get("dhw_extend_seconds", 0.0))
+    max_extend = ccfg.get("max_extend_hours", DEFAULT_MAX_EXTEND_HOURS)
+    extend = ccfg.get("extend_for_dhw", DEFAULT_EXTEND_FOR_DHW)
+
+    def _end(b: dict) -> datetime:
+        if not extend:
+            return b["end"]
+        return effective_block_end(b, extend_seconds, max_extend)
+
+    active = next(
+        (b for b in charge_blocks if b["start"] <= now < _end(b)), None
+    )
+    blocked_now = bool(active is not None and is_dhw_loading(opmode))
+
+    if extend:
+        extend_seconds = accrue_dhw_extension(state, now, blocked_now, extend_seconds)
+        state["dhw_extend_seconds"] = extend_seconds
+    else:
+        state.pop("dhw_pause_started_at", None)
+
+    out["dhw_extend_seconds"] = extend_seconds
+    out["dhw_extended"] = bool(extend and active is not None and extend_seconds > 0.5)
+
+    if active is not None:
+        out["block"] = _block_out(active)
+        if extend and extend_seconds > 0.5:
+            out["block"]["effective_end"] = _end(active).isoformat()
+        if blocked_now:
+            out["status"] = "dhw"
+            out["main_mode"] = MAIN_MODE_STANDBY
+            return out
+        out["status"] = "charge"
+        out["main_mode"] = MAIN_MODE_HEAT
+        return out
+
+    # Buiten de blokken: extensie is afgehandeld, teller weer op nul.
+    if extend:
+        state["dhw_extend_seconds"] = 0.0
+        state.pop("dhw_pause_started_at", None)
+    out["dhw_extend_seconds"] = 0.0
+    out["status"] = "standby"
+    out["main_mode"] = MAIN_MODE_STANDBY
+    nxt = next((b for b in charge_blocks if b["start"] > now), None)
+    out["next_block"] = _block_out(nxt)
+    return out
+
+
 def decide(
     ccfg: dict,
     now: datetime,
@@ -482,13 +607,14 @@ def decide(
     ``dhw_window`` is het geplande SWW-laadvenster; blokken die daarmee
     overlappen worden bij het plannen overgeslagen.
     """
-    state = state or {}
+    state = state if state is not None else {}
     onoff = ccfg.get("control") == CONTROL_ONOFF
     out: dict = {
         "now": now.isoformat(),
         "enabled": ccfg["enabled"],
         "control": ccfg.get("control", CONTROL_SUPPLY),
-        "avoid_dhw": ccfg.get("avoid_dhw", True),
+        "avoid_dhw": ccfg.get("avoid_dhw", False),
+        "extend_for_dhw": ccfg.get("extend_for_dhw", DEFAULT_EXTEND_FOR_DHW),
         "charge_temp": ccfg["charge_temp"],
         "base_temp": ccfg["base_temp"],
         "base_temp_from_register": ccfg.get("base_temp_from_register", False),
@@ -510,12 +636,12 @@ def decide(
         out["main_mode"] = None
         return out
 
-    if is_dhw_loading(opmode):
-        # SWW gaat vóór (één compressor). In onoff-stand zetten we de Remko
-        # expliciet op Standby zodat ruimteverwarming niet met SWW concurreert.
+    if is_dhw_loading(opmode) and not onoff:
+        # In `supply`-stand laten we het SWW-laden met rust: de Remko stuwt
+        # `5085` dan zélf op en onze vaste waarde heeft geen effect.
         out["status"] = "dhw"
         out["setpoint_temp"] = None
-        out["main_mode"] = MAIN_MODE_STANDBY if onoff else None
+        out["main_mode"] = None
         return out
 
     if not rows:
@@ -530,17 +656,7 @@ def decide(
     out["charge_blocks"] = [_block_out(b) for b in charge_blocks]
 
     if onoff:
-        active = next((b for b in charge_blocks if b["start"] <= now < b["end"]), None)
-        if active is not None:
-            out["status"] = "charge"
-            out["main_mode"] = MAIN_MODE_HEAT
-            out["block"] = _block_out(active)
-            return out
-        out["status"] = "standby"
-        out["main_mode"] = MAIN_MODE_STANDBY
-        nxt = next((b for b in charge_blocks if b["start"] > now), None)
-        out["next_block"] = _block_out(nxt)
-        return out
+        return _decide_onoff(ccfg, now, charge_blocks, state, opmode, out)
 
     coast_blocks = plan_coast_blocks(rows, granularity_min, now, ccfg)
     # Een koelblok dat met een laadblok samenvalt laten we vallen.
@@ -1038,7 +1154,9 @@ def _status_log(out: dict) -> str:
                   else f"LADEN -> aanvoer {sp:g} °C")]
         b = out.get("block")
         if b:
-            parts.append(f"blok t/m {_fmt_iso(b['end'])}")
+            end = b.get("effective_end") or b["end"]
+            tail = " (opgeschoven wegens SWW)" if b.get("effective_end") else ""
+            parts.append(f"blok t/m {_fmt_iso(end)}{tail}")
     elif status == "standby":
         parts = ["STANDBY -> 1951=Standby (compressor uit)"]
         nb = out.get("next_block")
@@ -1055,9 +1173,15 @@ def _status_log(out: dict) -> str:
         parts = ["geen prijs-/temperatuurdata"]
         parts.append("-> 1951=Standby (veilig)" if onoff else "— aanvoer ongemoeid")
     elif status == "dhw":
-        parts = ["SWW laden actief — regeling pauzeert"]
         if onoff:
-            parts.append("1951=Standby (niet tegelijk met SWW)")
+            parts = ["SWW laden actief — gepauzeerd (1951=Standby)"]
+            if out.get("dhw_extended"):
+                parts.append(
+                    f"blok schuift op met "
+                    f"{out.get('dhw_extend_seconds', 0.0) / 3600:.1f} u"
+                )
+        else:
+            parts = ["SWW laden actief — regeling pauzeert"]
     elif status == "disabled":
         parts = ["uit"]
     else:
@@ -1098,8 +1222,12 @@ def render_human(out: dict) -> List[str]:
             "(Standby)"
         )
         lines.append(
-            "SWW      : " + ("laden mijden aan" if out.get("avoid_dhw", True)
+            "SWW      : " + ("laden mijden aan"
+                             if out.get("avoid_dhw")
                              else "laden mijden uit")
+            + (", blok schuift op bij SWW-laden"
+               if out.get("extend_for_dhw", DEFAULT_EXTEND_FOR_DHW)
+               else "")
         )
     else:
         lines.append(
@@ -1115,8 +1243,10 @@ def render_human(out: dict) -> List[str]:
             )
     dw = out.get("dhw_window")
     if dw:
-        lines.append(f"SWW-venster: {_fmt_iso(dw['start'])} – {_fmt_iso(dw['end'])} "
-                     "(blokken die hiermee botsen vallen af)")
+        lines.append(f"SWW-venster: {_fmt_iso(dw['start'])} – {_fmt_iso(dw['end'])}")
+    if onoff and out.get("dhw_extend_seconds", 0) > 0.01:
+        lines.append(f"Inhaal   : {out['dhw_extend_seconds'] / 3600:.1f} u "
+                     "opgeschoven wegens SWW-laden")
 
     status = out.get("status")
     if status == "disabled":
@@ -1127,9 +1257,14 @@ def render_human(out: dict) -> List[str]:
                      + (" — 1951=Standby (veilig)" if onoff else " — aanvoer ongemoeid"))
         return lines
     if status == "dhw":
-        lines.append("Status   : SWW laden actief — regeling pauzeert")
         if onoff:
-            lines.append("           1951=Standby (niet tegelijk met SWW)")
+            lost = out.get("dhw_extend_seconds", 0.0) / 3600.0
+            lines.append("Status   : SWW laden actief — gepauzeerd (1951=03)")
+            if lost > 0.01:
+                lines.append(f"           blok schuift op met {lost:.1f} u "
+                             "(inhaal van de SWW-pauze)")
+        else:
+            lines.append("Status   : SWW laden actief — regeling pauzeert")
         return lines
 
     if status == "standby":
@@ -1143,8 +1278,10 @@ def render_human(out: dict) -> List[str]:
         lines.append(f"Actie    : {label} -> aanvoer {out.get('setpoint_temp'):g} °C")
     b = out.get("block")
     if b:
+        end_iso = b.get("effective_end") or b["end"]
+        tail = "  [opgeschoven wegens SWW]" if b.get("effective_end") else ""
         lines.append(
-            f"Blok     : {_fmt_iso(b['start'])} – {_fmt_iso(b['end'])} "
+            f"Blok     : {_fmt_iso(b['start'])} – {_fmt_iso(end_iso)}{tail} "
             f"(buitentemp {app.nl(b['mean_temp'], 1)} °C, "
             f"COP {app.nl(b['mean_cop'], 2)}, "
             f"{app.nl(b['mean_corrected'], 4)} €/kWh warmte)"

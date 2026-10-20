@@ -519,8 +519,11 @@ class TestDhwExclusion(unittest.TestCase):
             {"charge_start": "niet-een-tijd"}))
 
     def test_block_avoids_dhw_window(self):
-        # Het goedkoopste blok (08:00) valt samen met het SWW-venster; het
-        # op één na goedkoopste (rond 13:00) moet dan gekozen worden.
+        # Als `avoid_dhw` aanstaat: het goedkoopste blok (08:00) valt samen met
+        # het SWW-venster; het op één na goedkoopste (rond 13:00) moet dan
+        # gekozen worden.
+        c = _cfg(enabled=True, control="onoff", avoid_dhw=True)
+
         def pf(d):
             if 8 <= d.hour < 11:
                 return 0.05      # goedkoopst, maar botst met SWW
@@ -530,13 +533,20 @@ class TestDhwExclusion(unittest.TestCase):
 
         rows = _mk_rows(self.now, 96, price_fn=pf)
         window = (_dt(8, 0), _dt(11, 0))
-        out = heating_comfort.decide(self.c, self.now, rows, 15, {},
+        out = heating_comfort.decide(c, self.now, rows, 15, {},
                                      dhw_window=window)
         starts = [b["start"] for b in out["charge_blocks"]]
         self.assertTrue(starts, "er moet een laadblok overblijven")
         for s in starts:
             hour = int(s[11:13])
             self.assertNotIn(hour, (8, 9, 10))
+
+    def test_avoid_dhw_default_off(self):
+        # Standaard mijden we niet: het inhalen regelt het conflict.
+        self.assertFalse(_cfg()["avoid_dhw"])
+
+    def test_extend_for_dhw_default_on(self):
+        self.assertTrue(_cfg()["extend_for_dhw"])
 
     def test_avoid_dhw_can_be_disabled(self):
         c = _cfg(enabled=True, control="onoff", avoid_dhw=False)
@@ -545,6 +555,99 @@ class TestDhwExclusion(unittest.TestCase):
         out = heating_comfort.decide(c, self.now, rows, 15, {}, dhw_window=window)
         # Met mijden uit mag het blok nu wél met SWW samenvallen.
         self.assertEqual(out["status"], "charge")
+
+
+class TestDhwExtension(unittest.TestCase):
+    """De vloer krijgt zijn volle blok: SWW-pauzetijd schuift het einde op."""
+
+    def setUp(self):
+        self.c = _cfg(enabled=True, control="onoff", extend_for_dhw=True)
+        # Goedkoopste blok van 3 u pal op 'nu' (08:00) zodat we er middenin zitten.
+        self.rows = _mk_rows(_dt(8, 0), 96, price_fn=lambda d: 0.10)
+
+    def _out(self, when, state, opmode=None):
+        return heating_comfort.decide(
+            self.c, when, self.rows, 15, state, opmode=opmode
+        )
+
+    def test_pause_records_start(self):
+        state = {}
+        out = self._out(_dt(8, 30), state, opmode=4)
+        self.assertEqual(out["status"], "dhw")
+        self.assertEqual(out["main_mode"], heating_comfort.MAIN_MODE_STANDBY)
+        self.assertIn("dhw_pause_started_at", state)
+
+    def test_resume_accrues_lost_time(self):
+        state = {}
+        self._out(_dt(8, 30), state, opmode=4)   # SWW begint om 08:30
+        out = self._out(_dt(8, 50), state, opmode=6)  # klaar om 08:50
+        # 20 minuten verloren -> 1200 s extensie
+        self.assertAlmostEqual(out["dhw_extend_seconds"], 1200.0, delta=1.0)
+        self.assertEqual(out["status"], "charge")
+        self.assertNotIn("dhw_pause_started_at", state)
+
+    def test_block_runs_past_original_end(self):
+        # Origineel blok 08:00-11:00. Pauze 10:00-10:30 (+30 min).
+        state = {}
+        self._out(_dt(12, 0), state)               # niets aan de hand, buiten blok
+        # Zet een blok dat 'nu' bevat: gebruik een blok pal op 08:00.
+        state = {}
+        self._out(_dt(10, 0), state, opmode=4)     # pauze begint
+        self._out(_dt(10, 30), state, opmode=6)    # klaar -> +1800 s
+        # Om 11:15 zou het oude blok voorbij zijn; met extensie loopt het door.
+        out = self._out(_dt(11, 15), state)
+        self.assertEqual(out["status"], "charge")
+        self.assertTrue(out["dhw_extended"])
+
+    def test_extension_resets_outside_block(self):
+        # Goedkoopste blok alleen 's ochtends; ná het blok is er niets.
+        def pf(d):
+            return 0.05 if 8 <= d.hour < 11 else 0.40
+
+        rows = _mk_rows(_dt(8, 0), 16, price_fn=pf)  # 16 kwartieren = 08:00-12:00
+        state = {"dhw_extend_seconds": 1800.0}
+        out = heating_comfort.decide(
+            self.c, _dt(13, 0), rows, 15, state
+        )
+        self.assertEqual(out["status"], "standby")
+        self.assertEqual(out["dhw_extend_seconds"], 0.0)
+        self.assertEqual(state["dhw_extend_seconds"], 0.0)
+
+    def test_extension_carries_within_block(self):
+        # Binnen hetzelfde blok blijft de opgespaarde tijd staan.
+        state = {"dhw_extend_seconds": 900.0}
+        out = self._out(_dt(9, 0), state)
+        self.assertEqual(out["status"], "charge")
+        self.assertAlmostEqual(out["dhw_extend_seconds"], 900.0, delta=1.0)
+
+    def test_max_extend_caps(self):
+        c = _cfg(enabled=True, control="onoff", extend_for_dhw=True,
+                 max_extend_hours=0.5)
+        block = {"start": _dt(8, 0), "end": _dt(11, 0)}
+        end = heating_comfort.effective_block_end(block, 4 * 3600, 0.5)
+        self.assertEqual(end, _dt(11, 30))
+
+    def test_extend_disabled_no_catch_up(self):
+        c = _cfg(enabled=True, control="onoff", extend_for_dhw=False)
+        state = {}
+        heating_comfort.decide(c, _dt(10, 0), self.rows, 15, state, opmode=4)
+        out = heating_comfort.decide(c, _dt(10, 30), self.rows, 15, state, opmode=6)
+        self.assertEqual(out["dhw_extend_seconds"], 0.0)
+
+    def test_accrue_helper(self):
+        state = {}
+        e = heating_comfort.accrue_dhw_extension(state, _dt(8, 0), True, 0.0)
+        self.assertEqual(e, 0.0)
+        e = heating_comfort.accrue_dhw_extension(state, _dt(8, 20), False, 0.0)
+        self.assertAlmostEqual(e, 1200.0, delta=1.0)
+
+    def test_render_shows_catch_up(self):
+        state = {}
+        self._out(_dt(10, 0), state, opmode=4)
+        self._out(_dt(10, 30), state, opmode=6)
+        out = self._out(_dt(11, 15), state)
+        lines = "\n".join(heating_comfort.render_human(out))
+        self.assertIn("opgeschoven", lines)
 
 
 class TestReadFixedTemp(unittest.TestCase):
