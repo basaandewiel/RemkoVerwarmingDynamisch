@@ -473,6 +473,28 @@ class TestReadMainMode(unittest.TestCase):
         self.assertEqual(calls["registers"], [1951])
 
 
+class TestParseRawValues(unittest.TestCase):
+    """Ruwe registeruitlezing: 1951 zit NIET in de energie-catalogus."""
+
+    def test_parses_1951(self):
+        payload = '{"values": {"1951": "03", "5001": "0A"}}'
+        out = heating_comfort._parse_raw_values(payload, [1951])
+        self.assertEqual(out, {1951: 3})
+
+    def test_ignores_unrequested(self):
+        payload = '{"values": {"1951": "02", "5085": "012C"}}'
+        out = heating_comfort._parse_raw_values(payload, [1951])
+        self.assertEqual(out, {1951: 2})
+
+    def test_missing_register(self):
+        self.assertEqual(heating_comfort._parse_raw_values(
+            '{"values": {"5001": "0A"}}', [1951]), {})
+
+    def test_bad_payload(self):
+        self.assertEqual(heating_comfort._parse_raw_values("niet-json", [1951]), {})
+        self.assertEqual(heating_comfort._parse_raw_values("{}", [1951]), {})
+
+
 class TestDhwExclusion(unittest.TestCase):
     """Blok kiezen dat niet met een SWW-laadvenster botst."""
 

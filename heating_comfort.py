@@ -717,6 +717,33 @@ def _query_registers(mqtt_cfg: dict, registers: List[int],
     return got
 
 
+def _parse_raw_values(payload: str, registers: List[int]) -> dict:
+    """Lees ruwe registerwaarden (hex) uit een HOST2CLIENT-payload.
+
+    Anders dan `energy_log.parse_values` filtert dit **niet** op de
+    energie-catalogus: registers als `1951` (hoofdmodus) zitten daar niet in en
+    zouden anders stil verdwijnen. We decoderen de gevraagde registers gewoon
+    als hex → int.
+    """
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return {}
+    values = data.get("values") if isinstance(data, dict) else None
+    if not isinstance(values, dict):
+        return {}
+    out: dict = {}
+    for reg in registers:
+        raw = values.get(str(reg))
+        if raw is None:
+            continue
+        try:
+            out[reg] = int(str(raw), 16)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def _listen_registers(mqtt_cfg: dict, registers: List[int],
                       timeout: float = DEFAULT_MAIN_MODE_READ_TIMEOUT) -> dict:
     """Luister passief naar de periodieke statusframes en geef {register: waarde}.
@@ -748,8 +775,7 @@ def _listen_registers(mqtt_cfg: dict, registers: List[int],
             payload = message.payload.decode()
         except Exception:  # noqa: BLE001
             return
-        parsed = energy_log.parse_values(payload)
-        wanted = {r: v for r, v in parsed.items() if r in registers}
+        wanted = _parse_raw_values(payload, registers)
         if wanted:
             got.update(wanted)
             if all(r in got for r in registers):
