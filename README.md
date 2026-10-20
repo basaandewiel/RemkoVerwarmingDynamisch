@@ -891,7 +891,8 @@ die cyclus **zelf** doordat de aanvoer afkoelde naar ~21,5 °C:
 21:54:40  -> 47 Hz / 1200 W   aanvoer 27,0 °C   (klimt naar stooklijn 27,5)
 ```
 
-> **Gevolg voor `heating_comfort.py`.** Register 5085 sturen werkt **alleen** als:
+> **Gevolg voor `heating_comfort.py`.** Register 1975 sturen (→ `5085`) werkt
+> **alleen** als:
 > 1. de expert-hoofdmodus op **Verwarmen** staat (niet standby/automatisch), én
 > 2. de VK-modus op **vaste waarde** staat (niet stooklijn).
 >
@@ -899,9 +900,32 @@ die cyclus **zelf** doordat de aanvoer afkoelde naar ~21,5 °C:
 > overschreven. Dan moet `heating_comfort` dus **zelf** het "uit" regelen
 > (`coast_temp`) — de Remko heeft in de Verwarmen-modus geen eigen stop
 > (die bleef vanavond op 30 °C onbeperkt stoken).
->
-> Open ontwerpvraag: sturen op `5085` (expert-modus vast op Verwarmen) of op de
-> hoofdmodus (`1951`/`5001`) als aan/uit-knop.
+
+#### De Remko regelt "aan/uit" zélf via `5085` — de thermostaat doet niet mee (20-10-2026)
+
+Beslissende proef. De kamer was **18 °C** terwijl de Watts-thermostaat **19 °C**
+vroeg (dus echte kamervraag). De Remko stond op **Verwarmen**, maar bleef in
+`Nawerking` met de pomp draaiend en de compressor **uit** (aanvoer ≈ retour,
+19 °C, 0 W). De kamervraag deed dus **niets**.
+
+Daarna `1975` stapsgewijs verhoogd — `5085` volgde en de Remko schakelde zélf:
+
+```
+1975=25 °C -> 5085=25,0  -> 5001: Nawerking(9) -> Verwarmen(6)   (compressor nog niet aan)
+1975=30 °C -> 5085=30,0  -> compressor aan, 48 -> 54 Hz, 1100 -> 4800 W
+1975=35 °C -> 5085=35,0  -> compressor aan, 52 Hz, 1400 W el / 5500 W th
+                              aanvoer 23 -> 24,5 °C, retour blijft 19 °C (warmte afgegeven)
+```
+
+Conclusie: **`5001` (aan/uit) volgt `5085` — niet de kamerthermostaat.** Zodra de
+vraag boven de werkelijke aanvoer uitkomt, gaat de Remko van Nawerking naar
+Verwarmen en moduleert de compressor. De kamerthermostaat + mengunit bepalen
+alleen hoeveel warmte de vloerkring opneemt (`5156/5157/5577/5059/5071` blijven in
+de gateway op **0**). Voor prijssturing is dat precies wat we willen: **wij sturen
+`1975`/`5085`, de Remko zorgt zelf voor aan/uit en modulatie.**
+
+> **Open ontwerpvraag:** sturen op `1975`/`5085` (expert-modus vast op Verwarmen) of
+> de hoofdmodus (`1951`/`5001`) als extra aan/uit-knop gebruiken.
 
 #### Welke registers zijn schrijfbaar via MQTT? (21:56–22:35)
 
