@@ -99,6 +99,9 @@
     },
     "heating_comfort": {
       "enabled": false,
+      "control": "supply",
+      "avoid_dhw": true,
+      "dhw_guard_minutes": 15,
       "charge_temp": 40,
       "base_temp": null,
       "coast_temp": 28,

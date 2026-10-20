@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
 """Vloerverwarming-bufferregeling: laad de vloer op de goedkoopste uren.
 
-De vloerverwarming is een grote warmtebuffer. Deze regeling stuurt de
-**vaste waarde van de VK-modus** (register **1975**) op basis van de dynamische
-stroomprijs en de COP van de Remko. De gateway werkt daarna de gewenste
-aanvoertemperatuur `heat_water_temp_req` (**5085**) bij; 5085 is zelf
-**read-only** en volgt 1975.
+De vloerverwarming is een grote warmtebuffer. Deze regeling kiest het
+**goedkoopste aaneengesloten blok** van `charge_block_hours` uur (default 3) op
+de **gecorrigeerde** prijs — stroomprijs gedeeld door de COP, dus €/kWh warmte —
+rekening houdend met de buitentemperatuurvoorspelling. In dat blok laadt de
+vloer warmte op; daarbuiten staat de warmtepomp stil zodat de vloermassa de
+kamer blijft voeden.
 
-  * in de **goedkoopste uren** (kwartierprijs / COP) vraagt ze een **hogere**
-    aanvoertemperatuur (`charge_temp`, default 40 °C) zodat de vloer warmte
-    opslaat;
+Er zijn twee regelwijzen (config `mqtt.heating_comfort.control`):
+
+``"supply"`` (default) — **moduleren via register 1975**
+  * in de **goedkoopste uren** vraagt ze een **hogere** aanvoertemperatuur
+    (`charge_temp`, default 40 °C) zodat de vloer warmte opslaat;
   * in de **duurste uren** vraagt ze een **lage** aanvoertemperatuur
     (`coast_temp`, default 28 °C) zodat de warmtepomp stilstaat en de vloer de
     kamer blijft voeden;
   * daarbuiten staat de aanvoer op de normale, constante waarde (`base_temp`).
+
+``"onoff"`` — **aan/uit via register 1951** (`main_mode`)
+  * in het laadblok schrijft ze **1951 = 02** (Verwarmen): de Remko verwarmt
+    en kiest op de **stooklijn** (`1972 = 0`) zelf de laagst mogelijke aanvoer;
+  * daarbuiten schrijft ze **1951 = 03** (Standby): compressor en pomp staan
+    écht stil — geen sluipverbruik. Dit is de krachtigste zuinige stand.
+
+**SWW gaat vóór.** Er is één compressor, dus SWW laden en ruimteverwarming
+kunnen niet samen. Daarom:
+
+  * bij het **kiezen** van het laadblok worden uren overgeslagen die met een
+    gepland SWW-laadvenster (`dhw_comfort_state.json`) overlappen;
+  * bij het **draaien** pauzeert de regeling zodra de Remko op dat moment echt
+    SWW laadt (`opmode` register **5001** = 4), en hervat daarna.
 
 De rustwaarde `base_temp` wordt bij de start **uit het register gelezen**:
 register `1975` (met `1974` en `5085` als terugval). Verzet je de vaste waarde in
@@ -21,25 +38,19 @@ de GUI, dan volgt de regeling hem bij de volgende verversing automatisch. In de
 config kun je `base_temp` ook op een vast getal of op `"config"` zetten.
 
 Er wordt **geen ruimtetemperatuur gelezen**: het kamercomfort blijft bepaald
-door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 1975
-geschreven — niet aan de SWW-regeling (register 1082) of aan de hoofdmode
-(register 1951) geraakt. Draai deze service daarom naast `dhw_comfort`.
+door de bestaande thermostaat (bv. Watts). De SWW-regeling (register 1082) wordt
+nooit aangeraakt. Draai deze service daarom naast `dhw_comfort`.
 
-**Belangrijk — SWW gaat vóór.** Meet de regeling op dat de Remko **SWW aan het
-laden** is (`opmode` register **5001** = 4), dan doet ze **niets**: in die modus
-stuwt de Remko `5085` zélf op (naar ~60 °C) om het boilervat te laden en heeft
-onze vaste waarde geen effect. We laten het SWW-laden dus met rust en wachten tot
-de Remko terug is op ruimteverwarming. (De mengunit/klep van de vloerkring —
-onzichtbaar in de registers — houdt dat hete water sowieso buiten de vloer.)
-
-Wire-formaat (zelfde als 1082): temperatuur × 10 in hexadecimaal, 4 tekens.
-40 °C -> 400 decimaal -> 0x0190 -> "0190".
+Wire-formaat temperatuur (zelfde als 1082): temperatuur × 10 in hexadecimaal,
+4 tekens — 40 °C -> 400 decimaal -> 0x0190 -> "0190". Wire-formaat modus: twee
+hex-tekens ("02" = Verwarmen, "03" = Standby).
 
 Gebruik:
   python3 heating_comfort.py                 # één beslissing, en publiceren
   python3 heating_comfort.py --watch         # als service: elke `interval_minutes`
   python3 heating_comfort.py --dry-run       # niets publiceren, alleen tonen
   python3 heating_comfort.py --now 2026-10-11T08:00:00+02:00
+  python3 heating_comfort.py --control onoff # aan/uit via 1951 (config overschrijven)
 """
 
 from __future__ import annotations
@@ -73,15 +84,37 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # De **schrijfbare** instelling is 1975 (de "vaste waarde" van de VK-modus, die
 # de GUI ook zet); 5085 volgt 1975 automatisch. We sturen dus **1975** en lezen
 # 5085 terug als controle.
+#
+# Er zijn twee manieren om te regelen (`control` in de config):
+#
+#   * ``"supply"`` (default) — **moduleren**: de aanvoer-temperatuur (1975)
+#     tussen `charge_temp`, `base_temp` en `coast_temp` schuiven.
+#   * ``"onoff"`` — **aan/uit**: register **1951** (`main_mode`) schakelen tussen
+#     Verwarmen in het laadblok en Standby daarbuiten. Dat zet de compressor
+#     écht stil buiten het blok (harde knop), terwijl de Remko binnen het blok
+#     de laagst mogelijke aanvoer zelf kiest op de stooklijn.
 SUPPLY_REGISTER = 5085        # gewenste aanvoertemperatuur (read-only resultante)
 FIXED_TEMP_REGISTER = 1975    # schrijfbare "vaste waarde" van de VK-modus
 FIXED_TEMP_FALLBACK = 1974    # oudere/alternatieve vaste-waarde-register
 OPMODE_REGISTER = 5001        # bedrijfsmodus (4 = SWW laden, 6 = verwarmen, 9 = nawerking)
+MAIN_MODE_REGISTER = 1951     # schrijfbare hoofdmodus (aan/uit-knop)
 
 # `opmode`-waarden (register 5001) die betekenen: niet aan de ruimteverwarming
 # komen. Tijdens SWW-laden stuwt de Remko `5085` zelf op (~60 °C) en heeft onze
 # vaste waarde geen effect; we laten dat laden dus met rust.
 SWW_LOADING_OPMODE = 4
+
+# Waarden voor register 1951 (`main_mode`), hard gemeten op 20-10-2026:
+# `01` -> Auto, `02` -> Verwarmen, `03` -> Standby (compressor + pomp stil),
+# `04` -> Koelen.
+MAIN_MODE_AUTO = "01"
+MAIN_MODE_HEAT = "02"
+MAIN_MODE_STANDBY = "03"
+MAIN_MODE_COOL = "04"
+
+# Regelwijzen (config `mqtt.heating_comfort.control`).
+CONTROL_SUPPLY = "supply"
+CONTROL_ONOFF = "onoff"
 
 # Defaults (zie de module-docstring)
 DEFAULT_CHARGE_TEMP = 40.0
@@ -101,6 +134,9 @@ DEFAULT_RESPONSE_TIMEOUT = 8.0
 DEFAULT_ROWS_REFRESH_SECONDS = 1800.0
 DEFAULT_PRICE_DAYS_AHEAD = 3
 DEFAULT_BASE_READ_TIMEOUT = 8.0
+# Marge rond een gepland SWW-laadvenster waarin we de vloer niet laten laden
+# (de compressor kan maar één ding tegelijk).
+DEFAULT_DHW_GUARD_MINUTES = 15.0
 # Ondergrens/ bovengrens waarbinnen een uit register 1974/5085 gelezen
 # rustwaarde geloofwaardig is (daarbuiten negeren we hem).
 MIN_READABLE_BASE_TEMP = 15.0
@@ -139,8 +175,16 @@ def heating_cfg(cfg: dict) -> dict:
     else:
         base_temp = float(raw_base)
         base_from_register = False
+    control = str(hc.get("control", CONTROL_SUPPLY)).strip().lower()
+    if control not in (CONTROL_SUPPLY, CONTROL_ONOFF):
+        control = CONTROL_SUPPLY
     return {
         "enabled": bool(hc.get("enabled", False)),
+        "control": control,
+        "avoid_dhw": bool(hc.get("avoid_dhw", True)),
+        "dhw_guard_minutes": float(
+            hc.get("dhw_guard_minutes", DEFAULT_DHW_GUARD_MINUTES)
+        ),
         "charge_temp": float(hc.get("charge_temp", DEFAULT_CHARGE_TEMP)),
         "base_temp": base_temp,
         "base_temp_from_register": base_from_register,
@@ -206,6 +250,65 @@ def build_setpoint_payload(temperature: float) -> dict:
     return {"values": {str(FIXED_TEMP_REGISTER): value_hex}}
 
 
+def build_main_mode_payload(mode_hex: str) -> dict:
+    """Payload die de **hoofdmodus** (register 1951) zet — de aan/uit-knop.
+
+    Wire-formaat: twee hex-tekens, bv. "02" (Verwarmen) of "03" (Standby).
+    Ook hier geen `FORCE_RESPONSE`: het is een schrijfactie.
+    """
+    return {"values": {str(MAIN_MODE_REGISTER): str(mode_hex)}}
+
+
+# --------------------------------------------------------------------------- #
+# SWW-laadvenster (uit de dhw_comfort-status)
+# --------------------------------------------------------------------------- #
+
+def dhw_state_path() -> str:
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "remko-wkf70")
+    return os.path.join(cache_dir, "dhw_comfort_state.json")
+
+
+def load_dhw_state(path: Optional[str] = None) -> dict:
+    """Lees de statusfile van `dhw_comfort` (stil: leeg bij ontbreken/fout)."""
+    try:
+        with open(path or dhw_state_path(), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def dhw_charge_window(dhw_state: dict) -> Optional[Tuple[datetime, datetime]]:
+    """Het SWW-laadvenster uit de dhw-status als (start, end), of None.
+
+    `dhw_comfort` schrijft `charge_start`/`charge_end` zolang het vat geladen
+    wordt. Alleen een geldig, nog niet verstreken venster telt mee.
+    """
+    if not dhw_state:
+        return None
+    try:
+        start = datetime.fromisoformat(str(dhw_state.get("charge_start")))
+        end = datetime.fromisoformat(str(dhw_state.get("charge_end")))
+    except (TypeError, ValueError):
+        return None
+    if start.tzinfo is None or end.tzinfo is None:
+        return None
+    return start, end
+
+
+def _conflicts_dhw(
+    block: dict,
+    dhw_window: Optional[Tuple[datetime, datetime]],
+    guard_minutes: float,
+) -> bool:
+    """True als `block` met het SWW-laadvenster botst (incl. veiligheidsmarge)."""
+    if not dhw_window:
+        return False
+    start, end = dhw_window
+    return _overlaps(
+        block["start"], block["end"], start, end, guard_minutes / 60.0
+    )
+
+
 def _hours_per_day(horizon_hours: float) -> int:
     """Aantal etmalen dat de horizon beslaat (minimaal 1)."""
     return max(1, int(math.ceil(horizon_hours / 24.0)))
@@ -262,13 +365,16 @@ def plan_charge_blocks(
     granularity_min: int,
     now: datetime,
     ccfg: dict,
+    dhw_window: Optional[Tuple[datetime, datetime]] = None,
 ) -> List[dict]:
     """De laadblokken (goedkoopste uren) binnen de horizon, met tussenruimte.
 
     Kies de goedkoopste blokken van `charge_block_hours` uur, gespreid over de
     horizon met minstens `min_gap_hours` tussen de blokken, tot
     `charge_blocks_per_day` per etmaal. Blokken waarin het te warm is om te
-    verwarmen (boven `max_outdoor_for_heating_c`) vallen af.
+    verwarmen (boven `max_outdoor_for_heating_c`) vallen af, net als blokken die
+    met een gepland SWW-laadvenster (`dhw_window`) overlappen — de compressor
+    kan maar één ding tegelijk.
     """
     if not rows or ccfg["charge_blocks_per_day"] <= 0:
         return []
@@ -284,8 +390,14 @@ def plan_charge_blocks(
         earliest_start=now - timedelta(hours=bh),
         start_before=horizon_end,
     )
+    guard = ccfg.get("dhw_guard_minutes", DEFAULT_DHW_GUARD_MINUTES)
+    avoid = ccfg.get("avoid_dhw", True)
     candidates = [
-        b for b in candidates if b["end"] > now and _heating_needed(b, ccfg)
+        b
+        for b in candidates
+        if b["end"] > now
+        and _heating_needed(b, ccfg)
+        and not (avoid and _conflicts_dhw(b, dhw_window, guard))
     ]
     max_count = ccfg["charge_blocks_per_day"] * _hours_per_day(ccfg["horizon_hours"])
     return _select_spaced(candidates, max_count, ccfg["min_gap_hours"])
@@ -350,20 +462,30 @@ def decide(
     granularity_min: int,
     state: Optional[dict] = None,
     opmode: Optional[int] = None,
+    dhw_window: Optional[Tuple[datetime, datetime]] = None,
 ) -> dict:
-    """Bepaal de gewenste aanvoertemperatuur (register 1975) en de status.
+    """Bepaal de actie en het gewenste register.
 
-    Geeft een dict met o.a. `status`, `setpoint_temp` en het gekozen blok.
-    `setpoint_temp` is None als er niets te doen valt (niet schrijven).
+    In ``control = "supply"`` levert `setpoint_temp` de aanvoertemperatuur voor
+    register 1975. In ``control = "onoff"`` levert `main_mode` de te schrijven
+    modus voor register 1951 ("02" = Verwarmen in het blok, "03" = Standby
+    daarbuiten). `setpoint_temp`/`main_mode` zijn None als er niets te doen valt.
 
     ``opmode`` is de bedrijfsmodus (register 5001). Staat die op **SWW laden**
-    (4), dan doet de regeling niets: de Remko stuwt `5085` dan zélf op en onze
-    vaste waarde heeft geen effect.
+    (4), dan pauzeert de regeling: de Remko stuwt `5085` dan zélf op. In
+    onoff-stand gaat de Remko dan ook op **Standby** — SWW laden en
+    ruimteverwarming kunnen niet samen (één compressor).
+
+    ``dhw_window`` is het geplande SWW-laadvenster; blokken die daarmee
+    overlappen worden bij het plannen overgeslagen.
     """
     state = state or {}
+    onoff = ccfg.get("control") == CONTROL_ONOFF
     out: dict = {
         "now": now.isoformat(),
         "enabled": ccfg["enabled"],
+        "control": ccfg.get("control", CONTROL_SUPPLY),
+        "avoid_dhw": ccfg.get("avoid_dhw", True),
         "charge_temp": ccfg["charge_temp"],
         "base_temp": ccfg["base_temp"],
         "base_temp_from_register": ccfg.get("base_temp_from_register", False),
@@ -371,26 +493,52 @@ def decide(
         "min_supply": ccfg["min_supply"],
         "max_supply": ccfg["max_supply"],
         "opmode": opmode,
+        "setpoint_temp": None,
+        "main_mode": None,
     }
+    if dhw_window:
+        out["dhw_window"] = {
+            "start": dhw_window[0].isoformat(),
+            "end": dhw_window[1].isoformat(),
+        }
     if not ccfg["enabled"]:
         out["status"] = "disabled"
         out["setpoint_temp"] = None
+        out["main_mode"] = None
         return out
 
     if is_dhw_loading(opmode):
-        # SWW gaat vóór: laat het laden met rust, onze vaste waarde doet nu niets.
+        # SWW gaat vóór (één compressor). In onoff-stand zetten we de Remko
+        # expliciet op Standby zodat ruimteverwarming niet met SWW concurreert.
         out["status"] = "dhw"
         out["setpoint_temp"] = None
+        out["main_mode"] = MAIN_MODE_STANDBY if onoff else None
         return out
 
     if not rows:
-        # Geen prijs-/temperatuurdata: laat de aanvoer ongemoeid (de warmtepomp
-        # houdt zijn eigen, normale waarde aan).
+        # Geen prijs-/temperatuurdata: niets doen. In onoff-stand is "niets doen"
+        # de veilige Standby: geen verwarming zonder onderbouwing.
         out["status"] = "no_data"
         out["setpoint_temp"] = None
+        out["main_mode"] = MAIN_MODE_STANDBY if onoff else None
         return out
 
-    charge_blocks = plan_charge_blocks(rows, granularity_min, now, ccfg)
+    charge_blocks = plan_charge_blocks(rows, granularity_min, now, ccfg, dhw_window)
+    out["charge_blocks"] = [_block_out(b) for b in charge_blocks]
+
+    if onoff:
+        active = next((b for b in charge_blocks if b["start"] <= now < b["end"]), None)
+        if active is not None:
+            out["status"] = "charge"
+            out["main_mode"] = MAIN_MODE_HEAT
+            out["block"] = _block_out(active)
+            return out
+        out["status"] = "standby"
+        out["main_mode"] = MAIN_MODE_STANDBY
+        nxt = next((b for b in charge_blocks if b["start"] > now), None)
+        out["next_block"] = _block_out(nxt)
+        return out
+
     coast_blocks = plan_coast_blocks(rows, granularity_min, now, ccfg)
     # Een koelblok dat met een laadblok samenvalt laten we vallen.
     coast_blocks = [
@@ -401,7 +549,6 @@ def decide(
             for c in charge_blocks
         )
     ]
-    out["charge_blocks"] = [_block_out(b) for b in charge_blocks]
     out["coast_blocks"] = [_block_out(b) for b in coast_blocks]
 
     status, active = classify(now, charge_blocks, coast_blocks)
@@ -488,6 +635,21 @@ def read_opmode(mqtt_cfg: dict, timeout: float = DEFAULT_BASE_READ_TIMEOUT) -> O
 def is_dhw_loading(opmode: Optional[int]) -> bool:
     """True als de Remko op dit moment SWW aan het laden is (register 5001 = 4)."""
     return opmode == SWW_LOADING_OPMODE
+
+
+def read_main_mode(mqtt_cfg: dict,
+                   timeout: float = DEFAULT_BASE_READ_TIMEOUT) -> Optional[str]:
+    """Lees de hoofdmodus (register 1951) als hex-tekens, bv. "02"/"03".
+
+    Geeft ``None`` als het niet leesbaar is.
+    """
+    values = _query_registers(mqtt_cfg, [MAIN_MODE_REGISTER], timeout)
+    if MAIN_MODE_REGISTER not in values:
+        return None
+    try:
+        return format(int(values[MAIN_MODE_REGISTER]), "02X")
+    except (TypeError, ValueError):
+        return None
 
 
 def _query_registers(mqtt_cfg: dict, registers: List[int],
@@ -589,22 +751,39 @@ def execute(
     state: dict,
     dry_run: bool,
 ) -> dict:
-    """Publiceer de aanvoertemperatuur als ze veranderd is; werk state bij."""
-    setpoint = out.get("setpoint_temp")
-    if setpoint is None:
-        out["setpoint_changed"] = False
-        return out
+    """Publiceer de gewenste stand als hij veranderd is; werk state bij.
 
-    last = state.get("last_sent_setpoint")
-    changed = last is None or abs(float(last) - float(setpoint)) > EPS
-    out["setpoint_changed"] = changed
+    In ``supply``-stand is dat de aanvoertemperatuur (1975); in ``onoff``-stand
+    de hoofdmodus (1951). Er wordt niets gepubliceerd als de waarde gelijk is
+    aan de vorige keer (state) — MQTT blijft dan stil.
+    """
+    onoff = ccfg.get("control") == CONTROL_ONOFF
+    if onoff:
+        want = out.get("main_mode")
+        if want is None:
+            out["changed"] = False
+            return out
+        last = state.get("last_sent_main_mode")
+        changed = last is None or str(last) != str(want)
+        out["changed"] = changed
+        out["payload"] = build_main_mode_payload(str(want))
+    else:
+        setpoint = out.get("setpoint_temp")
+        if setpoint is None:
+            out["changed"] = False
+            return out
+        last = state.get("last_sent_setpoint")
+        changed = last is None or abs(float(last) - float(setpoint)) > EPS
+        out["changed"] = changed
+        out["payload"] = build_setpoint_payload(float(setpoint))
 
+    # Behoud de oude sleutel voor bestaande gebruikers van de JSON-uitvoer.
+    out["setpoint_changed"] = bool(changed)
     if not changed:
         return out
 
     topic = energy_log.command_topic(mqtt_cfg)
     out["topic"] = topic
-    out["payload"] = build_setpoint_payload(float(setpoint))
 
     if dry_run:
         out["mqtt_published"] = False
@@ -621,7 +800,10 @@ def execute(
     out["mqtt_published"] = ok
     out["mqtt_detail"] = detail
     if ok:
-        state["last_sent_setpoint"] = float(setpoint)
+        if onoff:
+            state["last_sent_main_mode"] = str(want)
+        else:
+            state["last_sent_setpoint"] = float(out["setpoint_temp"])
         state["last_sent_at"] = out["now"]
         save_state(state)
     return out
@@ -701,17 +883,25 @@ def watch(cfg: dict, tz: ZoneInfo, ccfg: dict, dry_run: bool) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    _log(
-        "Vloerverwarming-buffer gestart — aanvoer laden tot "
-        f"{ccfg['charge_temp']:g} °C, normaal {ccfg['base_temp']:g} °C, "
-        f"duur-uur {ccfg['coast_temp']:g} °C; "
-        f"blokken {ccfg['charge_block_hours']:g} u x "
-        f"{ccfg['charge_blocks_per_day']}/dag; "
-        f"berekenen elke {ccfg['interval_minutes']:g} min"
-    )
+    if ccfg.get("control") == CONTROL_ONOFF:
+        _log(
+            "Vloerverwarming aan/uit gestart — in het blok 1951=02 (Verwarmen), "
+            f"daarbuiten 1951=03 (Standby); blok {ccfg['charge_block_hours']:g} u x "
+            f"{ccfg['charge_blocks_per_day']}/dag; "
+            f"SWW mijden: {ccfg.get('avoid_dhw')}"
+        )
+    else:
+        _log(
+            "Vloerverwarming-buffer gestart — aanvoer laden tot "
+            f"{ccfg['charge_temp']:g} °C, normaal {ccfg['base_temp']:g} °C, "
+            f"duur-uur {ccfg['coast_temp']:g} °C; "
+            f"blokken {ccfg['charge_block_hours']:g} u x "
+            f"{ccfg['charge_blocks_per_day']}/dag; "
+            f"berekenen elke {ccfg['interval_minutes']:g} min"
+        )
 
     state = load_state()
-    if ccfg.get("base_temp_from_register"):
+    if ccfg.get("base_temp_from_register") and ccfg.get("control") != CONTROL_ONOFF:
         resolve_base_temp(ccfg, mqtt_cfg, state, log=_log)
         save_state(state)
     rows: List[dict] = []
@@ -731,27 +921,39 @@ def watch(cfg: dict, tz: ZoneInfo, ccfg: dict, dry_run: bool) -> int:
                     rows_at = time.time()
             # Lees de vaste waarde opnieuw: verzet de gebruiker 's winters de
             # GUI, dan volgt de rustwaarde automatisch.
-            if ccfg.get("base_temp_from_register"):
+            if ccfg.get("base_temp_from_register") and ccfg.get("control") != CONTROL_ONOFF:
                 resolve_base_temp(ccfg, mqtt_cfg, state, log=_log)
 
-        # SWW-laden? Dan niets doen (de Remko stuurt 5085 zelf op).
+        # SWW-laden? Dan pauzeren (de Remko stuurt 5085 zelf op).
         opmode = read_opmode(mqtt_cfg, ccfg.get("base_read_timeout_seconds",
                                                 DEFAULT_BASE_READ_TIMEOUT))
-        out = decide(ccfg, now, rows, granularity, state, opmode=opmode)
+        dhw_window = dhw_charge_window(load_dhw_state())
+        out = decide(ccfg, now, rows, granularity, state,
+                     opmode=opmode, dhw_window=dhw_window)
         execute(out, mqtt_cfg, ccfg, state, dry_run)
         save_state(state)
         _log(_status_log(out))
         stop.wait(ccfg["interval_minutes"] * 60.0)
 
-    _log("Vloerverwarming-buffer gestopt")
+    _log("Vloerverwarming gestopt")
     return 0
 
 
 def _status_log(out: dict) -> str:
     status = out.get("status")
     sp = out.get("setpoint_temp")
+    onoff = out.get("control") == CONTROL_ONOFF
     if status == "charge":
-        parts = [f"LADEN -> aanvoer {sp:g} °C"]
+        parts = [("LADEN -> 1951=Verwarmen" if onoff
+                  else f"LADEN -> aanvoer {sp:g} °C")]
+        b = out.get("block")
+        if b:
+            parts.append(f"blok t/m {_fmt_iso(b['end'])}")
+    elif status == "standby":
+        parts = ["STANDBY -> 1951=Standby (compressor uit)"]
+        nb = out.get("next_block")
+        if nb:
+            parts.append(f"volgend laadblok {_fmt_iso(nb['start'])}")
     elif status == "coast":
         parts = [f"DUUR UUR -> aanvoer {sp:g} °C (vloer laten uitwerken)"]
     elif status == "base":
@@ -760,14 +962,17 @@ def _status_log(out: dict) -> str:
         if nb:
             parts.append(f"volgend laadblok {_fmt_iso(nb['start'])}")
     elif status == "no_data":
-        parts = ["geen prijs-/temperatuurdata — aanvoer ongemoeid"]
+        parts = ["geen prijs-/temperatuurdata"]
+        parts.append("-> 1951=Standby (veilig)" if onoff else "— aanvoer ongemoeid")
     elif status == "dhw":
-        parts = ["SWW laden actief — regeling wacht (5085 volgt de SWW-vraag)"]
+        parts = ["SWW laden actief — regeling pauzeert"]
+        if onoff:
+            parts.append("1951=Standby (niet tegelijk met SWW)")
     elif status == "disabled":
         parts = ["uit"]
     else:
         parts = [str(status)]
-    if out.get("setpoint_changed") and out.get("topic"):
+    if out.get("changed") and out.get("topic"):
         if out.get("mqtt_published"):
             parts.append(f"VERSTUURD {json.dumps(out.get('payload'), ensure_ascii=False)}")
         else:
@@ -790,40 +995,62 @@ def _fmt_iso(iso: Optional[str]) -> str:
 # --------------------------------------------------------------------------- #
 
 def render_human(out: dict) -> List[str]:
+    onoff = out.get("control") == CONTROL_ONOFF
     lines: List[str] = []
-    lines.append("Vloerverwarming-bufferregeling — laden op de goedkoopste uren")
+    lines.append("Vloerverwarming — laden op de goedkoopste uren"
+                 + (" (aan/uit via 1951)" if onoff else ""))
     lines.append("=" * 64)
     if "now" in out:
         lines.append(f"Nu       : {app.fmt_dt(datetime.fromisoformat(out['now']))}")
-    lines.append(
-        f"Regeling : laden {out.get('charge_temp', DEFAULT_CHARGE_TEMP):g} °C, "
-        f"normaal {out.get('base_temp', DEFAULT_BASE_TEMP):g} °C, "
-        f"duur uur {out.get('coast_temp', DEFAULT_COAST_TEMP):g} °C "
-        f"(register {FIXED_TEMP_REGISTER})"
-    )
-    if out.get("base_temp_from_register"):
+    if onoff:
         lines.append(
-            f"Rustwaarde: {out.get('base_temp', DEFAULT_BASE_TEMP):g} °C "
-            f"uit register {FIXED_TEMP_REGISTER}/{SUPPLY_REGISTER}"
+            "Regeling : in laadblok 1951=02 (Verwarmen), daarbuiten 1951=03 "
+            "(Standby)"
         )
+        lines.append(
+            "SWW      : " + ("laden mijden aan" if out.get("avoid_dhw", True)
+                             else "laden mijden uit")
+        )
+    else:
+        lines.append(
+            f"Regeling : laden {out.get('charge_temp', DEFAULT_CHARGE_TEMP):g} °C, "
+            f"normaal {out.get('base_temp', DEFAULT_BASE_TEMP):g} °C, "
+            f"duur uur {out.get('coast_temp', DEFAULT_COAST_TEMP):g} °C "
+            f"(register {FIXED_TEMP_REGISTER})"
+        )
+        if out.get("base_temp_from_register"):
+            lines.append(
+                f"Rustwaarde: {out.get('base_temp', DEFAULT_BASE_TEMP):g} °C "
+                f"uit register {FIXED_TEMP_REGISTER}/{SUPPLY_REGISTER}"
+            )
+    dw = out.get("dhw_window")
+    if dw:
+        lines.append(f"SWW-venster: {_fmt_iso(dw['start'])} – {_fmt_iso(dw['end'])} "
+                     "(blokken die hiermee botsen vallen af)")
 
     status = out.get("status")
     if status == "disabled":
         lines.append("Status   : uit (mqtt.heating_comfort.enabled = false of mqtt uit)")
         return lines
     if status == "no_data":
-        lines.append("Status   : geen prijs-/temperatuurdata — aanvoer ongemoeid")
+        lines.append("Status   : geen prijs-/temperatuurdata"
+                     + (" — 1951=Standby (veilig)" if onoff else " — aanvoer ongemoeid"))
         return lines
     if status == "dhw":
-        lines.append("Status   : SWW laden actief — regeling wacht; de Remko stuurt "
-                     "5085 zelf op")
-        lines.append("           (onze vaste waarde heeft nu geen effect)")
+        lines.append("Status   : SWW laden actief — regeling pauzeert")
+        if onoff:
+            lines.append("           1951=Standby (niet tegelijk met SWW)")
         return lines
 
-    label = {"charge": "LADEN", "coast": "DUUR UUR", "base": "NORMAAL"}.get(
-        status, str(status)
-    )
-    lines.append(f"Actie    : {label} -> aanvoer {out.get('setpoint_temp'):g} °C")
+    if status == "standby":
+        lines.append("Actie    : STANDBY -> 1951=03 (compressor uit)")
+    elif status == "charge" and onoff:
+        lines.append("Actie    : LADEN -> 1951=02 (Verwarmen, stooklijn kiest aanvoer)")
+    else:
+        label = {"charge": "LADEN", "coast": "DUUR UUR", "base": "NORMAAL"}.get(
+            status, str(status)
+        )
+        lines.append(f"Actie    : {label} -> aanvoer {out.get('setpoint_temp'):g} °C")
     b = out.get("block")
     if b:
         lines.append(
@@ -849,16 +1076,17 @@ def render_human(out: dict) -> List[str]:
                 f"{app.nl(blk['mean_corrected'], 4)} €/kWh warmte"
             )
 
-    if out.get("setpoint_changed"):
+    if out.get("changed"):
+        what = "Modus" if onoff else "Setpoint"
         if out.get("mqtt_published"):
             lines.append(
-                f"Setpoint : VERSTUURD → {out.get('topic')} "
+                f"{what:<9}: VERSTUURD → {out.get('topic')} "
                 f"{json.dumps(out.get('payload'), ensure_ascii=False)}"
             )
         elif str(out.get("mqtt_detail", "")).startswith("dry-run"):
-            lines.append("Setpoint : (dry-run: niet gepubliceerd)")
+            lines.append(f"{what:<9}: (dry-run: niet gepubliceerd)")
         else:
-            lines.append(f"Setpoint : NIET verstuurd ({out.get('mqtt_detail')})")
+            lines.append(f"{what:<9}: NIET verstuurd ({out.get('mqtt_detail')})")
     return lines
 
 
@@ -881,6 +1109,10 @@ def main(argv: List[str] | None = None) -> int:
                     help="rustwaarde overschrijven (anders uit config/register 1974)")
     ap.add_argument("--read-base", action="store_true",
                     help="de rustwaarde nu uit register 1974/5085 lezen en tonen")
+    ap.add_argument("--control", choices=[CONTROL_SUPPLY, CONTROL_ONOFF], default=None,
+                    help="regelwijze: 'supply' (1975-moduleren) of 'onoff' (1951 aan/uit)")
+    ap.add_argument("--read-mode", action="store_true",
+                    help="de hoofdmodus nu uit register 1951 lezen en tonen")
     args = ap.parse_args(argv)
 
     try:
@@ -899,9 +1131,22 @@ def main(argv: List[str] | None = None) -> int:
     if args.base_temp is not None:
         ccfg["base_temp"] = float(args.base_temp)
         ccfg["base_temp_from_register"] = False
+    if args.control is not None:
+        ccfg["control"] = args.control
 
     mqtt_cfg = cfg.get("mqtt") or {}
     state = load_state()
+
+    if args.read_mode:
+        mode = read_main_mode(mqtt_cfg, ccfg.get("base_read_timeout_seconds",
+                                                 DEFAULT_BASE_READ_TIMEOUT))
+        if mode is None:
+            print("hoofdmodus: niet leesbaar (register 1951 gaf niets)", file=sys.stderr)
+            return 1
+        label = {"01": "Auto", "02": "Verwarmen", "03": "Standby",
+                 "04": "Koelen"}.get(mode, "?")
+        print(f"hoofdmodus (register {MAIN_MODE_REGISTER}): {mode} ({label})")
+        return 0
 
     if args.read_base:
         temp = read_fixed_temp(mqtt_cfg, ccfg["base_read_timeout_seconds"])
@@ -922,7 +1167,7 @@ def main(argv: List[str] | None = None) -> int:
     if now.tzinfo is None:
         now = now.replace(tzinfo=tz)
 
-    if ccfg.get("base_temp_from_register"):
+    if ccfg.get("base_temp_from_register") and ccfg.get("control") != CONTROL_ONOFF:
         resolve_base_temp(ccfg, mqtt_cfg, state, log=lambda m: print(m, file=sys.stderr))
 
     rows: List[dict] = []
@@ -934,7 +1179,9 @@ def main(argv: List[str] | None = None) -> int:
 
     opmode = read_opmode(mqtt_cfg, ccfg.get("base_read_timeout_seconds",
                                             DEFAULT_BASE_READ_TIMEOUT))
-    out = decide(ccfg, now, rows, granularity, state, opmode=opmode)
+    dhw_window = dhw_charge_window(load_dhw_state())
+    out = decide(ccfg, now, rows, granularity, state,
+                 opmode=opmode, dhw_window=dhw_window)
     execute(out, mqtt_cfg, ccfg, state, dry_run=args.dry_run)
 
     if args.json:

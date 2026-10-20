@@ -339,7 +339,171 @@ class TestOpMode(unittest.TestCase):
         out = heating_comfort.decide(c, now, rows, 15, {}, opmode=4)
         lines = "\n".join(heating_comfort.render_human(out))
         self.assertIn("SWW", lines)
-        self.assertIn("wacht", lines)
+        self.assertIn("pauzeert", lines)
+
+
+class TestMainMode(unittest.TestCase):
+    """Aan/uit-regeling via register 1951 (`control = "onoff"`)."""
+
+    def setUp(self):
+        self.c = _cfg(enabled=True, control="onoff")
+        self.now = _dt(8, 0)
+
+    def test_control_default_supply(self):
+        self.assertEqual(_cfg()["control"], heating_comfort.CONTROL_SUPPLY)
+
+    def test_control_onoff_parsed(self):
+        self.assertEqual(self.c["control"], heating_comfort.CONTROL_ONOFF)
+
+    def test_control_unknown_falls_back(self):
+        self.assertEqual(_cfg(control="banaan")["control"],
+                         heating_comfort.CONTROL_SUPPLY)
+
+    def test_payload_format(self):
+        self.assertEqual(heating_comfort.build_main_mode_payload("02"),
+                         {"values": {"1951": "02"}})
+
+    def test_in_block_is_heat(self):
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        out = heating_comfort.decide(self.c, self.now, rows, 15, {})
+        self.assertEqual(out["status"], "charge")
+        self.assertEqual(out["main_mode"], heating_comfort.MAIN_MODE_HEAT)
+        self.assertIsNone(out["setpoint_temp"])
+
+    def test_outside_block_is_standby(self):
+        # Goedkoopste blok pas 's middags: nu standby.
+        def pf(d):
+            return 0.05 if 13 <= d.hour < 16 else 0.40
+
+        rows = _mk_rows(self.now, 96, price_fn=pf)
+        out = heating_comfort.decide(self.c, self.now, rows, 15, {})
+        self.assertEqual(out["status"], "standby")
+        self.assertEqual(out["main_mode"], heating_comfort.MAIN_MODE_STANDBY)
+        self.assertIsNotNone(out["next_block"])
+
+    def test_dhw_loading_forces_standby(self):
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        out = heating_comfort.decide(self.c, self.now, rows, 15, {}, opmode=4)
+        self.assertEqual(out["status"], "dhw")
+        self.assertEqual(out["main_mode"], heating_comfort.MAIN_MODE_STANDBY)
+
+    def test_no_data_forces_standby(self):
+        out = heating_comfort.decide(self.c, self.now, [], 15, {})
+        self.assertEqual(out["status"], "no_data")
+        self.assertEqual(out["main_mode"], heating_comfort.MAIN_MODE_STANDBY)
+
+    def test_disabled_has_no_mode(self):
+        out = heating_comfort.decide(_cfg(control="onoff"), self.now, [], 15, {})
+        self.assertEqual(out["status"], "disabled")
+        self.assertIsNone(out["main_mode"])
+
+    def test_execute_publishes_main_mode(self):
+        c = self.c
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        state = {}
+        out = heating_comfort.decide(c, self.now, rows, 15, state)
+        heating_comfort.execute(out, {"enabled": True}, c, state, dry_run=True)
+        self.assertTrue(out["changed"])
+        self.assertEqual(out["payload"]["values"]["1951"], "02")
+
+    def test_execute_unchanged_mode_not_republished(self):
+        c = self.c
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        state = {"last_sent_main_mode": "02"}
+        out = heating_comfort.decide(c, self.now, rows, 15, state)
+        heating_comfort.execute(out, {"enabled": True}, c, state, dry_run=True)
+        self.assertFalse(out["changed"])
+
+    def test_execute_updates_state_on_publish(self):
+        c = self.c
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        state = {}
+        out = heating_comfort.decide(c, self.now, rows, 15, state)
+        orig = heating_comfort.mqtt_out.publish_command
+        heating_comfort.mqtt_out.publish_command = lambda *a, **k: (True, "ok")
+        try:
+            heating_comfort.execute(out, {"enabled": True}, c, state, dry_run=False)
+        finally:
+            heating_comfort.mqtt_out.publish_command = orig
+        self.assertEqual(state["last_sent_main_mode"], "02")
+
+    def test_render_onoff(self):
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        out = heating_comfort.decide(self.c, self.now, rows, 15, {})
+        lines = "\n".join(heating_comfort.render_human(out))
+        self.assertIn("1951", lines)
+        self.assertIn("aan/uit", lines)
+
+
+class TestReadMainMode(unittest.TestCase):
+    def setUp(self):
+        self.orig = heating_comfort._query_registers
+
+    def tearDown(self):
+        heating_comfort._query_registers = self.orig
+
+    def _fake(self, values):
+        heating_comfort._query_registers = lambda *a, **k: dict(values)
+
+    def test_reads_hex(self):
+        self._fake({1951: 3})
+        self.assertEqual(heating_comfort.read_main_mode({}), "03")
+
+    def test_missing(self):
+        self._fake({})
+        self.assertIsNone(heating_comfort.read_main_mode({}))
+
+
+class TestDhwExclusion(unittest.TestCase):
+    """Blok kiezen dat niet met een SWW-laadvenster botst."""
+
+    def setUp(self):
+        self.c = _cfg(enabled=True, control="onoff")
+        self.now = _dt(8, 0)
+
+    def test_dhw_charge_window_none_when_empty(self):
+        self.assertIsNone(heating_comfort.dhw_charge_window({}))
+
+    def test_dhw_charge_window_parses(self):
+        st = {
+            "charge_start": "2026-10-11T09:00:00+02:00",
+            "charge_end": "2026-10-11T10:00:00+02:00",
+        }
+        w = heating_comfort.dhw_charge_window(st)
+        self.assertIsNotNone(w)
+        self.assertEqual(w[0].hour, 9)
+
+    def test_dhw_charge_window_bad(self):
+        self.assertIsNone(heating_comfort.dhw_charge_window(
+            {"charge_start": "niet-een-tijd"}))
+
+    def test_block_avoids_dhw_window(self):
+        # Het goedkoopste blok (08:00) valt samen met het SWW-venster; het
+        # op één na goedkoopste (rond 13:00) moet dan gekozen worden.
+        def pf(d):
+            if 8 <= d.hour < 11:
+                return 0.05      # goedkoopst, maar botst met SWW
+            if 13 <= d.hour < 16:
+                return 0.15
+            return 0.40
+
+        rows = _mk_rows(self.now, 96, price_fn=pf)
+        window = (_dt(8, 0), _dt(11, 0))
+        out = heating_comfort.decide(self.c, self.now, rows, 15, {},
+                                     dhw_window=window)
+        starts = [b["start"] for b in out["charge_blocks"]]
+        self.assertTrue(starts, "er moet een laadblok overblijven")
+        for s in starts:
+            hour = int(s[11:13])
+            self.assertNotIn(hour, (8, 9, 10))
+
+    def test_avoid_dhw_can_be_disabled(self):
+        c = _cfg(enabled=True, control="onoff", avoid_dhw=False)
+        rows = _mk_rows(self.now, 96, price_fn=lambda d: 0.10)
+        window = (_dt(8, 0), _dt(11, 0))
+        out = heating_comfort.decide(c, self.now, rows, 15, {}, dhw_window=window)
+        # Met mijden uit mag het blok nu wél met SWW samenvallen.
+        self.assertEqual(out["status"], "charge")
 
 
 class TestReadFixedTemp(unittest.TestCase):
