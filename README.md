@@ -594,14 +594,20 @@ WantedBy=multi-user.target
 
 De vloerverwarming is één grote warmtebuffer: als je de vloer tijdens de
 goedkoopste uren wat warmer maakt, houdt die de kamer daarna urenlang op
-temperatuur. `heating_comfort.py` gebruikt dat en stuurt de **vaste waarde van
-de VK-modus** — register **1975** (de schrijfbare instelling; de gewenste
-aanvoertemperatuur `heat_water_temp_req` **5085** volgt hem automatisch) — op
-basis van dezelfde data als het advies: de **kwartierprijs**, de
-**uurvoorspelling** en de **COP** van de Remko (gecorrigeerde prijs = €/kWh ÷
-COP).
+temperatuur. `heating_comfort.py` kiest het **goedkoopste aaneengesloten blok**
+van `charge_block_hours` uur (default 3) op basis van dezelfde data als het
+advies: de **prijs**, de **uurvoorspelling** en de **COP** van de Remko
+(gecorrigeerde prijs = €/kWh ÷ COP, dus €/kWh *warmte*). Koud weer verlaagt de
+COP; een blok in een warmer uur kan daardoor rendabeler zijn ook al is de
+stroomprijs iets hoger.
 
-Drie niveau's:
+Er zijn twee **regelwijzen** (`mqtt.heating_comfort.control`):
+
+### `control: "supply"` (default) — moduleren via register 1975
+
+Stuurt de **vaste waarde van de VK-modus** — register **1975** (de schrijfbare
+instelling; de gewenste aanvoertemperatuur `heat_water_temp_req` **5085** volgt
+hem automatisch). Drie niveau's:
 
 | Actie | Waarde (via register 1975) | Betekenis |
 |---|---|---|
@@ -616,23 +622,69 @@ regeling hem bij de volgende verversing automatisch. In de config kun je
 `base_temp` ook op een vast getal of op `"config"` zetten (dan
 `heatpump.supply_temperature`). Met `--read-base` lees je hem los uit.
 
-De regeling leest **geen ruimtetemperatuur**: het kamercomfort blijft bepaald
-door de bestaande thermostaat (bv. Watts). Er wordt uitsluitend register 1975
-geschreven — **niet** aan de SWW-regeling (1082) of de hoofdmode (1951) geraakt,
-dus deze service kan naast `dhw_comfort.py` draaien.
-
 Het schrijfcommando is `{"values": {"1975": "0190"}}` = 40 °C (temperatuur ×10 in
 hexadecimaal). Bewust **zonder** `FORCE_RESPONSE`: dat veld zou het bericht als
-*query* (lezen) laten opvatten. Er wordt alleen gepubliceerd als de waarde
-**verandert**; de statusfile `~/.cache/remko-wkf70/heating_comfort_state.json`
-onthoudt de laatst gezette waarde.
+*query* (lezen) laten opvatten.
+
+### `control: "onoff"` — aan/uit via register 1951 (`main_mode`)
+
+De krachtigste zuinige stand. In plaats van de aanvoer te moduleren schakelt de
+regeling de **hoofdmodus** (register **1951**, hard gemeten schrijfbaar):
+
+| Situatie | Register 1951 | Effect |
+|---|---|---|
+| **in het laadblok** | `02` (Verwarmen) | de Remko verwarmt; met de VK-modus op **stooklijn** (`1972 = 0`) kiest hij zélf de laagst mogelijke aanvoer → beste COP |
+| **buiten het blok** | `03` (Standby) | compressor **en** pomp staan écht stil — geen sluipverbruik |
+
+Dit is precies waarom de vloermassa werkt: in het goedkope blok laadt de vloer op
+(de laagst mogelijke aanvoer), daarbuiten is de warmtepomp volledig uit en voedt
+de vloer de kamer. Het schrijfcommando is `{"values": {"1951": "02"}}`.
+
+> **Zet de VK-modus op stooklijn** (`1972 = 0`) als je `onoff` gebruikt: dan
+> negeert de Remko onze 1975 en volgt hij zijn eigen, lagere stooklijnwaarde.
+> Met `1972 = 1` (vaste waarde) volgt 5085 onze 1975.
+
+Met `set_main_mode.py` kun je 1951 ook handmatig zetten:
+
+```bash
+~/remkoverwarming/venv/bin/python3 set_main_mode.py standby   # 1951 = 03
+~/remkoverwarming/venv/bin/python3 set_main_mode.py verwarmen # 1951 = 02
+~/remkoverwarming/venv/bin/python3 set_main_mode.py auto      # 1951 = 01
+```
+
+### SWW gaat vóór (één compressor)
+
+SWW laden en ruimteverwarming kunnen **niet tegelijk**: de Remko heeft één
+compressor. Daarom:
+
+* bij het **plannen** worden laadblokken overgeslagen die met een gepland
+  SWW-laadvenster (`~/.cache/remko-wkf70/dhw_comfort_state.json`, veld
+  `charge_start`/`charge_end`) overlappen, plus een veiligheidsmarge
+  `dhw_guard_minutes` (default 15 min);
+* bij het **draaien** pauzeert de regeling zodra de Remko echt SWW laadt
+  (`opmode` register **5001** = 4). In `onoff`-stand gaat 1951 dan op **Standby**
+  (niet tegelijk met SWW); in `supply`-stand wordt 1975 met rust gelaten.
+
+Zet `avoid_dhw: false` om dit uit te schakelen.
+
+De regeling leest **geen ruimtetemperatuur**: het kamercomfort blijft bepaald
+door de bestaande thermostaat (bv. Watts). De SWW-regeling (register 1082) wordt
+nooit aangeraakt, dus deze service kan naast `dhw_comfort.py` draaien.
+
+Er wordt alleen gepubliceerd als de waarde **verandert**; de statusfile
+`~/.cache/remko-wkf70/heating_comfort_state.json` onthoudt de laatst gezette
+waarde (`last_sent_setpoint` in `supply`-stand, `last_sent_main_mode` in
+`onoff`-stand).
 
 **Config** (`mqtt.heating_comfort`, zie `config.example.json`):
 
 | Sleutel | Default | Betekenis |
 |---|---|---|
 | `enabled` | `false` | regeling aan/uit (staat bewust uit tot je hem op de Pi test). |
-| `charge_temp` | `40` | aanvoertemperatuur tijdens een laadblok. |
+| `control` | `"supply"` | regelwijze: `"supply"` (1975 moduleren) of `"onoff"` (1951 aan/uit). |
+| `avoid_dhw` | `true` | laadblokken mijden die met een SWW-laadvenster botsen. |
+| `dhw_guard_minutes` | `15` | veiligheidsmarge rond het SWW-laadvenster. |
+| `charge_temp` | `40` | aanvoertemperatuur tijdens een laadblok (alleen `supply`). |
 | `base_temp` | `null` = uit register | normale, constante aanvoer buiten de blokken. `null`/weggelaten = bij de start lezen uit register 1975 (met 1974/5085 als terugval); een getal = vast; `"config"` = `heatpump.supply_temperature`. |
 | `coast_temp` | `28` | aanvoertemperatuur tijdens de duurste uren. |
 | `min_supply` / `max_supply` | `20` / `45` | harde grenzen op de geschreven waarde (vloerbescherming). |
@@ -658,6 +710,12 @@ onthoudt de laatst gezette waarde.
 
 # de rustwaarde (vaste waarde) los uit register 1975/1974/5085 lezen en tonen:
 ~/remkoverwarming/venv/bin/python3 heating_comfort.py --read-base
+
+# de hoofdmodus (1951) los lezen en tonen:
+~/remkoverwarming/venv/bin/python3 heating_comfort.py --read-mode
+
+# aan/uit-modus (1951) in plaats van 1975-modulatie:
+~/remkoverwarming/venv/bin/python3 heating_comfort.py --control onoff --dry-run
 
 # als continue service:
 ~/remkoverwarming/venv/bin/python3 heating_comfort.py --watch
@@ -956,6 +1014,36 @@ tegenspreken. Zodra de Remko terug is op ruimteverwarming, pakt de regeling zijn
 eigen vaste waarde weer op. Zo kunnen `dhw_comfort.py` en `heating_comfort.py`
 naast elkaar draaien.
 
+#### Register 1951 is een echte aan/uit-knop (20-10-2026)
+
+Naast de modulerende `1975` blijkt de **hoofdmodus** (register **1951**) ook
+schrijfbaar én direct werkend. Met een onbewolkte meting (Remko stond op
+`5001 = Verwarmen`, compressor net gestart):
+
+```
+schrijf 1951 = 03 (Standby)  ->  binnen 8 s:  5001 = 10 (Standby),  5085 = 10 °C
+                                5625 compressor = uit,  5205 = 0 Hz,  5320 = 0 W
+schrijf 1951 = 02 (Verwarmen) -> 5001 = 6 (Verwarmen)
+```
+
+De coderingswaarden (`MAIN_MODE_*` in `heating_comfort.py`):
+
+| 1951 | Modus | Opmerking |
+|---|---|---|
+| `01` | Auto | de regeling kiest zelf (stooklijn) |
+| `02` | Verwarmen | ruimteverwarming aan |
+| `03` | Standby | **alles uit** (compressor + pomp stil) |
+| `04` | Koelen | koelen |
+
+Dit maakt een **harde** zuinige regeling mogelijk: in de dure uren `1951 = 03`
+(geen sluipverbruik), in het goedkope blok `1951 = 02` met de VK-modus op
+**stooklijn** (`1972 = 0`) zodat de Remko zélf de laagst mogelijke aanvoer kiest.
+Dat is `control: "onoff"` in `heating_comfort.py`.
+
+> **Let op.** `1951 = 03` (Standby) schakelt ook de **VK-kring** uit: `1972` valt
+> terug naar `0` (stooklijn). Dat is precies wat we willen — de stooklijn is de
+> gewenste stand bij het hervatten.
+
 #### Welke registers zijn schrijfbaar via MQTT? (21:56–22:35)
 
 Belangrijk: **niet elk register dat de gateway toont, kun je ook schrijven.**
@@ -968,8 +1056,8 @@ Systematisch getest door een waarde te publiceren en het effect terug te lezen:
 | **1975** `fixed_temp_req` (**vaste waarde VK**) | ✅ **ja** | **dé knop**: `1975` zetten → `5085` volgt direct |
 | **5085** `heat_water_temp_req` | ❌ **nee** | read-only resultante (publicatie wordt genegeerd) |
 | 1974 (vaste waarde, oud) | ❌ nee | niet in antwoord, niet overgenomen |
-| 1951 `main_mode` (expert-modus) | ? | geen observeerbaar effect (niet terugleesbaar) |
-| 1946 `temp_adjust` | ? | niet terugleesbaar |
+| **1951** `main_mode` (**expert-hoofdmodus**) | ✅ **ja** | **aan/uit-knop**: `03` → Standby (compressor+pomp stil), `02` → Verwarmen |
+| 1946 `temp_adjust` | ❌ nee | 0 ondanks GUI "−1,0 K" |
 
 De schrijfroute zelf is goed: `1082` veranderde wél (payload `{"values": {"1082":
 "01C2"}}`, ook met `FORCE_RESPONSE`). Het probleem is **5085-specifiek**: de
