@@ -121,6 +121,7 @@ MAIN_MODE_COOL = "04"
 # Regelwijzen (config `mqtt.heating_comfort.control`).
 CONTROL_SUPPLY = "supply"
 CONTROL_ONOFF = "onoff"
+CONTROL_PEAK_AVOID = "peak_avoid"  # Verwarmen buiten pieken, standby in dure pieken
 
 # Defaults (zie de module-docstring)
 DEFAULT_CHARGE_TEMP = 40.0
@@ -157,6 +158,12 @@ MIN_READABLE_BASE_TEMP = 15.0
 MAX_READABLE_BASE_TEMP = 50.0
 EPS = 1e-6
 
+# Peak avoidance mode (inverse of charge blocks)
+DEFAULT_PEAK_AVOIDANCE = False
+DEFAULT_PEAK_HOURS = 4.0
+DEFAULT_PEAK_BLOCKS_PER_DAY = 2
+DEFAULT_MIN_PEAK_GAP_HOURS = 4.0
+
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -190,7 +197,7 @@ def heating_cfg(cfg: dict) -> dict:
         base_temp = float(raw_base)
         base_from_register = False
     control = str(hc.get("control", CONTROL_SUPPLY)).strip().lower()
-    if control not in (CONTROL_SUPPLY, CONTROL_ONOFF):
+    if control not in (CONTROL_SUPPLY, CONTROL_ONOFF, CONTROL_PEAK_AVOID):
         control = CONTROL_SUPPLY
     return {
         "enabled": bool(hc.get("enabled", False)),
@@ -244,6 +251,14 @@ def heating_cfg(cfg: dict) -> dict:
         ),
         "qos": int(hc.get("qos", 1)),
         "retain": bool(hc.get("retain", False)),
+        # Peak avoidance mode
+        "peak_hours": float(hc.get("peak_hours", DEFAULT_PEAK_HOURS)),
+        "peak_blocks_per_day": int(
+            hc.get("peak_blocks_per_day", DEFAULT_PEAK_BLOCKS_PER_DAY)
+        ),
+        "min_peak_gap_hours": float(
+            hc.get("min_peak_gap_hours", DEFAULT_MIN_PEAK_GAP_HOURS)
+        ),
     }
 
 
@@ -498,6 +513,40 @@ def plan_coast_blocks(
     return _select_spaced(candidates, max_count, ccfg["min_gap_hours"])
 
 
+def plan_peak_blocks(
+    rows: List[dict],
+    granularity_min: int,
+    now: datetime,
+    ccfg: dict,
+) -> List[dict]:
+    """Zoek de duurste aaneengesloten blokken van `peak_hours` uur (piekuren).
+
+    Deze blokken worden gebruikt in `peak_avoid`-modus om de warmtepomp op
+    Standby te zetten tijdens de duurste uren.
+    """
+    if not rows or ccfg["peak_blocks_per_day"] <= 0:
+        return []
+    bh = ccfg["peak_hours"]
+    horizon_end = now + timedelta(hours=ccfg["horizon_hours"])
+    candidates = find_cheapest_blocks(
+        rows,
+        granularity_min=granularity_min,
+        block_hours=bh,
+        only_future=False,
+        top_n=100000,
+        now=now,
+        earliest_start=now - timedelta(hours=bh),
+        start_before=horizon_end,
+    )
+    candidates = [
+        b for b in candidates if b["end"] > now and _heating_needed(b, ccfg)
+    ]
+    # duurste eerst
+    candidates.sort(key=lambda b: b["mean_corrected"], reverse=True)
+    max_count = ccfg["peak_blocks_per_day"] * _hours_per_day(ccfg["horizon_hours"])
+    return _select_spaced(candidates, max_count, ccfg["min_peak_gap_hours"])
+
+
 # --------------------------------------------------------------------------- #
 # Beslissing
 # --------------------------------------------------------------------------- #
@@ -527,23 +576,51 @@ def _decide_onoff(
     state: dict,
     opmode: Optional[int],
     out: dict,
+    peak_blocks: Optional[List[dict]] = None,
 ) -> dict:
     """De aan/uit-beslissing (register 1951), met SWW-inhaal.
 
+    In normale onoff-modus: in laadblok 1951=Verwarmen, anders Standby.
+    In peak_avoid-modus: buiten pieken Verwarmen, in dure 4-uurs pieken Standby.
     De vloer krijgt altijd zijn volle `charge_block_hours`. Valt het SWW-laden
     (één compressor) tijdens ons blok, dan zetten we de Remko op **Standby**
     (status `dhw`) en schuiven we het blokeinde op met precies de verloren tijd
-    (`dhw_extend_seconds` in de statusfile). Zodra het SWW klaar is, hervatten
-    we en loopt het blok door tot het opgeschoven einde.
+    (`dhw_extend_seconds` in de statusfile).
     """
+    peak_blocks = peak_blocks or []
+    peak_avoid = ccfg.get("control") == CONTROL_PEAK_AVOID
+
     extend_seconds = float(state.get("dhw_extend_seconds", 0.0))
     max_extend = ccfg.get("max_extend_hours", DEFAULT_MAX_EXTEND_HOURS)
     extend = ccfg.get("extend_for_dhw", DEFAULT_EXTEND_FOR_DHW)
 
     def _end(b: dict) -> datetime:
-        if not extend:
+        if not extend or peak_avoid:
             return b["end"]
         return effective_block_end(b, extend_seconds, max_extend)
+
+    if peak_avoid:
+        # In pieken: Standby (dure uren vermijden)
+        in_peak = next(
+            (b for b in peak_blocks if b["start"] <= now < b["end"]), None
+        )
+        if in_peak is not None:
+            blocked_now = bool(is_dhw_loading(opmode))
+            if blocked_now:
+                out["status"] = "dhw"
+                out["main_mode"] = MAIN_MODE_STANDBY
+                out["peak_block"] = _block_out(in_peak)
+                return out
+            out["status"] = "peak"
+            out["main_mode"] = MAIN_MODE_STANDBY
+            out["peak_block"] = _block_out(in_peak)
+            return out
+        # Buiten pieken: Verwarmen
+        out["status"] = "heat"
+        out["main_mode"] = MAIN_MODE_HEAT
+        nxt_peak = next((b for b in peak_blocks if b["start"] > now), None)
+        out["next_peak_block"] = _block_out(nxt_peak)
+        return out
 
     active = next(
         (b for b in charge_blocks if b["start"] <= now < _end(b)), None
@@ -608,7 +685,8 @@ def decide(
     overlappen worden bij het plannen overgeslagen.
     """
     state = state if state is not None else {}
-    onoff = ccfg.get("control") == CONTROL_ONOFF
+    onoff = ccfg.get("control") in (CONTROL_ONOFF, CONTROL_PEAK_AVOID)
+    peak_avoid = ccfg.get("control") == CONTROL_PEAK_AVOID
     out: dict = {
         "now": now.isoformat(),
         "enabled": ccfg["enabled"],
@@ -651,6 +729,11 @@ def decide(
         out["setpoint_temp"] = None
         out["main_mode"] = MAIN_MODE_STANDBY if onoff else None
         return out
+
+    if peak_avoid:
+        peak_blocks = plan_peak_blocks(rows, granularity_min, now, ccfg)
+        out["peak_blocks"] = [_block_out(b) for b in peak_blocks]
+        return _decide_onoff(ccfg, now, [], state, opmode, out, peak_blocks=peak_blocks)
 
     charge_blocks = plan_charge_blocks(rows, granularity_min, now, ccfg, dhw_window)
     out["charge_blocks"] = [_block_out(b) for b in charge_blocks]
@@ -1182,6 +1265,13 @@ def _status_log(out: dict) -> str:
                 )
         else:
             parts = ["SWW laden actief — regeling pauzeert"]
+    elif status == "peak":
+        parts = ["PIEKUREN -> 1951=Standby (duurst, warmtepomp stil)"]
+    elif status == "heat":
+        parts = ["WARMEN -> 1951=Verwarmen (buiten piekuren)"]
+        nbp = out.get("next_peak_block")
+        if nbp:
+            parts.append(f"volgende piek {_fmt_iso(nbp['start'])}")
     elif status == "disabled":
         parts = ["uit"]
     else:
@@ -1217,18 +1307,27 @@ def render_human(out: dict) -> List[str]:
     if "now" in out:
         lines.append(f"Nu       : {app.fmt_dt(datetime.fromisoformat(out['now']))}")
     if onoff:
-        lines.append(
-            "Regeling : in laadblok 1951=02 (Verwarmen), daarbuiten 1951=03 "
-            "(Standby)"
-        )
-        lines.append(
-            "SWW      : " + ("laden mijden aan"
-                             if out.get("avoid_dhw")
-                             else "laden mijden uit")
-            + (", blok schuift op bij SWW-laden"
-               if out.get("extend_for_dhw", DEFAULT_EXTEND_FOR_DHW)
-               else "")
-        )
+        if out.get("control") == CONTROL_PEAK_AVOID:
+            lines.append(
+                "Regeling : buiten piekuren 1951=02 (Verwarmen), in piekuren 1951=03 "
+                "(Standby)"
+            )
+            lines.append(
+                "Modus    : piekvermijding — 2x 4 uur duurste pieken vermeden"
+            )
+        else:
+            lines.append(
+                "Regeling : in laadblok 1951=02 (Verwarmen), daarbuiten 1951=03 "
+                "(Standby)"
+            )
+            lines.append(
+                "SWW      : " + ("laden mijden aan"
+                                 if out.get("avoid_dhw")
+                                 else "laden mijden uit")
+                + (", blok schuift op bij SWW-laden"
+                   if out.get("extend_for_dhw", DEFAULT_EXTEND_FOR_DHW)
+                   else "")
+            )
     else:
         lines.append(
             f"Regeling : laden {out.get('charge_temp', DEFAULT_CHARGE_TEMP):g} °C, "
@@ -1267,7 +1366,11 @@ def render_human(out: dict) -> List[str]:
             lines.append("Status   : SWW laden actief — regeling pauzeert")
         return lines
 
-    if status == "standby":
+    if status == "peak":
+        lines.append("Actie    : PIEKUREN -> 1951=03 (compressor uit, duurste uren)")
+    elif status == "heat":
+        lines.append("Actie    : WARMEN -> 1951=02 (Verwarmen, buiten piekuren)")
+    elif status == "standby":
         lines.append("Actie    : STANDBY -> 1951=03 (compressor uit)")
     elif status == "charge" and onoff:
         lines.append("Actie    : LADEN -> 1951=02 (Verwarmen, stooklijn kiest aanvoer)")
@@ -1286,22 +1389,32 @@ def render_human(out: dict) -> List[str]:
             f"COP {app.nl(b['mean_cop'], 2)}, "
             f"{app.nl(b['mean_corrected'], 4)} €/kWh warmte)"
         )
-    plan = out.get("charge_blocks") or []
-    if plan:
-        lines.append("Laadplan :")
-        for blk in plan:
-            lines.append(
-                f"  - {_fmt_iso(blk['start'])} – {_fmt_iso(blk['end'])}  "
-                f"{app.nl(blk['mean_corrected'], 4)} €/kWh warmte"
-            )
-    coast = out.get("coast_blocks") or []
-    if coast:
-        lines.append("Duur-uur :")
-        for blk in coast:
-            lines.append(
-                f"  - {_fmt_iso(blk['start'])} – {_fmt_iso(blk['end'])}  "
-                f"{app.nl(blk['mean_corrected'], 4)} €/kWh warmte"
-            )
+    if out.get("control") == CONTROL_PEAK_AVOID:
+        peaks = out.get("peak_blocks") or []
+        if peaks:
+            lines.append("Piekblokken (standby):")
+            for blk in peaks:
+                lines.append(
+                    f"  - {_fmt_iso(blk['start'])} – {_fmt_iso(blk['end'])}  "
+                    f"{app.nl(blk['mean_corrected'], 4)} €/kWh warmte"
+                )
+    else:
+        plan = out.get("charge_blocks") or []
+        if plan:
+            lines.append("Laadplan :")
+            for blk in plan:
+                lines.append(
+                    f"  - {_fmt_iso(blk['start'])} – {_fmt_iso(blk['end'])}  "
+                    f"{app.nl(blk['mean_corrected'], 4)} €/kWh warmte"
+                )
+        coast = out.get("coast_blocks") or []
+        if coast:
+            lines.append("Duur-uur :")
+            for blk in coast:
+                lines.append(
+                    f"  - {_fmt_iso(blk['start'])} – {_fmt_iso(blk['end'])}  "
+                    f"{app.nl(blk['mean_corrected'], 4)} €/kWh warmte"
+                )
 
     if out.get("changed"):
         what = "Modus" if onoff else "Setpoint"
@@ -1336,8 +1449,8 @@ def main(argv: List[str] | None = None) -> int:
                     help="rustwaarde overschrijven (anders uit config/register 1974)")
     ap.add_argument("--read-base", action="store_true",
                     help="de rustwaarde nu uit register 1974/5085 lezen en tonen")
-    ap.add_argument("--control", choices=[CONTROL_SUPPLY, CONTROL_ONOFF], default=None,
-                    help="regelwijze: 'supply' (1975-moduleren) of 'onoff' (1951 aan/uit)")
+    ap.add_argument("--control", choices=[CONTROL_SUPPLY, CONTROL_ONOFF, CONTROL_PEAK_AVOID], default=None,
+                    help="regelwijze: 'supply' (1975-moduleren), 'onoff' (1951 aan/uit) of 'peak_avoid' (verwarmen buiten pieken)")
     ap.add_argument("--read-mode", action="store_true",
                     help="de hoofdmodus nu uit register 1951 lezen en tonen")
     args = ap.parse_args(argv)
