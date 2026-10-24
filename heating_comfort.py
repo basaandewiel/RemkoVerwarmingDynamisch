@@ -8,7 +8,7 @@ rekening houdend met de buitentemperatuurvoorspelling. In dat blok laadt de
 vloer warmte op; daarbuiten staat de warmtepomp stil zodat de vloermassa de
 kamer blijft voeden.
 
-Er zijn twee regelwijzen (config `mqtt.heating_comfort.control`):
+Er zijn drie regelwijzen (config `mqtt.heating_comfort.control`):
 
 ``"supply"`` (default) — **moduleren via register 1975**
   * in de **goedkoopste uren** vraagt ze een **hogere** aanvoertemperatuur
@@ -23,6 +23,14 @@ Er zijn twee regelwijzen (config `mqtt.heating_comfort.control`):
     en kiest op de **stooklijn** (`1972 = 0`) zelf de laagst mogelijke aanvoer;
   * daarbuiten schrijft ze **1951 = 03** (Standby): compressor en pomp staan
     écht stil — geen sluipverbruik. Dit is de krachtigste zuinige stand.
+
+``"peak_avoid"`` — **piekvermijding via register 1951** (`main_mode`)
+  * zoekt de **duurste aaneengesloten blokken** op basis van de **gecorrigeerde**
+    prijs (€/kWh warmte = stroomprijs / COP) en zet de warmtepomp op
+    **1951 = 03** (Standby) in die pieken;
+  * daarbuiten staat hij op **1951 = 02** (Verwarmen). Standaard worden **2**
+    blokken van **4 uur** gezocht met minimaal **4 uur** tussen de pieken
+    (`peak_hours`, `peak_blocks_per_day`, `min_peak_gap_hours`).
 
 **SWW gaat vóór, maar het vloerblok wordt ingehaald.** Er is één compressor,
 dus SWW laden en ruimteverwarming kunnen niet samen. Daarom:
@@ -121,7 +129,7 @@ MAIN_MODE_COOL = "04"
 # Regelwijzen (config `mqtt.heating_comfort.control`).
 CONTROL_SUPPLY = "supply"
 CONTROL_ONOFF = "onoff"
-CONTROL_PEAK_AVOID = "peak_avoid"  # Verwarmen buiten pieken, standby in dure pieken
+CONTROL_PEAK_AVOID = "peak_avoid"  # Verwarmen buiten pieken, standby in dure pieken (op gecorrigeerde prijs)
 
 # Defaults (zie de module-docstring)
 DEFAULT_CHARGE_TEMP = 40.0
