@@ -80,6 +80,7 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from zoneinfo import ZoneInfo
+from pprint import pprint
 
 import cop_model as cop_mod
 import energy_log
@@ -739,7 +740,30 @@ def decide(
         return out
 
     if peak_avoid:
-        peak_blocks = plan_peak_blocks(rows, granularity_min, now, ccfg)
+        peak_blocks = None
+        if state is not None:
+            cached = state.get("peak_blocks_cache") or {}
+            if cached.get("date") == now.strftime("%Y-%m-%d"):
+                try:
+                    cached_blocks = []
+                    for b in cached.get("blocks") or []:
+                        cached_blocks.append({
+                            "start": datetime.fromisoformat(b["start"]),
+                            "end": datetime.fromisoformat(b["end"]),
+                            "mean_corrected": b.get("mean_corrected"),
+                            "mean_cop": b.get("mean_cop"),
+                            "mean_temp": b.get("mean_temp"),
+                        })
+                    peak_blocks = cached_blocks
+                except Exception:
+                    peak_blocks = None
+        if peak_blocks is None:
+            peak_blocks = plan_peak_blocks(rows, granularity_min, now, ccfg)
+            if state is not None:
+                state["peak_blocks_cache"] = {
+                    "date": now.strftime("%Y-%m-%d"),
+                    "blocks": [_block_out(b) for b in peak_blocks],
+                }
         out["peak_blocks"] = [_block_out(b) for b in peak_blocks]
         return _decide_onoff(ccfg, now, [], state, opmode, out, peak_blocks=peak_blocks)
 
