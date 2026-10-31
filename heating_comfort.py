@@ -1078,7 +1078,7 @@ def execute(
     de hoofdmodus (1951). Er wordt niets gepubliceerd als de waarde gelijk is
     aan de vorige keer (state) — MQTT blijft dan stil.
     """
-    onoff = ccfg.get("control") == CONTROL_ONOFF
+    onoff = ccfg.get("control") in (CONTROL_ONOFF, CONTROL_PEAK_AVOID)
     if onoff:
         want = out.get("main_mode")
         if want is None:
