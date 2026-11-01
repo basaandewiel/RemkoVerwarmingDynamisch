@@ -155,6 +155,55 @@ class EntsoeStaleCacheFallbackTest(_CacheDirTest):
         m.assert_not_called()
 
 
+class EntsoeGapFillTest(unittest.TestCase):
+    """Een enkel ontbrekend kwartier mag een blok niet laten vervallen."""
+
+    def test_single_missing_slot_is_interpolated(self):
+        start = datetime(2026, 11, 1, 17, 0, tzinfo=TZ)
+        slots = [
+            (start, 100.0),
+            (start + timedelta(minutes=15), 110.0),
+            # 18:15 ontbreekt
+            (start + timedelta(minutes=45), 130.0),
+            (start + timedelta(minutes=60), 140.0),
+        ]
+        filled = entsoe._fill_single_slot_gaps(slots, 15)
+        self.assertEqual(len(filled), 5)
+        self.assertEqual(filled[2][0], start + timedelta(minutes=30))
+        self.assertAlmostEqual(filled[2][1], 120.0)
+
+    def test_larger_gap_is_left_alone(self):
+        start = datetime(2026, 11, 1, 17, 0, tzinfo=TZ)
+        slots = [
+            (start, 100.0),
+            (start + timedelta(minutes=15), 110.0),
+            # twee kwartieren ontbreken
+            (start + timedelta(minutes=60), 140.0),
+        ]
+        self.assertEqual(entsoe._fill_single_slot_gaps(slots, 15), slots)
+
+
+class EntsoeFetchGapFillTest(_CacheDirTest):
+    def test_fetch_prices_applies_gap_fill(self):
+        today = datetime.now(TZ).date()
+        start_local = datetime.combine(today, time(hour=17), tzinfo=TZ)
+        start_utc = start_local.astimezone(timezone.utc)
+        slots = [
+            (start_utc, 100.0),
+            (start_utc + timedelta(minutes=15), 110.0),
+            (start_utc + timedelta(minutes=45), 130.0),
+            (start_utc + timedelta(minutes=60), 140.0),
+        ]
+        with patch.object(entsoe, "_request_day", return_value=slots):
+            result = entsoe.fetch_prices(
+                "key", tz="Europe/Amsterdam", days_ahead=1,
+                cache_dir=self.cache_dir, cache_ttl_seconds=0,
+            )
+        self.assertEqual(len(result["slots"]), 5)
+        self.assertEqual(result["slots"][2][0], start_local + timedelta(minutes=30))
+        self.assertAlmostEqual(result["slots"][2][1], 120.0)
+
+
 class EntsoeTransientClassificationTest(unittest.TestCase):
     def test_server_and_rate_limit_codes_are_transient(self):
         for code in (500, 502, 503, 504, 520, 527, 599, 408, 429):

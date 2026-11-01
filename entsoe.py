@@ -279,6 +279,33 @@ def _find_text(el: Optional[ET.Element], name: str) -> Optional[str]:
     return (child.text or "").strip() or None
 
 
+def _fill_single_slot_gaps(
+    slots: List[Tuple[datetime, float]], granularity_min: int
+) -> List[Tuple[datetime, float]]:
+    """Vul een enkel ontbrekend kwartier lineair aan.
+
+    ENTSO-E laat sporadisch één positie weg (gemeten op 1-11-2026: positie 30
+    en 74). De blokzoeker eist aaneengesloten slots; zonder aanvulling vervalt
+    een blok dat zo'n gat kruist volledig en schuift de piek-/laadkeuze naar
+    een later blok. Alleen gaten van precies één ontbrekend slot worden
+    ingevuld; grotere gaten (bijv. een niet-gepubliceerde dag of de
+    zomertijdovergang) blijven ongemoeid.
+    """
+    if len(slots) < 2 or granularity_min <= 0:
+        return slots
+    step = timedelta(minutes=granularity_min)
+    filled: List[Tuple[datetime, float]] = []
+    for i, (dt, price) in enumerate(slots):
+        filled.append((dt, price))
+        if i + 1 >= len(slots):
+            continue
+        next_dt, next_price = slots[i + 1]
+        if next_dt - dt != 2 * step:
+            continue
+        filled.append((dt + step, (price + next_price) / 2.0))
+    return filled
+
+
 def fetch_prices(
     api_key: str,
     tz: str = "Europe/Amsterdam",
@@ -339,6 +366,7 @@ def fetch_prices(
         for i in range(len(slots) - 1)
     ]
     granularity_min = Counter(diffs).most_common(1)[0][0] if diffs else 60
+    slots = _fill_single_slot_gaps(slots, granularity_min)
 
     return {
         "slots": slots,
