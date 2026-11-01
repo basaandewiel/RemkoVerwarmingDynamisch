@@ -1356,13 +1356,19 @@ def _status_log(out: dict) -> str:
                 )
         else:
             parts = ["SWW laden actief — regeling pauzeert"]
+        pb = out.get("peak_block")
+        if pb:
+            parts.append(f"piek {_fmt_block_range(pb)}")
     elif status == "peak":
         parts = ["PIEKUREN -> 1951=Standby (duurst, warmtepomp stil)"]
+        pb = out.get("peak_block")
+        if pb:
+            parts.append(f"piek {_fmt_block_range(pb)}")
     elif status == "heat":
         parts = ["WARMEN -> 1951=Verwarmen (buiten piekuren)"]
         nbp = out.get("next_peak_block")
         if nbp:
-            parts.append(f"volgende piek {_fmt_iso(nbp['start'])}")
+            parts.append(f"volgende piek {_fmt_block_range(nbp)}")
     elif status == "disabled":
         parts = ["uit"]
     else:
@@ -1383,6 +1389,24 @@ def _fmt_iso(iso: Optional[str]) -> str:
     except (ValueError, TypeError):
         return "?"
     return f"{app.DUTCH_DAYS[dt.weekday()][:3]} {dt:%d-%m %H:%M}"
+
+
+def _fmt_block_range(block: Optional[dict]) -> str:
+    """Kort tijdvak voor de servicelog: 'zo 01-11 16:45 – 20:45'."""
+    if not block:
+        return "?"
+    start = block.get("start")
+    end = block.get("end")
+    if not start or not end:
+        return "?"
+    try:
+        start_dt = datetime.fromisoformat(start)
+        end_dt = datetime.fromisoformat(end)
+    except (ValueError, TypeError):
+        return f"{_fmt_iso(start)} – {_fmt_iso(end)}"
+    if start_dt.date() == end_dt.date():
+        return f"{_fmt_iso(start)} – {end_dt:%H:%M}"
+    return f"{_fmt_iso(start)} – {_fmt_iso(end)}"
 
 
 # --------------------------------------------------------------------------- #

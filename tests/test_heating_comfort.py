@@ -307,6 +307,52 @@ class TestRender(unittest.TestCase):
         self.assertIn("uit", lines)
 
 
+class TestStatusLog(unittest.TestCase):
+    """De servicelog toont in peak_avoid het actieve of volgende piektijdvak."""
+
+    def _blk(self, start_h, start_m, end_h, end_m, day=11, end_day=None):
+        start = _dt(start_h, start_m, day=day)
+        end = _dt(end_h, end_m, day=end_day or day)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+
+    def test_peak_shows_current_range(self):
+        out = {
+            "status": "peak",
+            "control": "peak_avoid",
+            "peak_block": self._blk(16, 45, 20, 45),
+        }
+        log = heating_comfort._status_log(out)
+        self.assertIn("PIEKUREN", log)
+        self.assertIn("piek zon 11-10 16:45 – 20:45", log)
+
+    def test_heat_shows_next_range(self):
+        out = {
+            "status": "heat",
+            "control": "peak_avoid",
+            "next_peak_block": self._blk(16, 45, 20, 45),
+        }
+        log = heating_comfort._status_log(out)
+        self.assertIn("volgende piek zon 11-10 16:45 – 20:45", log)
+
+    def test_range_across_midnight_shows_both_dates(self):
+        out = {
+            "status": "heat",
+            "control": "peak_avoid",
+            "next_peak_block": self._blk(23, 0, 3, 0, end_day=12),
+        }
+        log = heating_comfort._status_log(out)
+        self.assertIn("zon 11-10 23:00 – maa 12-10 03:00", log)
+
+    def test_dhw_during_peak_shows_current_range(self):
+        out = {
+            "status": "dhw",
+            "control": "peak_avoid",
+            "peak_block": self._blk(16, 45, 20, 45),
+        }
+        log = heating_comfort._status_log(out)
+        self.assertIn("piek zon 11-10 16:45 – 20:45", log)
+
+
 class TestOpMode(unittest.TestCase):
     """Bedrijfsmodus (5001) lezen en SWW-detectie."""
 
