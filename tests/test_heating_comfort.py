@@ -650,6 +650,164 @@ class TestDhwExtension(unittest.TestCase):
         self.assertIn("opgeschoven", lines)
 
 
+class TestPlanPeakStability(unittest.TestCase):
+    """Een begonnen piek mag niet opschuiven als het zoekvenster rolt."""
+
+    def setUp(self):
+        self.c = _cfg(
+            enabled=True,
+            control="peak_avoid",
+            peak_hours=4.0,
+            peak_blocks_per_day=2,
+            min_peak_gap_hours=4.0,
+        )
+
+    def _rows(self):
+        def pf(dt):
+            minutes = dt.hour * 60 + dt.minute
+            if 16 * 60 + 45 <= minutes < 20 * 60 + 45:
+                return 0.40          # avondpiek
+            if 8 * 60 <= minutes < 12 * 60:
+                return 0.35          # ochtendpiek
+            return 0.10
+
+        return _mk_rows(_dt(0, 0), 96, price_fn=pf)
+
+    def _b(self, start_h, start_m, end_h, end_m):
+        return {
+            "start": _dt(start_h, start_m),
+            "end": _dt(end_h, end_m),
+            "mean_corrected": 0.08,
+            "mean_cop": 4.0,
+            "mean_temp": 9.0,
+        }
+
+    def test_started_peak_keeps_its_end(self):
+        now = _dt(20, 15)
+        active = self._b(16, 45, 20, 45)
+        blocks = heating_comfort.plan_peak_blocks(
+            self._rows(), 15, now, self.c, locked_blocks=[active]
+        )
+        self.assertIn((active["start"], active["end"]),
+                      [(b["start"], b["end"]) for b in blocks])
+
+    def test_no_shift_after_peak_end(self):
+        now = _dt(20, 50)
+        ended = self._b(16, 45, 20, 45)
+        morning = self._b(8, 0, 12, 0)
+        blocks = heating_comfort.plan_peak_blocks(
+            self._rows(), 15, now, self.c, locked_blocks=[morning, ended]
+        )
+        # Alleen de twee begonnen pieken; geen 17:00-21:00-variant erbij.
+        self.assertEqual(
+            [b["start"].strftime("%H:%M") for b in blocks], ["08:00", "16:45"]
+        )
+
+    def test_overlapping_variant_is_not_a_new_peak(self):
+        now = _dt(20, 50)
+        ended = self._b(16, 45, 20, 45)
+        blocks = heating_comfort.plan_peak_blocks(
+            self._rows(), 15, now, self.c, locked_blocks=[ended]
+        )
+        # Er is nog ruimte voor één piek, maar 17:00-21:00 overlapt de
+        # afgelopen piek en mag niet opnieuw gekozen worden.
+        self.assertNotIn("17:00", [b["start"].strftime("%H:%M") for b in blocks])
+
+
+class TestPeakCache(unittest.TestCase):
+    def setUp(self):
+        self.c = _cfg(
+            enabled=True,
+            control="peak_avoid",
+            peak_hours=4.0,
+            peak_blocks_per_day=2,
+            min_peak_gap_hours=4.0,
+        )
+
+    def _rows(self):
+        def pf(dt):
+            minutes = dt.hour * 60 + dt.minute
+            if 16 * 60 + 45 <= minutes < 20 * 60 + 45:
+                return 0.40
+            if 8 * 60 <= minutes < 12 * 60:
+                return 0.35
+            return 0.10
+
+        return _mk_rows(_dt(0, 0), 96, price_fn=pf)
+
+    def _cache(self, blocks, stale=False):
+        return {
+            "date": "2026-10-11",
+            "version": heating_comfort.PEAK_CACHE_VERSION,
+            "stale": stale,
+            "blocks": blocks,
+        }
+
+    def test_stable_cache_is_reused(self):
+        cached = self._cache([
+            {"start": "2026-10-11T16:45:00+02:00",
+             "end": "2026-10-11T20:45:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ])
+        state = {"peak_blocks_cache": cached}
+        out = heating_comfort.decide(self.c, _dt(20, 15), self._rows(), 15, state)
+        self.assertEqual(out["status"], "peak")
+        self.assertEqual(state["peak_blocks_cache"], cached)
+
+    def test_stale_cache_refreshes_future_peaks(self):
+        # Oude, te late avondpiek in de cache; na een prijsrefresh moet de
+        # eerdere (echte) piek 16:45-20:45 worden.
+        state = {"peak_blocks_cache": self._cache([
+            {"start": "2026-10-11T18:30:00+02:00",
+             "end": "2026-10-11T22:30:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ], stale=True)}
+        out = heating_comfort.decide(self.c, _dt(12, 0), self._rows(), 15, state)
+        starts = [b["start"] for b in out["peak_blocks"]]
+        self.assertIn("2026-10-11T16:45:00+02:00", starts)
+        self.assertNotIn("2026-10-11T18:30:00+02:00", starts)
+
+    def test_stale_cache_keeps_started_peak(self):
+        state = {"peak_blocks_cache": self._cache([
+            {"start": "2026-10-11T16:45:00+02:00",
+             "end": "2026-10-11T20:45:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ], stale=True)}
+        out = heating_comfort.decide(self.c, _dt(20, 50), self._rows(), 15, state)
+        # Piek is voorbij: weer verwarmen, en geen opgeschoven piek 17:00-21:00.
+        self.assertEqual(out["status"], "heat")
+        self.assertIsNone(out.get("next_peak_block"))
+
+    def test_use_cache_false_ignores_cache(self):
+        state = {"peak_blocks_cache": self._cache([
+            {"start": "2026-10-11T18:30:00+02:00",
+             "end": "2026-10-11T22:30:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ])}
+        out = heating_comfort.decide(
+            self.c, _dt(12, 0), self._rows(), 15, state, use_cache=False
+        )
+        starts = [b["start"] for b in out["peak_blocks"]]
+        self.assertIn("2026-10-11T16:45:00+02:00", starts)
+
+    def test_legacy_cache_without_version_is_ignored(self):
+        # Oude statusfile (vóór de piekvergrendeling): niet vertrouwen.
+        legacy = self._cache([
+            {"start": "2026-10-11T18:30:00+02:00",
+             "end": "2026-10-11T22:30:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ])
+        legacy.pop("version")
+        state = {"peak_blocks_cache": legacy}
+        out = heating_comfort.decide(self.c, _dt(12, 0), self._rows(), 15, state)
+        starts = [b["start"] for b in out["peak_blocks"]]
+        self.assertIn("2026-10-11T16:45:00+02:00", starts)
+        self.assertEqual(
+            state["peak_blocks_cache"]["version"],
+            heating_comfort.PEAK_CACHE_VERSION,
+        )
+
+
 class TestReadFixedTemp(unittest.TestCase):
     """Register 1975/1974/5085 uitlezen en als rustwaarde gebruiken."""
 

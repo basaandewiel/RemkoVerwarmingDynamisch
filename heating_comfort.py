@@ -171,6 +171,9 @@ EPS = 1e-6
 DEFAULT_PEAK_AVOIDANCE = False
 DEFAULT_PEAK_HOURS = 4.0
 DEFAULT_PEAK_BLOCKS_PER_DAY = 2
+# Versie van het piekplan in de statusfile. Een plan van vóór de
+# vergrendeling van begonnen pieken is niet betrouwbaar en wordt genegeerd.
+PEAK_CACHE_VERSION = 2
 DEFAULT_MIN_PEAK_GAP_HOURS = 4.0
 
 
@@ -409,10 +412,21 @@ def _overlaps(a_start, a_end, b_start, b_end, gap_hours: float) -> bool:
     return not (a_end + gap <= b_start or b_end + gap <= a_start)
 
 
-def _select_spaced(blocks: List[dict], max_count: int, gap_hours: float) -> List[dict]:
+def _select_spaced(
+    blocks: List[dict],
+    max_count: int,
+    gap_hours: float,
+    seed: Optional[List[dict]] = None,
+) -> List[dict]:
     """Kies uit `blocks` (op voorkeur gesorteerd) telkens het eerstvolgende blok
-    dat `gap_hours` vrij houdt van de al gekozen blokken, tot `max_count`."""
-    chosen: List[dict] = []
+    dat `gap_hours` vrij houdt van de al gekozen blokken, tot `max_count`.
+
+    `seed` bevat blokken die al vaststaan (bijv. een begonnen piek). Die tellen
+    mee voor de tussenruimte, maar niet voor `max_count`.
+    """
+    seed = list(seed or [])
+    chosen: List[dict] = list(seed)
+    limit = max_count + len(seed)
     if max_count <= 0:
         return chosen
     for b in blocks:
@@ -421,7 +435,7 @@ def _select_spaced(blocks: List[dict], max_count: int, gap_hours: float) -> List
             for c in chosen
         ):
             chosen.append(b)
-            if len(chosen) >= max_count:
+            if len(chosen) >= limit:
                 break
     return sorted(chosen, key=lambda b: b["start"])
 
@@ -527,14 +541,23 @@ def plan_peak_blocks(
     granularity_min: int,
     now: datetime,
     ccfg: dict,
+    locked_blocks: Optional[List[dict]] = None,
 ) -> List[dict]:
     """Zoek de duurste aaneengesloten blokken van `peak_hours` uur (piekuren).
 
     Deze blokken worden gebruikt in `peak_avoid`-modus om de warmtepomp op
     Standby te zetten tijdens de duurste uren.
+
+    `locked_blocks` zijn pieken die al begonnen zijn. Die blijven op hun
+    oorspronkelijke tijdvak staan: zodra de compressor uit is, mag een
+    herberekening (nieuwe prijzen of een verschuivend zoekvenster) het einde
+    niet opschuiven. Zonder deze vergrendeling schuift de piek na 20:45 op naar
+    17:00–21:00, daarna 17:15–21:15, enz. en blijft de warmtepomp onbedoeld
+    standby.
     """
     if not rows or ccfg["peak_blocks_per_day"] <= 0:
         return []
+    locked = list(locked_blocks or [])
     bh = ccfg["peak_hours"]
     horizon_end = now + timedelta(hours=ccfg["horizon_hours"])
     candidates = find_cheapest_blocks(
@@ -550,10 +573,22 @@ def plan_peak_blocks(
     candidates = [
         b for b in candidates if b["end"] > now and _heating_needed(b, ccfg)
     ]
+    if locked:
+        # Schuifvarianten van een al begonnen piek (17:00–21:00 naast
+        # 16:45–20:45) zijn geen nieuwe piek.
+        candidates = [
+            b
+            for b in candidates
+            if not any(
+                _overlaps(b["start"], b["end"], c["start"], c["end"], 0.0)
+                for c in locked
+            )
+        ]
     # duurste eerst
     candidates.sort(key=lambda b: b["mean_corrected"], reverse=True)
     max_count = ccfg["peak_blocks_per_day"] * _hours_per_day(ccfg["horizon_hours"])
-    return _select_spaced(candidates, max_count, ccfg["min_peak_gap_hours"])
+    remaining = max(0, max_count - len(locked))
+    return _select_spaced(candidates, remaining, ccfg["min_peak_gap_hours"], seed=locked)
 
 
 # --------------------------------------------------------------------------- #
@@ -677,6 +712,7 @@ def decide(
     state: Optional[dict] = None,
     opmode: Optional[int] = None,
     dhw_window: Optional[Tuple[datetime, datetime]] = None,
+    use_cache: bool = True,
 ) -> dict:
     """Bepaal de actie en het gewenste register.
 
@@ -692,6 +728,9 @@ def decide(
 
     ``dhw_window`` is het geplande SWW-laadvenster; blokken die daarmee
     overlappen worden bij het plannen overgeslagen.
+
+    ``use_cache`` hergebruikt in ``peak_avoid`` het per dag bewaarde piekplan.
+    De service doet dat; een losse CLI-run rekent juist vers (``False``).
     """
     state = state if state is not None else {}
     onoff = ccfg.get("control") in (CONTROL_ONOFF, CONTROL_PEAK_AVOID)
@@ -740,12 +779,15 @@ def decide(
         return out
 
     if peak_avoid:
-        peak_blocks = None
-        if state is not None:
+        cached_blocks: List[dict] = []
+        cache_stale = True
+        if state is not None and use_cache:
             cached = state.get("peak_blocks_cache") or {}
-            if cached.get("date") == now.strftime("%Y-%m-%d"):
+            if (
+                cached.get("date") == now.strftime("%Y-%m-%d")
+                and cached.get("version") == PEAK_CACHE_VERSION
+            ):
                 try:
-                    cached_blocks = []
                     for b in cached.get("blocks") or []:
                         cached_blocks.append({
                             "start": datetime.fromisoformat(b["start"]),
@@ -754,16 +796,26 @@ def decide(
                             "mean_cop": b.get("mean_cop"),
                             "mean_temp": b.get("mean_temp"),
                         })
-                    peak_blocks = cached_blocks
+                    cache_stale = bool(cached.get("stale"))
                 except Exception:
-                    peak_blocks = None
-        if peak_blocks is None:
-            peak_blocks = plan_peak_blocks(rows, granularity_min, now, ccfg)
+                    cached_blocks = []
+                    cache_stale = True
+        if not cached_blocks or cache_stale:
+            # Al begonnen pieken blijven staan; alleen toekomstige pieken
+            # worden met de nieuwe prijzen/voorspelling herberekend.
+            locked = [b for b in cached_blocks if b["start"] <= now]
+            peak_blocks = plan_peak_blocks(
+                rows, granularity_min, now, ccfg, locked_blocks=locked
+            )
             if state is not None:
                 state["peak_blocks_cache"] = {
                     "date": now.strftime("%Y-%m-%d"),
+                    "version": PEAK_CACHE_VERSION,
+                    "stale": False,
                     "blocks": [_block_out(b) for b in peak_blocks],
                 }
+        else:
+            peak_blocks = cached_blocks
         out["peak_blocks"] = [_block_out(b) for b in peak_blocks]
         return _decide_onoff(ccfg, now, [], state, opmode, out, peak_blocks=peak_blocks)
 
@@ -1235,6 +1287,13 @@ def watch(cfg: dict, tz: ZoneInfo, ccfg: dict, dry_run: bool) -> int:
             try:
                 rows, granularity, source = build_rows(cfg)
                 rows_at = time.time()
+                # Het piekplan is per dag gecachet om tijdens die dag stabiel te
+                # blijven. Na nieuwe prijzen/voorspelling moeten toekomstige
+                # pieken opnieuw berekend worden; al begonnen pieken houden hun
+                # tijdvak (zie plan_peak_blocks).
+                cache = state.get("peak_blocks_cache")
+                if isinstance(cache, dict):
+                    cache["stale"] = True
                 _log(f"prijzen + voorspelling bijgewerkt ({source})")
             except Exception as exc:  # noqa: BLE001 — netwerk mag de service niet stoppen
                 _log("FOUT: prijzen/voorspelling ophalen mislukt:", exc)
@@ -1553,7 +1612,7 @@ def main(argv: List[str] | None = None) -> int:
                                             DEFAULT_BASE_READ_TIMEOUT))
     dhw_window = dhw_charge_window(load_dhw_state())
     out = decide(ccfg, now, rows, granularity, state,
-                 opmode=opmode, dhw_window=dhw_window)
+                 opmode=opmode, dhw_window=dhw_window, use_cache=False)
     execute(out, mqtt_cfg, ccfg, state, dry_run=args.dry_run)
 
     if args.json:
