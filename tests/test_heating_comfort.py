@@ -853,6 +853,69 @@ class TestPeakCache(unittest.TestCase):
             heating_comfort.PEAK_CACHE_VERSION,
         )
 
+    def _two_day_rows(self):
+        def pf(dt):
+            minutes = dt.hour * 60 + dt.minute
+            if 16 * 60 + 45 <= minutes < 20 * 60 + 45:
+                return 0.40
+            if 8 * 60 <= minutes < 12 * 60:
+                return 0.35
+            return 0.10
+
+        return _mk_rows(_dt(0, 0), 192, price_fn=pf)
+
+    def test_after_evening_peak_next_morning_is_planned(self):
+        now = _dt(21, 30)
+        state = {"peak_blocks_cache": self._cache([
+            {"start": "2026-10-11T08:00:00+02:00",
+             "end": "2026-10-11T12:00:00+02:00",
+             "mean_corrected": 0.07, "mean_cop": 4.0, "mean_temp": 9.0},
+            {"start": "2026-10-11T16:45:00+02:00",
+             "end": "2026-10-11T20:45:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ], stale=True)}
+        out = heating_comfort.decide(
+            self.c, now, self._two_day_rows(), 15, state
+        )
+        self.assertEqual(out["status"], "heat")
+        self.assertIsNotNone(out.get("next_peak_block"))
+        self.assertEqual(
+            out["next_peak_block"]["start"], "2026-10-12T08:00:00+02:00"
+        )
+
+    def test_midnight_does_not_revive_yesterdays_peak(self):
+        now = _dt(0, 4, day=12)
+        # Cache van gisteravond; de avondpiek is allang voorbij.
+        state = {"peak_blocks_cache": self._cache([
+            {"start": "2026-10-11T16:45:00+02:00",
+             "end": "2026-10-11T20:45:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ], stale=True)}
+        out = heating_comfort.decide(
+            self.c, now, self._two_day_rows(), 15, state
+        )
+        self.assertEqual(out["status"], "heat")
+        self.assertEqual(
+            [b["start"] for b in out["peak_blocks"]],
+            ["2026-10-12T08:00:00+02:00", "2026-10-12T16:45:00+02:00"],
+        )
+
+    def test_cross_midnight_peak_stays_active(self):
+        # Een échte piek die over middernacht loopt blijft wel actief.
+        now = _dt(0, 4, day=12)
+        state = {"peak_blocks_cache": self._cache([
+            {"start": "2026-10-11T23:00:00+02:00",
+             "end": "2026-10-12T03:00:00+02:00",
+             "mean_corrected": 0.09, "mean_cop": 4.0, "mean_temp": 9.0},
+        ], stale=True)}
+        out = heating_comfort.decide(
+            self.c, now, self._two_day_rows(), 15, state
+        )
+        self.assertEqual(out["status"], "peak")
+        self.assertEqual(
+            out["peak_block"]["start"], "2026-10-11T23:00:00+02:00"
+        )
+
 
 class TestReadFixedTemp(unittest.TestCase):
     """Register 1975/1974/5085 uitlezen en als rustwaarde gebruiken."""

@@ -172,8 +172,9 @@ DEFAULT_PEAK_AVOIDANCE = False
 DEFAULT_PEAK_HOURS = 4.0
 DEFAULT_PEAK_BLOCKS_PER_DAY = 2
 # Versie van het piekplan in de statusfile. Een plan van vóór de
-# vergrendeling van begonnen pieken is niet betrouwbaar en wordt genegeerd.
-PEAK_CACHE_VERSION = 2
+# vergrendeling van begonnen pieken of vóór de dagindeling is niet
+# betrouwbaar en wordt genegeerd.
+PEAK_CACHE_VERSION = 3
 DEFAULT_MIN_PEAK_GAP_HOURS = 4.0
 
 
@@ -554,6 +555,10 @@ def plan_peak_blocks(
     niet opschuiven. Zonder deze vergrendeling schuift de piek na 20:45 op naar
     17:00–21:00, daarna 17:15–21:15, enz. en blijft de warmtepomp onbedoeld
     standby.
+
+    De pieken worden per kalenderdag gekozen (`peak_blocks_per_day` per dag).
+    Zo komt na de avondpiek ook de ochtendpiek van morgen in beeld, en kan een
+    venster van gisteravond na middernacht niet als nieuwe piek opduiken.
     """
     if not rows or ccfg["peak_blocks_per_day"] <= 0:
         return []
@@ -586,9 +591,20 @@ def plan_peak_blocks(
         ]
     # duurste eerst
     candidates.sort(key=lambda b: b["mean_corrected"], reverse=True)
-    max_count = ccfg["peak_blocks_per_day"] * _hours_per_day(ccfg["horizon_hours"])
-    remaining = max(0, max_count - len(locked))
-    return _select_spaced(candidates, remaining, ccfg["min_peak_gap_hours"], seed=locked)
+
+    chosen = list(locked)
+    day = now.date()
+    end_day = horizon_end.date()
+    while day <= end_day:
+        day_locked = [b for b in locked if b["start"].date() == day]
+        remaining = max(0, ccfg["peak_blocks_per_day"] - len(day_locked))
+        if remaining:
+            day_candidates = [b for b in candidates if b["start"].date() == day]
+            chosen = _select_spaced(
+                day_candidates, remaining, ccfg["min_peak_gap_hours"], seed=chosen
+            )
+        day += timedelta(days=1)
+    return sorted(chosen, key=lambda b: b["start"])
 
 
 # --------------------------------------------------------------------------- #
@@ -783,10 +799,7 @@ def decide(
         cache_stale = True
         if state is not None and use_cache:
             cached = state.get("peak_blocks_cache") or {}
-            if (
-                cached.get("date") == now.strftime("%Y-%m-%d")
-                and cached.get("version") == PEAK_CACHE_VERSION
-            ):
+            if cached.get("version") == PEAK_CACHE_VERSION:
                 try:
                     for b in cached.get("blocks") or []:
                         cached_blocks.append({
@@ -807,6 +820,10 @@ def decide(
             peak_blocks = plan_peak_blocks(
                 rows, granularity_min, now, ccfg, locked_blocks=locked
             )
+            # Oude, afgelopen pieken alleen kort bewaren: ze weren nog
+            # schuifvarianten van het rollende zoekvenster.
+            keep_after = now - timedelta(hours=ccfg["peak_hours"])
+            peak_blocks = [b for b in peak_blocks if b["end"] > keep_after]
             if state is not None:
                 state["peak_blocks_cache"] = {
                     "date": now.strftime("%Y-%m-%d"),
@@ -816,8 +833,10 @@ def decide(
                 }
         else:
             peak_blocks = cached_blocks
-        out["peak_blocks"] = [_block_out(b) for b in peak_blocks]
-        return _decide_onoff(ccfg, now, [], state, opmode, out, peak_blocks=peak_blocks)
+        # Voor de beslissing en weergave alleen actuele/toekomstige pieken.
+        current = [b for b in peak_blocks if b["end"] > now]
+        out["peak_blocks"] = [_block_out(b) for b in current]
+        return _decide_onoff(ccfg, now, [], state, opmode, out, peak_blocks=current)
 
     charge_blocks = plan_charge_blocks(rows, granularity_min, now, ccfg, dhw_window)
     out["charge_blocks"] = [_block_out(b) for b in charge_blocks]
