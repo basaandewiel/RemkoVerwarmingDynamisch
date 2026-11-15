@@ -171,10 +171,13 @@ EPS = 1e-6
 DEFAULT_PEAK_AVOIDANCE = False
 DEFAULT_PEAK_HOURS = 4.0
 DEFAULT_PEAK_BLOCKS_PER_DAY = 2
+# Alleen blokken die duurder zijn dan dit deel van het daggemiddelde tellen
+# als piek. Zo wordt niet elke dag kunstmatig met twee "pieken" gevuld.
+DEFAULT_PEAK_MIN_RATIO = 1.0
 # Versie van het piekplan in de statusfile. Een plan van vóór de
-# vergrendeling van begonnen pieken of vóór de dagindeling is niet
-# betrouwbaar en wordt genegeerd.
-PEAK_CACHE_VERSION = 3
+# vergrendeling van begonnen pieken, de dagindeling of de daggemiddelde-toets
+# is niet betrouwbaar en wordt genegeerd.
+PEAK_CACHE_VERSION = 4
 DEFAULT_MIN_PEAK_GAP_HOURS = 4.0
 
 
@@ -271,6 +274,9 @@ def heating_cfg(cfg: dict) -> dict:
         ),
         "min_peak_gap_hours": float(
             hc.get("min_peak_gap_hours", DEFAULT_MIN_PEAK_GAP_HOURS)
+        ),
+        "peak_min_ratio": float(
+            hc.get("peak_min_ratio", DEFAULT_PEAK_MIN_RATIO)
         ),
     }
 
@@ -441,6 +447,38 @@ def _select_spaced(
     return sorted(chosen, key=lambda b: b["start"])
 
 
+def _day_average_corrected(rows: List[dict]) -> dict:
+    """Gemiddelde gecorrigeerde warmteprijs per kalenderdag.
+
+    Een piekblok moet duidelijk duurder zijn dan een gemiddeld uur van die
+    dag. Zonder deze toets vult de dagquota (`peak_blocks_per_day`) elke dag
+    met twee "pieken", ook als het tweede blok in werkelijkheid goedkoop is.
+    """
+    buckets: dict = {}
+    for r in rows:
+        dt = r.get("dt_local")
+        corr = r.get("corrected")
+        if dt is None or corr is None:
+            continue
+        buckets.setdefault(dt.date(), []).append(corr)
+    return {day: sum(vals) / len(vals) for day, vals in buckets.items() if vals}
+
+
+def _is_expensive_enough(block: dict, day_avg: dict, min_ratio: float) -> bool:
+    """Is het blok duurder dan `min_ratio` keer het daggemiddelde?
+
+    Ontbreekt het daggemiddelde (bijv. een blok van gisteravond dat nog door
+    de cache loopt), dan laten we het blok met rust.
+    """
+    if min_ratio <= 0:
+        return True
+    avg = day_avg.get(block["start"].date())
+    mean = block.get("mean_corrected")
+    if not avg or mean is None:
+        return True
+    return mean >= avg * min_ratio
+
+
 def _heating_needed(block: dict, ccfg: dict) -> bool:
     """Is verwarmen aannemelijk nodig tijdens dit blok?
 
@@ -565,6 +603,12 @@ def plan_peak_blocks(
     locked = list(locked_blocks or [])
     bh = ccfg["peak_hours"]
     horizon_end = now + timedelta(hours=ccfg["horizon_hours"])
+    day_avg = _day_average_corrected(rows)
+    min_ratio = ccfg.get("peak_min_ratio", DEFAULT_PEAK_MIN_RATIO)
+    # Een begonnen piek die achteraf goedkoop blijkt (bijv. een opgedrongen
+    # tweede blok van de dagquota) vervalt, zodat de warmtepomp niet onnodig
+    # standby blijft.
+    locked = [b for b in locked if _is_expensive_enough(b, day_avg, min_ratio)]
     candidates = find_cheapest_blocks(
         rows,
         granularity_min=granularity_min,
@@ -576,7 +620,11 @@ def plan_peak_blocks(
         start_before=horizon_end,
     )
     candidates = [
-        b for b in candidates if b["end"] > now and _heating_needed(b, ccfg)
+        b
+        for b in candidates
+        if b["end"] > now
+        and _heating_needed(b, ccfg)
+        and _is_expensive_enough(b, day_avg, min_ratio)
     ]
     if locked:
         # Schuifvarianten van een al begonnen piek (17:00–21:00 naast

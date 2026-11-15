@@ -62,6 +62,8 @@ class TestHeatingCfg(unittest.TestCase):
         self.assertEqual(c["coast_block_hours"], 2.0)
         self.assertEqual(c["coast_blocks_per_day"], 1)
         self.assertEqual(c["max_outdoor_for_heating_c"], 15.0)
+        # Zonder expliciete drempel telt alleen "duurder dan gemiddeld".
+        self.assertEqual(c["peak_min_ratio"], 1.0)
 
     def test_base_temp_null_means_register(self):
         c = _cfg(base_temp=None)
@@ -758,6 +760,75 @@ class TestPlanPeakStability(unittest.TestCase):
         # Er is nog ruimte voor één piek, maar 17:00-21:00 overlapt de
         # afgelopen piek en mag niet opnieuw gekozen worden.
         self.assertNotIn("17:00", [b["start"].strftime("%H:%M") for b in blocks])
+
+
+class TestPeakDayAverage(unittest.TestCase):
+    """Een piek moet duurder zijn dan een gemiddeld uur van die dag.
+
+    De dagquota (`peak_blocks_per_day`) mag geen tweede, goedkoop blok
+    opdringen. Anders gaat de warmtepomp 's nachts onnodig op standby.
+    """
+
+    def setUp(self):
+        self.c = _cfg(
+            enabled=True,
+            control="peak_avoid",
+            peak_hours=4.0,
+            peak_blocks_per_day=2,
+            min_peak_gap_hours=4.0,
+            peak_min_ratio=1.0,
+        )
+
+    def _rows(self, days=1):
+        def pf(dt):
+            minutes = dt.hour * 60 + dt.minute
+            if 15 * 60 <= minutes < 19 * 60:
+                return 0.40          # echte avondpiek
+            if minutes >= 23 * 60 or minutes < 3 * 60:
+                return 0.09          # nachtblok net onder het daggemiddelde
+            return 0.02
+
+        return _mk_rows(_dt(0, 0), 96 * days, price_fn=pf)
+
+    def test_cheap_overnight_block_is_not_a_peak(self):
+        blocks = heating_comfort.plan_peak_blocks(
+            self._rows(2), 15, _dt(12, 0), self.c
+        )
+        day_11 = [b for b in blocks if b["start"].date() == _dt(12, 0).date()]
+        self.assertEqual(
+            [(b["start"].strftime("%H:%M"), b["end"].strftime("%H:%M"))
+             for b in day_11],
+            [("15:00", "19:00")],
+        )
+
+    def test_cheap_locked_peak_is_released(self):
+        # Opgedrongen nachtblok uit een ouder plan: niet actief houden.
+        cheap = {
+            "start": _dt(23, 0),
+            "end": _dt(3, 0, day=12),
+            "mean_corrected": 0.09 / 3.0,
+            "mean_cop": 3.0,
+            "mean_temp": 8.0,
+        }
+        blocks = heating_comfort.plan_peak_blocks(
+            self._rows(2), 15, _dt(0, 30, day=12), self.c,
+            locked_blocks=[cheap],
+        )
+        self.assertNotIn(_dt(23, 0), [b["start"] for b in blocks])
+
+    def test_ratio_zero_disables_threshold(self):
+        c = _cfg(
+            enabled=True,
+            control="peak_avoid",
+            peak_hours=4.0,
+            peak_blocks_per_day=2,
+            min_peak_gap_hours=4.0,
+            peak_min_ratio=0.0,
+        )
+        blocks = heating_comfort.plan_peak_blocks(
+            self._rows(2), 15, _dt(12, 0), c
+        )
+        self.assertIn("23:00", [b["start"].strftime("%H:%M") for b in blocks])
 
 
 class TestPeakCache(unittest.TestCase):

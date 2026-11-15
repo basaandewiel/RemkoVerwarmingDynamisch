@@ -652,6 +652,29 @@ Met `set_main_mode.py` kun je 1951 ook handmatig zetten:
 ~/remkoverwarming/venv/bin/python3 set_main_mode.py auto      # 1951 = 01
 ```
 
+### `control: "peak_avoid"` — verwarmen buiten de pieken
+
+Zoekt per kalenderdag de **duurste** aaneengesloten blokken van `peak_hours`
+uur (op gecorrigeerde prijs) en zet de Remko daar op **Standby** (1951 = `03`).
+Buiten die blokken verwarmt hij gewoon. Zo blijft de compressor stil tijdens de
+dure uren en profiteert de vloer van de goedkope uren.
+
+Een blok telt alleen als piek wanneer de gemiddelde gecorrigeerde prijs
+**hoger is dan het daggemiddelde** (`peak_min_ratio`, default `1.0`). Zonder
+deze toets zou de dagquota (`peak_blocks_per_day`) op rustige dagen een tweede,
+goedkoop blok als "piek" opdringen — met onnodige standby tot gevolg.
+
+Begonnen pieken worden **vergrendeld**: een prijsverversing kan het einde niet
+opschuiven. De planning is **per kalenderdag**, zodat na de avondpiek ook de
+ochtendpiek van morgen in beeld blijft en een venster van gisteravond na
+middernacht niet opnieuw actief wordt. In de servicelog verschijnt het volledige
+tijdvak:
+
+```text
+PIEKUREN -> 1951=Standby (duurst, warmtepomp stil) | piek zo 15-11 19:15 – 23:15
+WARMEN -> 1951=Verwarmen (buiten piekuren) | volgende piek ma 16-11 07:00 – 11:00
+```
+
 ### SWW gaat vóór (één compressor)
 
 SWW laden en ruimteverwarming kunnen **niet tegelijk**: de Remko heeft één
@@ -681,7 +704,7 @@ waarde (`last_sent_setpoint` in `supply`-stand, `last_sent_main_mode` in
 | Sleutel | Default | Betekenis |
 |---|---|---|
 | `enabled` | `false` | regeling aan/uit (staat bewust uit tot je hem op de Pi test). |
-| `control` | `"supply"` | regelwijze: `"supply"` (1975 moduleren) of `"onoff"` (1951 aan/uit). |
+| `control` | `"supply"` | regelwijze: `"supply"` (1975 moduleren), `"onoff"` (1951 aan/uit) of `"peak_avoid"` (standby in de duurste blokken). |
 | `avoid_dhw` | `true` | laadblokken mijden die met een SWW-laadvenster botsen. |
 | `dhw_guard_minutes` | `15` | veiligheidsmarge rond het SWW-laadvenster. |
 | `charge_temp` | `40` | aanvoertemperatuur tijdens een laadblok (alleen `supply`). |
@@ -693,6 +716,10 @@ waarde (`last_sent_setpoint` in `supply`-stand, `last_sent_main_mode` in
 | `min_gap_hours` | `6.0` | minimale tussenruimte tussen blokken. |
 | `coast_enabled` | `true` | duurste uren ook daadwerkelijk "uit" vragen. |
 | `coast_block_hours` / `coast_blocks_per_day` | `2.0` / `1` | lengte en aantal duur-uur-blokken. |
+| `peak_hours` | `4.0` | lengte van een piekblok in `peak_avoid`. |
+| `peak_blocks_per_day` | `2` | maximaal aantal piekblokken per kalenderdag. |
+| `min_peak_gap_hours` | `4.0` | minimale tussenruimte tussen piekblokken. |
+| `peak_min_ratio` | `1.0` | een blok is pas piek als de gemiddelde gecorrigeerde prijs ≥ dit deel van het daggemiddelde; `0` schakelt de toets uit. |
 | `horizon_hours` | `24` | hoe ver vooruit wordt gepland. |
 | `max_outdoor_for_heating_c` | `15` | boven deze buitentemperatuur geen blokken: dan verwarmt een vloerverwarmingshuis doorgaans niet. |
 | `interval_minutes` | `5` | herberekeninterval in `--watch`. |
