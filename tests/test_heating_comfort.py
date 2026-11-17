@@ -812,11 +812,40 @@ class TestPeakDayAverage(unittest.TestCase):
             [("15:00", "19:00")],
         )
 
+    def test_dinner_peak_survives_high_cop(self):
+        # Op een warme middag drukt de hoge COP de gecorrigeerde prijs van de
+        # avondpiek onder het daggemiddelde. De rauwe stroomprijs is wél hoger.
+        def pf(dt):
+            minutes = dt.hour * 60 + dt.minute
+            if 5 * 60 <= minutes < 10 * 60:
+                return 0.35
+            if 16 * 60 <= minutes < 21 * 60:
+                return 0.32
+            return 0.30
+
+        rows = _mk_rows(_dt(0, 0), 96, price_fn=pf)
+        for r in rows:
+            warm = r["dt_local"].hour >= 12
+            r["temp"] = 11.0 if warm else 4.0
+            r["corrected"] = r["price"] / (5.0 if warm else 3.0)
+        locked = {
+            "start": _dt(5, 0),
+            "end": _dt(10, 0),
+            "mean_price": 0.35,
+            "mean_corrected": 0.35 / 3.0,
+            "mean_temp": 4.0,
+        }
+        blocks = heating_comfort.plan_peak_blocks(
+            rows, 15, _dt(12, 0), self.c, locked_blocks=[locked]
+        )
+        self.assertIn("16:00", [b["start"].strftime("%H:%M") for b in blocks])
+
     def test_cheap_locked_peak_is_released(self):
         # Opgedrongen nachtblok uit een ouder plan: niet actief houden.
         cheap = {
             "start": _dt(23, 0),
             "end": _dt(3, 0, day=12),
+            "mean_price": 0.09,
             "mean_corrected": 0.09 / 3.0,
             "mean_cop": 3.0,
             "mean_temp": 8.0,

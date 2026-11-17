@@ -659,10 +659,13 @@ uur (op gecorrigeerde prijs) en zet de Remko daar op **Standby** (1951 = `03`).
 Buiten die blokken verwarmt hij gewoon. Zo blijft de compressor stil tijdens de
 dure uren en profiteert de vloer van de goedkope uren.
 
-Een blok telt alleen als piek wanneer de gemiddelde gecorrigeerde prijs
+Een blok telt alleen als piek wanneer de gemiddelde **stroomprijs** (€/kWh)
 **hoger is dan het daggemiddelde** (`peak_min_ratio`, default `1.0`). Zonder
 deze toets zou de dagquota (`peak_blocks_per_day`) op rustige dagen een tweede,
-goedkoop blok als "piek" opdringen — met onnodige standby tot gevolg.
+goedkoop blok als "piek" opdringen — met onnodige standby tot gevolg. De toets
+gebruikt bewust de rauwe prijs: op een warme middag is de COP hoog, waardoor de
+gecorrigeerde prijs van een dure avondpiek onder het daggemiddelde kan vallen,
+terwijl standby daar wél stroom bespaart.
 
 Begonnen pieken worden **vergrendeld**: een prijsverversing kan het einde niet
 opschuiven. De planning is **per kalenderdag**, zodat na de avondpiek ook de
@@ -719,7 +722,7 @@ waarde (`last_sent_setpoint` in `supply`-stand, `last_sent_main_mode` in
 | `peak_hours` | `4.0` | lengte van een piekblok in `peak_avoid`. |
 | `peak_blocks_per_day` | `2` | maximaal aantal piekblokken per kalenderdag. |
 | `min_peak_gap_hours` | `4.0` | minimale tussenruimte tussen piekblokken. |
-| `peak_min_ratio` | `1.0` | een blok is pas piek als de gemiddelde gecorrigeerde prijs ≥ dit deel van het daggemiddelde; `0` schakelt de toets uit. |
+| `peak_min_ratio` | `1.0` | een blok is pas piek als de gemiddelde stroomprijs (€/kWh) ≥ dit deel van het daggemiddelde; `0` schakelt de toets uit. |
 | `horizon_hours` | `24` | hoe ver vooruit wordt gepland. |
 | `max_outdoor_for_heating_c` | `15` | boven deze buitentemperatuur geen blokken: dan verwarmt een vloerverwarmingshuis doorgaans niet. |
 | `interval_minutes` | `5` | herberekeninterval in `--watch`. |
