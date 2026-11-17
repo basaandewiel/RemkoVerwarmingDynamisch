@@ -171,14 +171,13 @@ EPS = 1e-6
 DEFAULT_PEAK_AVOIDANCE = False
 DEFAULT_PEAK_HOURS = 4.0
 DEFAULT_PEAK_BLOCKS_PER_DAY = 2
-# Alleen blokken waarvan de gemiddelde STROOMprijs hoger is dan dit deel van
-# het daggemiddelde tellen als piek. Zo wordt niet elke dag kunstmatig met twee
-# "pieken" gevuld, maar blijft een dure avondpiek ook op een warme dag zichtbaar.
+# Alleen blokken die duurder zijn dan dit deel van het daggemiddelde tellen
+# als piek. Zo wordt niet elke dag kunstmatig met twee "pieken" gevuld.
 DEFAULT_PEAK_MIN_RATIO = 1.0
 # Versie van het piekplan in de statusfile. Een plan van vóór de
 # vergrendeling van begonnen pieken, de dagindeling of de daggemiddelde-toets
 # is niet betrouwbaar en wordt genegeerd.
-PEAK_CACHE_VERSION = 5
+PEAK_CACHE_VERSION = 4
 DEFAULT_MIN_PEAK_GAP_HOURS = 4.0
 
 
@@ -448,21 +447,20 @@ def _select_spaced(
     return sorted(chosen, key=lambda b: b["start"])
 
 
-def _day_average_price(rows: List[dict]) -> dict:
-    """Gemiddelde **stroomprijs** (€/kWh) per kalenderdag.
+def _day_average_corrected(rows: List[dict]) -> dict:
+    """Gemiddelde gecorrigeerde warmteprijs per kalenderdag.
 
-    De toets gebruikt de rauwe prijs, niet de COP-gecorrigeerde warmteprijs.
-    In een warm middaguur is de COP hoog, waardoor de gecorrigeerde prijs van
-    een normaal dure avondpiek ónder het daggemiddelde kan zaken. Standby
-    bespaart echter de stroomprijs van dat uur, dus die is de juiste maatstaf.
+    Een piekblok moet duidelijk duurder zijn dan een gemiddeld uur van die
+    dag. Zonder deze toets vult de dagquota (`peak_blocks_per_day`) elke dag
+    met twee "pieken", ook als het tweede blok in werkelijkheid goedkoop is.
     """
     buckets: dict = {}
     for r in rows:
         dt = r.get("dt_local")
-        price = r.get("price")
-        if dt is None or price is None:
+        corr = r.get("corrected")
+        if dt is None or corr is None:
             continue
-        buckets.setdefault(dt.date(), []).append(price)
+        buckets.setdefault(dt.date(), []).append(corr)
     return {day: sum(vals) / len(vals) for day, vals in buckets.items() if vals}
 
 
@@ -475,13 +473,7 @@ def _is_expensive_enough(block: dict, day_avg: dict, min_ratio: float) -> bool:
     if min_ratio <= 0:
         return True
     avg = day_avg.get(block["start"].date())
-    mean = block.get("mean_price")
-    if mean is None:
-        # Oude cachestaties hebben alleen de gecorrigeerde prijs en de COP.
-        corr = block.get("mean_corrected")
-        cop = block.get("mean_cop")
-        if corr is not None and cop:
-            mean = corr * cop
+    mean = block.get("mean_corrected")
     if not avg or mean is None:
         return True
     return mean >= avg * min_ratio
@@ -504,7 +496,6 @@ def _block_out(block: Optional[dict]) -> Optional[dict]:
     return {
         "start": block["start"].isoformat(),
         "end": block["end"].isoformat(),
-        "mean_price": block.get("mean_price"),
         "mean_corrected": block.get("mean_corrected"),
         "mean_cop": block.get("mean_cop"),
         "mean_temp": block.get("mean_temp"),
@@ -606,16 +597,13 @@ def plan_peak_blocks(
     De pieken worden per kalenderdag gekozen (`peak_blocks_per_day` per dag).
     Zo komt na de avondpiek ook de ochtendpiek van morgen in beeld, en kan een
     venster van gisteravond na middernacht niet als nieuwe piek opduiken.
-
-    De blokken worden gerangschikt op COP-gecorrigeerde prijs; of een blok een
-    piek ís, wordt beoordeeld op de rauwe stroomprijs (`_day_average_price`).
     """
     if not rows or ccfg["peak_blocks_per_day"] <= 0:
         return []
     locked = list(locked_blocks or [])
     bh = ccfg["peak_hours"]
     horizon_end = now + timedelta(hours=ccfg["horizon_hours"])
-    day_avg = _day_average_price(rows)
+    day_avg = _day_average_corrected(rows)
     min_ratio = ccfg.get("peak_min_ratio", DEFAULT_PEAK_MIN_RATIO)
     # Een begonnen piek die achteraf goedkoop blijkt (bijv. een opgedrongen
     # tweede blok van de dagquota) vervalt, zodat de warmtepomp niet onnodig
@@ -871,7 +859,6 @@ def decide(
                         cached_blocks.append({
                             "start": datetime.fromisoformat(b["start"]),
                             "end": datetime.fromisoformat(b["end"]),
-                            "mean_price": b.get("mean_price"),
                             "mean_corrected": b.get("mean_corrected"),
                             "mean_cop": b.get("mean_cop"),
                             "mean_temp": b.get("mean_temp"),
