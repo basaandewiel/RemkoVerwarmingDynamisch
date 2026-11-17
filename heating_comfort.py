@@ -843,6 +843,12 @@ def decide(
         return out
 
     if peak_avoid:
+        if rows:
+            last_local = rows[-1].get("dt_local")
+            if last_local is not None:
+                out["price_data_until"] = (
+                    last_local + timedelta(minutes=granularity_min)
+                ).isoformat()
         cached_blocks: List[dict] = []
         cache_stale = True
         if state is not None and use_cache:
@@ -861,6 +867,13 @@ def decide(
                 except Exception:
                     cached_blocks = []
                     cache_stale = True
+        if cached_blocks:
+            # Een plan zonder actueel/toekomstig blok is afgelopen. Ook zonder
+            # prijsrefresh moet dan opnieuw gepland worden, anders blijft de
+            # volgende piek (die wél in de data staat) onzichtbaar.
+            cache_stale = cache_stale or not any(
+                b["end"] > now for b in cached_blocks
+            )
         if not cached_blocks or cache_stale:
             # Al begonnen pieken blijven staan; alleen toekomstige pieken
             # worden met de nieuwe prijzen/voorspelling herberekend.
@@ -1436,6 +1449,14 @@ def _status_log(out: dict) -> str:
         nbp = out.get("next_peak_block")
         if nbp:
             parts.append(f"volgende piek {_fmt_block_range(nbp)}")
+        else:
+            until = out.get("price_data_until")
+            if until:
+                parts.append(
+                    f"geen volgende piek bekend (prijzen tot {_fmt_iso(until)})"
+                )
+            else:
+                parts.append("geen volgende piek bekend")
     elif status == "disabled":
         parts = ["uit"]
     else:

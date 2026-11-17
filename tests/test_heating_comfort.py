@@ -345,6 +345,17 @@ class TestStatusLog(unittest.TestCase):
         log = heating_comfort._status_log(out)
         self.assertIn("zon 11-10 23:00 – maa 12-10 03:00", log)
 
+    def test_heat_without_next_peak_explains_price_horizon(self):
+        out = {
+            "status": "heat",
+            "control": "peak_avoid",
+            "price_data_until": "2026-10-11T23:45:00+02:00",
+        }
+        log = heating_comfort._status_log(out)
+        self.assertIn(
+            "geen volgende piek bekend (prijzen tot zon 11-10 23:45)", log
+        )
+
     def test_dhw_during_peak_shows_current_range(self):
         out = {
             "status": "dhw",
@@ -953,6 +964,21 @@ class TestPeakCache(unittest.TestCase):
         self.assertEqual(
             out["next_peak_block"]["start"], "2026-10-12T08:00:00+02:00"
         )
+
+    def test_finished_cache_replans_future_peak(self):
+        # Cache bevat alleen een afgelopen piek. Zonder prijsrefresh moet
+        # toch opnieuw gepland worden, anders blijft "volgende piek" leeg.
+        state = {"peak_blocks_cache": self._cache([
+            {"start": "2026-10-11T06:45:00+02:00",
+             "end": "2026-10-11T10:45:00+02:00",
+             "mean_corrected": 0.08, "mean_cop": 4.0, "mean_temp": 9.0},
+        ])}
+        out = heating_comfort.decide(self.c, _dt(12, 0), self._rows(), 15, state)
+        self.assertEqual(
+            (out.get("next_peak_block") or {}).get("start"),
+            "2026-10-11T16:45:00+02:00",
+        )
+        self.assertIn("T00:00:00+02:00", out["price_data_until"])
 
     def test_midnight_does_not_revive_yesterdays_peak(self):
         now = _dt(0, 4, day=12)
