@@ -667,8 +667,11 @@ goedkoop blok als "piek" opdringen — met onnodige standby tot gevolg.
 Begonnen pieken worden **vergrendeld**: een prijsverversing kan het einde niet
 opschuiven. De planning is **per kalenderdag**, zodat na de avondpiek ook de
 ochtendpiek van morgen in beeld blijft en een venster van gisteravond na
-middernacht niet opnieuw actief wordt. In de servicelog verschijnt het volledige
-tijdvak:
+middernacht niet opnieuw actief wordt. Daarbij worden **alle kalenderdagen met
+prijsdata** meegenomen, niet alleen `horizon_hours` (24 u): de avondpiek van
+morgen begint vaak pas meer dan 24 uur na nu en zou anders worden afgesneden,
+waardoor een kunstmatig vroeg blok als "volgende piek" verschijnt. In de
+servicelog verschijnt het volledige tijdvak:
 
 ```text
 PIEKUREN -> 1951=Standby (duurst, warmtepomp stil) | piek zo 15-11 19:15 – 23:15
@@ -720,7 +723,7 @@ waarde (`last_sent_setpoint` in `supply`-stand, `last_sent_main_mode` in
 | `peak_blocks_per_day` | `2` | maximaal aantal piekblokken per kalenderdag. |
 | `min_peak_gap_hours` | `4.0` | minimale tussenruimte tussen piekblokken. |
 | `peak_min_ratio` | `1.0` | een blok is pas piek als de gemiddelde gecorrigeerde prijs ≥ dit deel van het daggemiddelde; `0` schakelt de toets uit. |
-| `horizon_hours` | `24` | hoe ver vooruit wordt gepland. |
+| `horizon_hours` | `24` | hoe ver vooruit wordt gepland (laadblokken/coast); piekblokken beslaan alle kalenderdagen met prijsdata. |
 | `max_outdoor_for_heating_c` | `15` | boven deze buitentemperatuur geen blokken: dan verwarmt een vloerverwarmingshuis doorgaans niet. |
 | `interval_minutes` | `5` | herberekeninterval in `--watch`. |
 

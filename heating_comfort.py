@@ -175,9 +175,9 @@ DEFAULT_PEAK_BLOCKS_PER_DAY = 2
 # als piek. Zo wordt niet elke dag kunstmatig met twee "pieken" gevuld.
 DEFAULT_PEAK_MIN_RATIO = 1.0
 # Versie van het piekplan in de statusfile. Een plan van vóór de
-# vergrendeling van begonnen pieken, de dagindeling of de daggemiddelde-toets
-# is niet betrouwbaar en wordt genegeerd.
-PEAK_CACHE_VERSION = 4
+# vergrendeling van begonnen pieken, de dagindeling, de daggemiddelde-toets of
+# de volledige dagdekking is niet betrouwbaar en wordt genegeerd.
+PEAK_CACHE_VERSION = 5
 DEFAULT_MIN_PEAK_GAP_HOURS = 4.0
 
 
@@ -597,13 +597,26 @@ def plan_peak_blocks(
     De pieken worden per kalenderdag gekozen (`peak_blocks_per_day` per dag).
     Zo komt na de avondpiek ook de ochtendpiek van morgen in beeld, en kan een
     venster van gisteravond na middernacht niet als nieuwe piek opduiken.
+
+    De planning beslaat alle kalenderdagen waarvoor prijsdata beschikbaar is,
+    niet slechts `horizon_hours`. Met een horizon van 24 uur zou de avondpiek
+    van morgen (die vaak pas >24 uur na nu begint) worden afgesneden, waardoor
+    een kunstmatig vroeg blok als "volgende piek" gekozen wordt.
     """
     if not rows or ccfg["peak_blocks_per_day"] <= 0:
         return []
     locked = list(locked_blocks or [])
     bh = ccfg["peak_hours"]
-    horizon_end = now + timedelta(hours=ccfg["horizon_hours"])
     day_avg = _day_average_corrected(rows)
+    price_days = sorted(day_avg)
+    if not price_days:
+        return []
+    # Dek de volledige kalenderdagen af waarvoor prijzen bekend zijn. Een
+    # blok hoeft niet vóór `now + horizon_hours` te beginnen; het moet alleen
+    # binnen de beschikbare prijsdata vallen.
+    data_until = max(r["dt_local"] for r in rows) + timedelta(
+        minutes=granularity_min
+    )
     min_ratio = ccfg.get("peak_min_ratio", DEFAULT_PEAK_MIN_RATIO)
     # Een begonnen piek die achteraf goedkoop blijkt (bijv. een opgedrongen
     # tweede blok van de dagquota) vervalt, zodat de warmtepomp niet onnodig
@@ -617,7 +630,7 @@ def plan_peak_blocks(
         top_n=100000,
         now=now,
         earliest_start=now - timedelta(hours=bh),
-        start_before=horizon_end,
+        start_before=data_until,
     )
     candidates = [
         b
@@ -642,7 +655,7 @@ def plan_peak_blocks(
 
     chosen = list(locked)
     day = now.date()
-    end_day = horizon_end.date()
+    end_day = max(price_days)
     while day <= end_day:
         day_locked = [b for b in locked if b["start"].date() == day]
         remaining = max(0, ccfg["peak_blocks_per_day"] - len(day_locked))

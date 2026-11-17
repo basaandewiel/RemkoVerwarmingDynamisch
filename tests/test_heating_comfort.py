@@ -812,6 +812,40 @@ class TestPeakDayAverage(unittest.TestCase):
             [("15:00", "19:00")],
         )
 
+    def test_next_day_evening_peak_is_not_cut_off_by_24h_horizon(self):
+        # De avondpiek van morgen begint (>24 u) na `now`. Met een horizon van
+        # 24 uur zou een kunstmatig vroeg blok als "volgende piek" gekozen
+        # worden. Alle dagen met prijsdata moeten meetellen.
+        day11 = _dt(0, 0, day=11).date()
+        day12 = _dt(0, 0, day=12).date()
+
+        def pf(dt):
+            minutes = dt.hour * 60 + dt.minute
+            if dt.date() == day11:
+                return 0.40 if 8 * 60 <= minutes < 12 * 60 else 0.10
+            if 16 * 60 + 45 <= minutes < 21 * 60 + 45:
+                return 0.45          # echte avondpiek
+            if 13 * 60 + 45 <= minutes < 18 * 60 + 45:
+                return 0.20          # kunstmatig vroeg blok
+            return 0.05
+
+        rows = _mk_rows(_dt(0, 0, day=11), 192, price_fn=pf)
+        c = _cfg(
+            enabled=True,
+            control="peak_avoid",
+            peak_hours=5.0,
+            peak_blocks_per_day=1,
+            min_peak_gap_hours=4.0,
+            horizon_hours=24.0,
+        )
+        blocks = heating_comfort.plan_peak_blocks(
+            rows, 15, _dt(13, 46, day=11), c
+        )
+        day12_blocks = [b for b in blocks if b["start"].date() == day12]
+        self.assertEqual(
+            [b["start"].strftime("%H:%M") for b in day12_blocks], ["16:45"]
+        )
+
     def test_cheap_locked_peak_is_released(self):
         # Opgedrongen nachtblok uit een ouder plan: niet actief houden.
         cheap = {
